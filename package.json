@@ -1,12 +1,11 @@
 {
-  "name": "tauri-app",
+  "name": "word-covenant",
   "private": true,
-  "version": "2.10.3",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently --kill-others \"pnpm vite:dev\" \"pnpm devtools\"",
+    "dev": "pnpm vite:dev",
     "vite:dev": "cross-env DEBUG=0 vite",
-    "devtools": "vue-devtools",
     "test": "vitest",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
@@ -17,8 +16,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
-    "@tauri-apps/plugin-shell": "^2.3.5",
-    "@vue/devtools": "^8.1.1",
     "pinia": "^3.0.4",
     "vue": "^3.5.30"
   },
@@ -37,11 +34,11 @@
     "@vue/eslint-config-prettier": "^10.2.0",
     "@vue/test-utils": "^2.4.6",
     "@vue/tsconfig": "^0.9.1",
-    "concurrently": "^10.0.0",
     "cross-env": "^10.1.0",
     "eslint": "^10.1.0",
     "eslint-plugin-security": "^4.0.0",
     "eslint-plugin-vue": "^10.8.0",
+    "happy-dom": "20.11.1",
     "lodash-es": "^4.17.23",
     "prettier": "^3.8.1",
     "tailwindcss": "^4.2.2",
@@ -51,7 +48,6 @@
     "vite": "^8.0.2",
     "vite-plugin-node-polyfills": "^0.26.0",
     "vite-plugin-top-level-await": "^1.6.0",
-    "vite-plugin-vue-devtools": "^8.1.1",
     "vitest": "^4.1.1",
     "vue-tsc": "^3.2.6"
   },

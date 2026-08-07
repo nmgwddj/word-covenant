@@ -1,26 +1,76 @@
 <script setup lang="ts">
-import GreetComponent from './components/GreetComponent.vue'
-const store = useStore()
-store.initApp()
+import { computed, onMounted } from 'vue'
+import AgentActionPanel from '@/components/AgentActionPanel.vue'
+import PrivacyStatus from '@/components/PrivacyStatus.vue'
+import RecordingControl from '@/components/RecordingControl.vue'
+import TimelinePanel from '@/components/TimelinePanel.vue'
+import { usePrivacyStore } from '@/stores/privacy'
+import { useSessionStore } from '@/stores/session'
+
+const privacyStore = usePrivacyStore()
+const sessionStore = useSessionStore()
+const recordingLabel = computed(() => (sessionStore.isRecording ? '记录中' : '待命'))
+
+onMounted(async () => {
+  await Promise.all([privacyStore.refresh(), sessionStore.initialize()])
+})
+
+async function toggleRecording() {
+  await sessionStore.toggleRecording()
+  await privacyStore.refresh()
+}
+
+async function setEgressEnabled(enabled: boolean) {
+  await privacyStore.setEgressEnabled(enabled)
+}
 </script>
 
 <template>
-  <main class="flex-1 flex flex-col items-center justify-center min-h-screen">
-    <h1>Welcome to Tauri 2 + Vue</h1>
+  <main class="workspace-shell">
+    <header class="workspace-header">
+      <div class="brand-lockup">
+        <div class="brand-lockup__mark" aria-hidden="true"><span /></div>
+        <div>
+          <h1>WordCovenant</h1>
+          <p>凡口头所言，皆立为契约。有据可查，事事落单。</p>
+        </div>
+      </div>
 
-    <div class="flex flex-row">
-      <a href="https://vitejs.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
-    </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
+      <div class="workspace-header__actions">
+        <PrivacyStatus :status="privacyStore.status" />
+        <span class="recording-state" :class="{ 'recording-state--active': sessionStore.isRecording }">
+          <span aria-hidden="true" />{{ recordingLabel }}
+        </span>
+        <RecordingControl
+          :recording="sessionStore.isRecording"
+          :disabled="sessionStore.isLoading"
+          @toggle="toggleRecording"
+        />
+      </div>
+    </header>
 
-    <GreetComponent />
+    <section class="workspace-grid">
+      <aside class="session-rail" aria-label="本地会话">
+        <p class="session-rail__label">LOCAL ARCHIVE</p>
+        <button class="session-item session-item--active" type="button">
+          <span class="session-item__dot" aria-hidden="true" />
+          <span>当前会话</span>
+          <time>今天</time>
+        </button>
+        <button class="icon-button session-rail__new" type="button" title="新建本地会话">
+          <span class="i-mdi-plus" aria-hidden="true" />
+        </button>
+      </aside>
+
+      <TimelinePanel :spans="sessionStore.timeline" />
+      <AgentActionPanel
+        :actions="sessionStore.actions"
+        :egress-enabled="privacyStore.status.egressEnabled"
+        :active-egress-approvals="privacyStore.status.activeEgressApprovals"
+        :egress-loading="privacyStore.isUpdatingEgress"
+        @propose="sessionStore.proposeLocalSpeech"
+        @set-egress-enabled="setEgressEnabled"
+      />
+    </section>
   </main>
 </template>

@@ -11,6 +11,11 @@ export {}
 /* prettier-ignore */
 declare module 'vue' {
   export interface GlobalComponents {
+    AgentActionPanel: typeof import('./src/components/AgentActionPanel.vue')['default']
     GreetComponent: typeof import('./src/components/GreetComponent.vue')['default']
+    OutboundAccessControl: typeof import('./src/components/OutboundAccessControl.vue')['default']
+    PrivacyStatus: typeof import('./src/components/PrivacyStatus.vue')['default']
+    RecordingControl: typeof import('./src/components/RecordingControl.vue')['default']
+    TimelinePanel: typeof import('./src/components/TimelinePanel.vue')['default']
   }
 }
