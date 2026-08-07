@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import AgentActionPanel from '@/components/AgentActionPanel.vue'
+import DevelopmentCaptureControl from '@/components/DevelopmentCaptureControl.vue'
 import PrivacyStatus from '@/components/PrivacyStatus.vue'
 import RecordingControl from '@/components/RecordingControl.vue'
 import TimelinePanel from '@/components/TimelinePanel.vue'
@@ -9,7 +10,12 @@ import { useSessionStore } from '@/stores/session'
 
 const privacyStore = usePrivacyStore()
 const sessionStore = useSessionStore()
-const recordingLabel = computed(() => (sessionStore.isRecording ? '记录中' : '待命'))
+const isDevelopmentBuild = import.meta.env.DEV
+const recordingLabel = computed(() => {
+  if (!sessionStore.isRecording) return '待命'
+  return sessionStore.captureInput === 'development_mock' ? '模拟记录中' : '记录中'
+})
+let developmentMockTimer: number | undefined
 
 onMounted(async () => {
   await Promise.all([privacyStore.refresh(), sessionStore.initialize()])
@@ -18,11 +24,50 @@ onMounted(async () => {
 async function toggleRecording() {
   await sessionStore.toggleRecording()
   await privacyStore.refresh()
+  synchronizeDevelopmentMockTimer()
 }
 
 async function setEgressEnabled(enabled: boolean) {
   await privacyStore.setEgressEnabled(enabled)
 }
+
+function toggleDevelopmentCaptureInput() {
+  sessionStore.setCaptureInput(
+    sessionStore.captureInput === 'development_mock' ? 'microphone' : 'development_mock',
+  )
+}
+
+function stopDevelopmentMockTimer() {
+  if (developmentMockTimer !== undefined) {
+    window.clearInterval(developmentMockTimer)
+    developmentMockTimer = undefined
+  }
+}
+
+function synchronizeDevelopmentMockTimer() {
+  if (!isDevelopmentBuild || !sessionStore.isDevelopmentMockActive) {
+    stopDevelopmentMockTimer()
+    return
+  }
+  if (developmentMockTimer !== undefined) return
+
+  developmentMockTimer = window.setInterval(() => {
+    void advanceDevelopmentMock()
+  }, 200)
+}
+
+async function advanceDevelopmentMock() {
+  try {
+    await sessionStore.advanceDevelopmentMock()
+  } catch {
+    stopDevelopmentMockTimer()
+  }
+  synchronizeDevelopmentMockTimer()
+}
+
+watch(() => sessionStore.isDevelopmentMockActive, synchronizeDevelopmentMockTimer)
+
+onBeforeUnmount(stopDevelopmentMockTimer)
 </script>
 
 <template>
@@ -41,6 +86,12 @@ async function setEgressEnabled(enabled: boolean) {
         <span class="recording-state" :class="{ 'recording-state--active': sessionStore.isRecording }">
           <span aria-hidden="true" />{{ recordingLabel }}
         </span>
+        <DevelopmentCaptureControl
+          v-if="isDevelopmentBuild"
+          :selected="sessionStore.captureInput === 'development_mock'"
+          :disabled="sessionStore.isLoading || sessionStore.isRecording"
+          @select="toggleDevelopmentCaptureInput"
+        />
         <RecordingControl
           :recording="sessionStore.isRecording"
           :disabled="sessionStore.isLoading"
@@ -62,7 +113,10 @@ async function setEgressEnabled(enabled: boolean) {
         </button>
       </aside>
 
-      <TimelinePanel :spans="sessionStore.timeline" />
+      <TimelinePanel
+        :spans="sessionStore.timeline"
+        :session-start-ns="sessionStore.activeSession?.startedMonotonicNs ?? 0"
+      />
       <AgentActionPanel
         :actions="sessionStore.actions"
         :egress-enabled="privacyStore.status.egressEnabled"

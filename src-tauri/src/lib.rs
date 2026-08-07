@@ -9,7 +9,7 @@ pub mod state;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -25,19 +25,39 @@ pub fn run() {
             }
             Ok(())
         })
-        .plugin(tauri_plugin_prevent_default::init())
-        .invoke_handler(tauri::generate_handler![
-            commands::get_privacy_status,
-            commands::set_egress_enabled,
-            commands::start_session,
-            commands::stop_session,
-            commands::list_timeline,
-            commands::create_egress_approval,
-            commands::revoke_egress_approval,
-            commands::propose_local_speech,
-            commands::list_actions,
-            commands::attempt_http_profile,
-        ])
+        .plugin(tauri_plugin_prevent_default::init());
+
+    #[cfg(debug_assertions)]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        commands::get_privacy_status,
+        commands::set_egress_enabled,
+        commands::start_session,
+        commands::start_development_mock_session,
+        commands::advance_development_mock,
+        commands::stop_session,
+        commands::list_timeline,
+        commands::create_egress_approval,
+        commands::revoke_egress_approval,
+        commands::propose_local_speech,
+        commands::list_actions,
+        commands::attempt_http_profile,
+    ]);
+
+    #[cfg(not(debug_assertions))]
+    let builder = builder.invoke_handler(tauri::generate_handler![
+        commands::get_privacy_status,
+        commands::set_egress_enabled,
+        commands::start_session,
+        commands::stop_session,
+        commands::list_timeline,
+        commands::create_egress_approval,
+        commands::revoke_egress_approval,
+        commands::propose_local_speech,
+        commands::list_actions,
+        commands::attempt_http_profile,
+    ]);
+
+    builder
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

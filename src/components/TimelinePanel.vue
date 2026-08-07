@@ -1,15 +1,22 @@
 <script setup lang="ts">
 import type { TranscriptSpan } from '@/types'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   spans: TranscriptSpan[]
-}>()
+  sessionStartNs?: number
+}>(), {
+  sessionStartNs: 0,
+})
 
 function timestamp(ns: number): string {
   const totalSeconds = Math.floor(ns / 1_000_000_000)
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
+}
+
+function captureTimestamp(ns: number): string {
+  return timestamp(Math.max(0, ns - props.sessionStartNs))
 }
 
 function speakerLabel(speakerClusterId: string | null): string {
@@ -31,7 +38,7 @@ function speakerLabel(speakerClusterId: string | null): string {
 
     <ol v-if="props.spans.length" class="timeline-list">
       <li v-for="span in props.spans" :key="span.id" class="timeline-entry">
-        <time :datetime="String(span.captureStartNs)">{{ timestamp(span.captureStartNs) }}</time>
+        <time :datetime="String(span.captureStartNs)">{{ captureTimestamp(span.captureStartNs) }}</time>
         <div class="timeline-entry__rail" aria-hidden="true"><span /></div>
         <article class="timeline-entry__body">
           <div class="timeline-entry__meta">

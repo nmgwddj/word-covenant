@@ -1,6 +1,7 @@
 export type SessionState = 'recording' | 'stopped'
 export type TranscriptSource = 'synthetic' | 'local_inference' | 'user_edited'
 export type ActionStatus = 'ready' | 'blocked' | 'completed'
+export type CaptureInputKind = 'microphone' | 'development_mock'
 
 export interface PrivacyStatus {
   localOnly: boolean
@@ -12,7 +13,16 @@ export interface PrivacyStatus {
 export interface CaptureSession {
   id: string
   startedAt: string
+  startedMonotonicNs: number
+  stoppedAt: string | null
   state: SessionState
+}
+
+export interface DevelopmentMockProgress {
+  sessionId: string
+  packetsAdvanced: number
+  spans: TranscriptSpan[]
+  exhausted: boolean
 }
 
 export interface TranscriptSpan {

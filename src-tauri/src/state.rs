@@ -1,3 +1,5 @@
+#[cfg(any(test, debug_assertions))]
+use crate::audio::{DevelopmentMockProgress, DevelopmentMockRunner};
 use crate::audit::{AuditKind, AuditStore, AuditStoreError, AuditTrail};
 use crate::domain::{CaptureSession, DataCategory, TranscriptSpan};
 use crate::policy::{EgressApproval, EgressPolicy, EgressRequest, PolicyDecision, PolicyReason};
@@ -44,6 +46,8 @@ pub struct AppState {
     policy: Mutex<EgressPolicy>,
     audit_trail: Mutex<AuditTrail>,
     audit_store: Mutex<AuditStore>,
+    #[cfg(any(test, debug_assertions))]
+    development_mock: Mutex<Option<DevelopmentMockRunner>>,
 }
 
 impl AppState {
@@ -72,6 +76,8 @@ impl AppState {
             policy: Mutex::new(EgressPolicy::default()),
             audit_trail: Mutex::new(audit_trail),
             audit_store: Mutex::new(audit_store),
+            #[cfg(any(test, debug_assertions))]
+            development_mock: Mutex::new(None),
         }
     }
 
@@ -129,6 +135,56 @@ impl AppState {
     }
 
     pub fn start_session(&self) -> Result<CaptureSession, String> {
+        self.start_session_with_active(false)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub fn start_development_mock_session(&self) -> Result<CaptureSession, String> {
+        let mut development_mock = self
+            .development_mock
+            .lock()
+            .map_err(|_| "development mock state lock poisoned".to_owned())?;
+        if development_mock.is_some() {
+            return Err("a development mock session is already active".to_owned());
+        }
+
+        let session = self.start_session_with_active(true)?;
+        *development_mock = Some(DevelopmentMockRunner::new(&session)?);
+        Ok(session)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub fn advance_development_mock(
+        &self,
+        packet_count: usize,
+    ) -> Result<DevelopmentMockProgress, String> {
+        let active_session_id = self
+            .recording_session_id()?
+            .ok_or_else(|| "no recording session is active".to_owned())?;
+        let progress = {
+            let mut development_mock = self
+                .development_mock
+                .lock()
+                .map_err(|_| "development mock state lock poisoned".to_owned())?;
+            let runner = development_mock
+                .as_mut()
+                .ok_or_else(|| "no development mock session is active".to_owned())?;
+            if runner.session_id() != active_session_id {
+                return Err("development mock does not match the active session".to_owned());
+            }
+            runner.advance(packet_count)?
+        };
+
+        for span in progress.spans.iter().cloned() {
+            self.append_transcript(span)?;
+        }
+        Ok(progress)
+    }
+
+    fn start_session_with_active(
+        &self,
+        reject_active_session: bool,
+    ) -> Result<CaptureSession, String> {
         let now = Utc::now();
         let monotonic_ns = self.monotonic_ns();
         let mut sessions = self
@@ -140,6 +196,12 @@ impl AppState {
             .values()
             .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
         {
+            if reject_active_session {
+                return Err(
+                    "stop the active recording session before starting a development mock"
+                        .to_owned(),
+                );
+            }
             return Ok(active.clone());
         }
 
@@ -157,20 +219,27 @@ impl AppState {
     pub fn stop_session(&self) -> Result<Option<CaptureSession>, String> {
         let now = Utc::now();
         let monotonic_ns = self.monotonic_ns();
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "session state lock poisoned".to_owned())?;
-        let Some(session) = sessions
-            .values_mut()
-            .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
-        else {
-            return Ok(None);
+        let stopped = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| "session state lock poisoned".to_owned())?;
+            let Some(session) = sessions
+                .values_mut()
+                .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
+            else {
+                return Ok(None);
+            };
+
+            session.stop(now);
+            let stopped = session.clone();
+            self.record_audit(AuditKind::SessionStopped, monotonic_ns, &stopped)?;
+            stopped
         };
 
-        session.stop(now);
-        let stopped = session.clone();
-        self.record_audit(AuditKind::SessionStopped, monotonic_ns, &stopped)?;
+        #[cfg(any(test, debug_assertions))]
+        self.stop_development_mock(stopped.id)?;
+
         Ok(Some(stopped))
     }
 
@@ -199,6 +268,36 @@ impl AppState {
             .or_default()
             .push(span.clone());
         self.record_audit(AuditKind::TranscriptRecorded, monotonic_ns, &span)
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn recording_session_id(&self) -> Result<Option<Uuid>, String> {
+        self.sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())
+            .map(|sessions| {
+                sessions
+                    .values()
+                    .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
+                    .map(|session| session.id)
+            })
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn stop_development_mock(&self, session_id: Uuid) -> Result<(), String> {
+        let mut development_mock = self
+            .development_mock
+            .lock()
+            .map_err(|_| "development mock state lock poisoned".to_owned())?;
+        let Some(mut runner) = development_mock.take() else {
+            return Ok(());
+        };
+        if runner.session_id() == session_id {
+            runner.stop()
+        } else {
+            *development_mock = Some(runner);
+            Ok(())
+        }
     }
 
     pub fn create_egress_approval(
@@ -348,6 +447,7 @@ fn policy_reason_message(reason: PolicyReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::TranscriptSource;
 
     #[test]
     fn starts_and_stops_an_audited_local_session() {
@@ -360,6 +460,49 @@ mod tests {
         );
         assert!(state.stop_session().unwrap().is_some());
         assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn development_mock_records_the_fixed_script_locally_and_stops_cleanly() {
+        let state = AppState::in_memory();
+        let before = state.privacy_status().unwrap();
+        let session = state.start_development_mock_session().unwrap();
+        let mut spans = Vec::new();
+
+        loop {
+            let progress = state.advance_development_mock(10).unwrap();
+            assert_eq!(progress.session_id, session.id);
+            assert!(progress.packets_advanced <= 10);
+            spans.extend(progress.spans);
+            if progress.exhausted {
+                break;
+            }
+        }
+
+        assert_eq!(spans.len(), 3);
+        assert!(spans.iter().all(
+            |span| span.session_id == session.id && span.source == TranscriptSource::Synthetic
+        ));
+        assert_eq!(spans[0].capture_start_ns, session.started_monotonic_ns);
+        assert_eq!(
+            spans[0].capture_end_ns - spans[0].capture_start_ns,
+            2_800_000_000
+        );
+        assert_eq!(spans[1].speaker_cluster_id.as_deref(), Some("speaker-2"));
+        assert_eq!(spans[2].text, "先生成一份待确认的行动草案。");
+        assert_eq!(state.list_timeline(Some(session.id)).unwrap().len(), 3);
+        assert!(state.audit_is_valid().unwrap());
+
+        assert!(state.stop_session().unwrap().is_some());
+        assert!(state.advance_development_mock(1).is_err());
+
+        let after = state.privacy_status().unwrap();
+        assert_eq!(after.local_only, before.local_only);
+        assert_eq!(after.egress_enabled, before.egress_enabled);
+        assert_eq!(
+            after.active_egress_approvals,
+            before.active_egress_approvals
+        );
     }
 
     #[test]

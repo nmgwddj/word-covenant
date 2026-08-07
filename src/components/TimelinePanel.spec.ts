@@ -26,4 +26,28 @@ describe('TimelinePanel', () => {
     expect(wrapper.text()).toContain('说话人 2')
     expect(wrapper.text()).toContain('本地时间线记录')
   })
+
+  test('renders an active session timeline relative to its monotonic start', () => {
+    const wrapper = mount(TimelinePanel, {
+      props: {
+        sessionStartNs: 65_000_000_000,
+        spans: [
+          {
+            id: 'relative',
+            sessionId: 'session-one',
+            captureStartNs: 66_000_000_000,
+            captureEndNs: 68_000_000_000,
+            speakerClusterId: 'speaker-1',
+            text: '会话相对时间',
+            isFinal: true,
+            revision: 1,
+            source: 'synthetic',
+          },
+        ],
+      },
+    })
+
+    expect(wrapper.text()).toContain('00:01')
+    expect(wrapper.text()).not.toContain('01:06')
+  })
 })

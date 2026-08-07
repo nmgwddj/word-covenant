@@ -24,6 +24,13 @@ pub struct HttpProfileAttemptInput {
     pub data_categories: BTreeSet<DataCategory>,
 }
 
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvanceDevelopmentMockInput {
+    pub packet_count: usize,
+}
+
 #[tauri::command]
 pub fn get_privacy_status(state: State<'_, AppState>) -> Result<PrivacyStatus, String> {
     state.privacy_status()
@@ -40,6 +47,23 @@ pub fn set_egress_enabled(
 #[tauri::command]
 pub fn start_session(state: State<'_, AppState>) -> Result<crate::domain::CaptureSession, String> {
     state.start_session()
+}
+
+#[cfg(any(test, debug_assertions))]
+#[tauri::command]
+pub fn start_development_mock_session(
+    state: State<'_, AppState>,
+) -> Result<crate::domain::CaptureSession, String> {
+    state.start_development_mock_session()
+}
+
+#[cfg(any(test, debug_assertions))]
+#[tauri::command]
+pub fn advance_development_mock(
+    state: State<'_, AppState>,
+    input: AdvanceDevelopmentMockInput,
+) -> Result<crate::audio::DevelopmentMockProgress, String> {
+    state.advance_development_mock(input.packet_count)
 }
 
 #[tauri::command]
