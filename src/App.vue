@@ -3,14 +3,18 @@ import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import AgentActionPanel from '@/components/AgentActionPanel.vue'
 import CaptureStatus from '@/components/CaptureStatus.vue'
 import DevelopmentCaptureControl from '@/components/DevelopmentCaptureControl.vue'
+import ModelRegistryPanel from '@/components/ModelRegistryPanel.vue'
 import PrivacyStatus from '@/components/PrivacyStatus.vue'
 import RecordingControl from '@/components/RecordingControl.vue'
 import TimelinePanel from '@/components/TimelinePanel.vue'
 import { usePrivacyStore } from '@/stores/privacy'
+import { useModelStore } from '@/stores/models'
 import { useSessionStore } from '@/stores/session'
 import { wordCovenantApi } from '@/lib/wordCovenantApi'
+import type { LocalModelImportInput } from '@/types'
 
 const privacyStore = usePrivacyStore()
+const modelStore = useModelStore()
 const sessionStore = useSessionStore()
 const isDevelopmentBuild = import.meta.env.DEV
 const recordingLabel = computed(() => {
@@ -24,7 +28,7 @@ onMounted(async () => {
   unlistenCaptureProjection = await wordCovenantApi.onCaptureProjection((projection) => {
     sessionStore.applyCaptureProjection(projection)
   })
-  await Promise.all([privacyStore.refresh(), sessionStore.initialize()])
+  await Promise.all([privacyStore.refresh(), sessionStore.initialize(), modelStore.initialize()])
 })
 
 async function toggleRecording() {
@@ -47,6 +51,18 @@ async function selectInputDevice(deviceUid: string) {
   if (deviceUid) {
     await sessionStore.selectInputDevice(deviceUid)
   }
+}
+
+async function importLocalModel(input: LocalModelImportInput) {
+  await modelStore.importLocalModel(input)
+}
+
+async function selectLocalModelFile() {
+  return modelStore.selectLocalModelFile()
+}
+
+function clearLocalModelImportError() {
+  modelStore.clearImportError()
 }
 
 function stopDevelopmentMockTimer() {
@@ -131,11 +147,20 @@ onBeforeUnmount(() => {
         <button class="icon-button session-rail__new" type="button" title="新建本地会话">
           <span class="i-mdi-plus" aria-hidden="true" />
         </button>
+        <ModelRegistryPanel
+          :models="modelStore.models"
+          :importing="modelStore.isImporting"
+          :error="modelStore.importError"
+          :select-source-path="selectLocalModelFile"
+          @clear-error="clearLocalModelImportError"
+          @import="importLocalModel"
+        />
       </aside>
 
       <TimelinePanel
         :spans="sessionStore.timeline"
         :session-start-ns="sessionStore.activeSession?.startedMonotonicNs ?? 0"
+        :use-wall-clock="!sessionStore.activeSession"
       />
       <AgentActionPanel
         :actions="sessionStore.actions"

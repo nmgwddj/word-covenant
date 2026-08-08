@@ -4,8 +4,10 @@ import type { TranscriptSpan } from '@/types'
 const props = withDefaults(defineProps<{
   spans: TranscriptSpan[]
   sessionStartNs?: number
+  useWallClock?: boolean
 }>(), {
   sessionStartNs: 0,
+  useWallClock: false,
 })
 
 function timestamp(ns: number): string {
@@ -15,8 +17,20 @@ function timestamp(ns: number): string {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`
 }
 
-function captureTimestamp(ns: number): string {
-  return timestamp(Math.max(0, ns - props.sessionStartNs))
+function captureTimestamp(span: TranscriptSpan): string {
+  if (props.useWallClock && span.wallClockStart) {
+    const date = new Date(span.wallClockStart)
+    if (!Number.isNaN(date.valueOf())) {
+      return new Intl.DateTimeFormat('zh-CN', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }).format(date)
+    }
+  }
+
+  return timestamp(Math.max(0, span.captureStartNs - props.sessionStartNs))
 }
 
 function speakerLabel(speakerClusterId: string | null): string {
@@ -38,7 +52,7 @@ function speakerLabel(speakerClusterId: string | null): string {
 
     <ol v-if="props.spans.length" class="timeline-list">
       <li v-for="span in props.spans" :key="span.id" class="timeline-entry">
-        <time :datetime="String(span.captureStartNs)">{{ captureTimestamp(span.captureStartNs) }}</time>
+        <time :datetime="span.wallClockStart ?? String(span.captureStartNs)">{{ captureTimestamp(span) }}</time>
         <div class="timeline-entry__rail" aria-hidden="true"><span /></div>
         <article class="timeline-entry__body">
           <div class="timeline-entry__meta">

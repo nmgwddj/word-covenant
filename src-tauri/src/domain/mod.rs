@@ -4,4 +4,7 @@ pub mod transcript;
 
 pub use agent::{ActionProposal, DataCategory, PlanV1, ToolCall, ToolKind};
 pub use session::{CaptureSegment, CaptureSession, SessionState};
-pub use transcript::{SpeakerCluster, TranscriptSource, TranscriptSpan};
+pub use transcript::{
+    SpeakerCluster, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
+    TranscriptSpan, TranscriptTiming,
+};

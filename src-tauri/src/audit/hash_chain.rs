@@ -13,6 +13,8 @@ pub enum AuditKind {
     CaptureSegmentRecorded,
     CaptureGapRecorded,
     TranscriptRecorded,
+    TranscriptRevisionRecorded,
+    LocalModelImported,
     PlanProposed,
     EgressApprovalCreated,
     EgressApprovalRevoked,
@@ -45,7 +47,7 @@ impl AuditEvent {
         payload: &T,
         previous_hash: Option<String>,
     ) -> Result<Self, serde_json::Error> {
-        let payload_hash = hash_bytes(&serde_json::to_vec(payload)?);
+        let payload_hash = payload_digest(payload)?;
         let id = Uuid::new_v4();
         let hash = hash_event(
             id,
@@ -83,6 +85,13 @@ impl AuditEvent {
                 &self.payload_hash,
                 self.previous_hash.as_deref(),
             )
+    }
+
+    /// Recompute a serializable record's digest and compare it with the
+    /// digest committed by this event. Callers retain the record locally; the
+    /// audit chain stores only the digest.
+    pub fn matches_payload<T: Serialize>(&self, payload: &T) -> Result<bool, serde_json::Error> {
+        Ok(self.payload_hash == payload_digest(payload)?)
     }
 }
 
@@ -186,6 +195,10 @@ fn hash_event(
     hash_bytes(material.as_bytes())
 }
 
+fn payload_digest<T: Serialize>(payload: &T) -> Result<String, serde_json::Error> {
+    Ok(hash_bytes(&serde_json::to_vec(payload)?))
+}
+
 fn hash_bytes(value: &[u8]) -> String {
     let digest = Sha256::digest(value);
     format!("{digest:x}")
@@ -246,5 +259,25 @@ mod tests {
         trail.events[0].payload_hash.push('0');
 
         assert!(!trail.verify());
+    }
+
+    #[test]
+    fn compares_an_event_against_a_typed_payload_digest() {
+        let payload = serde_json::json!({ "session": "one", "revision": 1 });
+        let event = AuditEvent::new(
+            None,
+            None,
+            AuditKind::TranscriptRevisionRecorded,
+            10,
+            Utc::now(),
+            &payload,
+            None,
+        )
+        .unwrap();
+
+        assert!(event.matches_payload(&payload).unwrap());
+        assert!(!event
+            .matches_payload(&serde_json::json!({ "session": "one", "revision": 2 }))
+            .unwrap());
     }
 }

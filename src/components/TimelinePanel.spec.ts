@@ -50,4 +50,37 @@ describe('TimelinePanel', () => {
     expect(wrapper.text()).toContain('00:01')
     expect(wrapper.text()).not.toContain('01:06')
   })
+
+  test('renders a persisted wall-clock timestamp after reopening without a live session', () => {
+    const wrapper = mount(TimelinePanel, {
+      props: {
+        useWallClock: true,
+        spans: [
+          {
+            id: 'archived',
+            sessionId: 'session-one',
+            captureStartNs: 66_000_000_000,
+            captureEndNs: 68_000_000_000,
+            wallClockStart: '2026-08-08T02:03:04.000Z',
+            speakerClusterId: 'speaker-1',
+            text: '已归档会话',
+            isFinal: true,
+            revision: 1,
+            source: 'local_inference',
+          },
+        ],
+      },
+    })
+
+    const expectedWallClock = new Intl.DateTimeFormat('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(new Date('2026-08-08T02:03:04.000Z'))
+
+    expect(wrapper.find('time').attributes('datetime')).toBe('2026-08-08T02:03:04.000Z')
+    expect(wrapper.find('time').text()).toBe(expectedWallClock)
+    expect(wrapper.text()).not.toContain('01:06')
+  })
 })

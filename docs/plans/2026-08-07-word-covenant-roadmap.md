@@ -24,7 +24,7 @@
 5. WebView CSP/capabilities do not grant network or shell access. A future Rust HTTP client is created only after a successful policy decision.
 6. Agent output is typed `PlanV1` data, never executable text. Arbitrary shell commands, arbitrary URLs, native sidecars, and generic MCP tools are not MVP capabilities.
 7. Diarization initially assigns anonymous clusters. A display name or voiceprint profile is explicit user data, not an identity claim inferred from ambient audio.
-8. The audit chain makes local changes detectable; it does not prove legal enforceability or non-repudiation.
+8. The current SHA-256 audit chain binds local records and detects modifications that do not recompute the chain. A Keychain-backed seal is required before claiming resistance to an attacker who can rewrite or truncate SQLite; it also does not prove legal enforceability or non-repudiation.
 
 ### MVP definition
 

@@ -15,6 +15,7 @@ declare module 'vue' {
     CaptureStatus: typeof import('./src/components/CaptureStatus.vue')['default']
     DevelopmentCaptureControl: typeof import('./src/components/DevelopmentCaptureControl.vue')['default']
     GreetComponent: typeof import('./src/components/GreetComponent.vue')['default']
+    ModelRegistryPanel: typeof import('./src/components/ModelRegistryPanel.vue')['default']
     OutboundAccessControl: typeof import('./src/components/OutboundAccessControl.vue')['default']
     PrivacyStatus: typeof import('./src/components/PrivacyStatus.vue')['default']
     RecordingControl: typeof import('./src/components/RecordingControl.vue')['default']

@@ -2,6 +2,7 @@ export type SessionState = 'recording' | 'stopped'
 export type TranscriptSource = 'synthetic' | 'local_inference' | 'user_edited'
 export type ActionStatus = 'ready' | 'blocked' | 'completed'
 export type CaptureInputKind = 'microphone' | 'development_mock'
+export type LocalModelKind = 'speech_recognition' | 'voice_activity_detection' | 'speaker_embedding'
 export type CaptureStatus = 'idle' | 'awaiting_permission' | 'recording' | 'interrupted' | 'failed'
 export type MicrophonePermission = 'not_determined' | 'granted' | 'denied' | 'restricted'
 export type CaptureIssueCode =
@@ -62,11 +63,36 @@ export interface DevelopmentMockProgress {
   exhausted: boolean
 }
 
+export interface RegisteredModel {
+  id: string
+  modelKind: LocalModelKind
+  fileSizeBytes: number
+  sha256: string
+  version: string
+  inputFormat: string
+  modelCardId: string
+  licenseId: string
+  licenseConfirmedAt: string
+  importedAt: string
+}
+
+export interface LocalModelImportInput {
+  sourcePath: string
+  modelKind: LocalModelKind
+  version: string
+  inputFormat: string
+  expectedSha256: string
+  modelCardId: string
+  licenseId: string
+  licenseAcknowledged: boolean
+}
+
 export interface TranscriptSpan {
   id: string
   sessionId: string
   captureStartNs: number
   captureEndNs: number
+  wallClockStart?: string | null
   speakerClusterId: string | null
   text: string
   isFinal: boolean

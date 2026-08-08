@@ -4,6 +4,7 @@ pub mod audio;
 pub mod audit;
 pub mod commands;
 pub mod domain;
+pub mod inference;
 pub mod policy;
 pub mod state;
 
@@ -47,6 +48,7 @@ pub fn run() {
             }
             Ok(())
         })
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_prevent_default::init());
 
     #[cfg(debug_assertions)]
@@ -60,6 +62,9 @@ pub fn run() {
         commands::advance_development_mock,
         commands::stop_session,
         commands::list_timeline,
+        commands::list_local_models,
+        commands::select_local_model_file,
+        commands::import_local_model,
         commands::create_egress_approval,
         commands::revoke_egress_approval,
         commands::propose_local_speech,
@@ -76,6 +81,9 @@ pub fn run() {
         commands::select_input_device,
         commands::stop_session,
         commands::list_timeline,
+        commands::list_local_models,
+        commands::select_local_model_file,
+        commands::import_local_model,
         commands::create_egress_approval,
         commands::revoke_egress_approval,
         commands::propose_local_speech,

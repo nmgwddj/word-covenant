@@ -5,7 +5,9 @@ import type {
   CaptureProjection,
   CaptureSession,
   DevelopmentMockProgress,
+  LocalModelImportInput,
   PrivacyStatus,
+  RegisteredModel,
   TranscriptSpan,
 } from '@/types'
 
@@ -224,6 +226,30 @@ export const wordCovenantApi = {
     }
 
     return sessionId && sessionId !== demoSessionId ? [] : demoTimeline
+  },
+
+  async listLocalModels(): Promise<RegisteredModel[]> {
+    if (isTauriRuntime()) {
+      return invoke<RegisteredModel[]>('list_local_models')
+    }
+
+    return []
+  },
+
+  async selectLocalModelFile(): Promise<string | null> {
+    if (isTauriRuntime()) {
+      return invoke<string | null>('select_local_model_file')
+    }
+
+    throw new Error('浏览器预览不能打开本机模型文件选择器')
+  },
+
+  async importLocalModel(input: LocalModelImportInput): Promise<RegisteredModel> {
+    if (isTauriRuntime()) {
+      return invoke<RegisteredModel>('import_local_model', { input })
+    }
+
+    throw new Error('浏览器预览不能导入本地模型文件')
   },
 
   async startDevelopmentMockSession(): Promise<CaptureSession> {

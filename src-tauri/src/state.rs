@@ -7,12 +7,19 @@ use crate::audio::{DevelopmentMockProgress, DevelopmentMockRunner};
 use crate::audit::{AuditKind, AuditStore, AuditStoreError, AuditTrail};
 #[cfg(target_os = "macos")]
 use crate::domain::CaptureSegment;
-use crate::domain::{CaptureSession, DataCategory, TranscriptSpan};
+use crate::domain::{
+    CaptureSession, DataCategory, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
+    TranscriptSpan, TranscriptTiming,
+};
+use crate::inference::model_registry::{ModelImportRequest, ModelRegistry, RegisteredModel};
+use crate::inference::{
+    AsrResponse, MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionMapper,
+};
 use crate::policy::{EgressApproval, EgressPolicy, EgressRequest, PolicyDecision, PolicyReason};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 use uuid::Uuid;
@@ -52,6 +59,9 @@ pub struct AppState {
     policy: Mutex<EgressPolicy>,
     audit_trail: Mutex<AuditTrail>,
     audit_store: Mutex<AuditStore>,
+    model_registry: Mutex<ModelRegistry>,
+    inference_mapper: Mutex<TranscriptEmissionMapper>,
+    model_root: Option<PathBuf>,
     #[cfg(target_os = "macos")]
     capture_service: Mutex<CaptureService>,
     #[cfg(any(test, debug_assertions))]
@@ -60,35 +70,64 @@ pub struct AppState {
 
 impl AppState {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditStoreError> {
-        let audit_store = AuditStore::open_path(path)?;
+        let database_path = path.as_ref();
+        let model_root = database_path
+            .parent()
+            .filter(|parent| parent.is_absolute())
+            .map(|parent| parent.join("models"));
+        let audit_store = AuditStore::open_path(database_path)?;
+        if !audit_store.verify()? {
+            return Err(AuditStoreError::Integrity);
+        }
         let audit_trail = AuditTrail::from_events(audit_store.list()?);
         if !audit_trail.verify() {
             return Err(AuditStoreError::Integrity);
         }
 
-        Ok(Self::from_audit_store(audit_store, audit_trail))
+        Self::from_audit_store(audit_store, audit_trail, model_root)
     }
 
     #[cfg(test)]
     pub fn in_memory() -> Self {
         let audit_store = AuditStore::open_in_memory().expect("in-memory audit store opens");
-        Self::from_audit_store(audit_store, AuditTrail::default())
+        Self::from_audit_store(audit_store, AuditTrail::default(), None)
+            .expect("in-memory transcript projection loads")
     }
 
-    fn from_audit_store(audit_store: AuditStore, audit_trail: AuditTrail) -> Self {
-        Self {
+    fn from_audit_store(
+        audit_store: AuditStore,
+        audit_trail: AuditTrail,
+        model_root: Option<PathBuf>,
+    ) -> Result<Self, AuditStoreError> {
+        let timelines = timeline_projections(audit_store.list_all_transcript_revisions()?);
+        let persisted_models = audit_store.list_local_models()?;
+        let model_registry = if let Some(model_root) = model_root.as_deref() {
+            ModelRegistry::from_persisted(model_root, persisted_models)
+        } else if persisted_models.is_empty() {
+            Ok(ModelRegistry::new())
+        } else {
+            Err(crate::inference::model_registry::ModelRegistryError::ManagedRootNotConfigured)
+        }
+        .map_err(|error| AuditStoreError::InvalidModelMetadata {
+            field: "persisted registry",
+            value: error.to_string(),
+        })?;
+        Ok(Self {
             started_at: Instant::now(),
             sessions: Mutex::new(BTreeMap::new()),
-            timelines: Mutex::new(BTreeMap::new()),
+            timelines: Mutex::new(timelines),
             actions: Mutex::new(Vec::new()),
             policy: Mutex::new(EgressPolicy::default()),
             audit_trail: Mutex::new(audit_trail),
             audit_store: Mutex::new(audit_store),
+            model_registry: Mutex::new(model_registry),
+            inference_mapper: Mutex::new(TranscriptEmissionMapper::default()),
+            model_root,
             #[cfg(target_os = "macos")]
             capture_service: Mutex::new(CaptureService::new()),
             #[cfg(any(test, debug_assertions))]
             development_mock: Mutex::new(None),
-        }
+        })
     }
 
     pub fn privacy_status(&self) -> Result<PrivacyStatus, String> {
@@ -487,10 +526,18 @@ impl AppState {
             .map_err(|_| "timeline state lock poisoned".to_owned())?;
         let mut spans = match session_id {
             Some(session_id) => timelines.get(&session_id).cloned().unwrap_or_default(),
+            // There is no live session after a cold restart. Show the most
+            // recently recorded local session rather than mixing unrelated
+            // archives into a view labelled as the current conversation.
             None => timelines
-                .values()
-                .flat_map(|timeline| timeline.iter().cloned())
-                .collect(),
+                .iter()
+                .max_by_key(|(_, timeline)| {
+                    timeline
+                        .iter()
+                        .filter_map(|span| span.wall_clock_start)
+                        .max()
+                })
+                .map_or_else(Vec::new, |(_, timeline)| timeline.clone()),
         };
         spans.sort_by_key(|span| (span.capture_start_ns, span.revision));
         Ok(spans)
@@ -505,6 +552,180 @@ impl AppState {
             .or_default()
             .push(span.clone());
         self.record_audit(AuditKind::TranscriptRecorded, monotonic_ns, &span)
+    }
+
+    /// Persist a final inference/correction revision before exposing its compact
+    /// timeline projection. Partial ASR output remains transient Rust/UI state
+    /// and never enters Agent context through this path.
+    pub fn append_final_transcript_revision(
+        &self,
+        revision: TranscriptRevision,
+    ) -> Result<(), String> {
+        if !revision.is_final {
+            return Err(
+                "only final transcript revisions may be persisted for Agent context".to_owned(),
+            );
+        }
+        revision
+            .validate()
+            .map_err(|error| format!("invalid final transcript revision: {error}"))?;
+
+        let projection = transcript_revision_projection(&revision);
+        // Acquire every fallible in-memory resource before the SQLite
+        // transaction. Once it commits, callers must not receive a retryable
+        // error for this final revision.
+        let mut timelines = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let event = trail
+            .next_event(
+                Some(revision.session_id),
+                revision.parent_revision_id,
+                AuditKind::TranscriptRevisionRecorded,
+                revision.capture_end_ns,
+                revision.wall_clock_end,
+                &revision,
+            )
+            .map_err(|error| format!("could not serialize transcript revision: {error}"))?;
+        {
+            let mut audit_store = self
+                .audit_store
+                .lock()
+                .map_err(|_| "audit store lock poisoned".to_owned())?;
+            audit_store
+                .append_transcript_revision_with_audit(&event, &revision)
+                .map_err(|error| format!("could not persist transcript revision: {error}"))?;
+        }
+        assert!(
+            trail.append_event(event),
+            "an audit event generated while holding the trail lock must append"
+        );
+        drop(trail);
+
+        Self::upsert_timeline_projection(&mut timelines, projection);
+        Ok(())
+    }
+
+    fn upsert_timeline_projection(
+        timelines: &mut BTreeMap<Uuid, Vec<TranscriptSpan>>,
+        span: TranscriptSpan,
+    ) {
+        let timeline = timelines.entry(span.session_id).or_default();
+        if let Some(previous) = timeline.iter_mut().find(|previous| previous.id == span.id) {
+            if span.revision >= previous.revision {
+                *previous = span;
+            }
+        } else {
+            timeline.push(span);
+        }
+    }
+
+    /// Applies one native ASR response to its active local capture session.
+    /// Partial output never reaches SQLite, FTS, the timeline, or Agent
+    /// context; only final emissions become first durable revisions.
+    pub fn append_local_asr_response(
+        &self,
+        session_id: Uuid,
+        response: AsrResponse,
+    ) -> Result<Vec<TranscriptSpan>, String> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| "ASR response references an unknown local session".to_owned())?;
+
+        let mut mapper = self
+            .inference_mapper
+            .lock()
+            .map_err(|_| "inference mapper lock poisoned".to_owned())?;
+        let mut projections = Vec::new();
+        for emission in response.emissions {
+            let mapped = mapper
+                .map(session_id, emission)
+                .map_err(|error| format!("could not map local ASR emission: {error}"))?;
+            let MappedTranscriptEmission::Final(final_emission) = mapped else {
+                continue;
+            };
+
+            let persisted = (|| {
+                let revision = transcript_revision_from_final_emission(
+                    &session,
+                    &final_emission.emission,
+                    final_emission.logical_span_id,
+                )?;
+                let projection = transcript_revision_projection(&revision);
+                self.append_final_transcript_revision(revision)?;
+                Ok::<_, String>(projection)
+            })();
+            match persisted {
+                Ok(projection) => {
+                    // Keep the reservation pending until SQLite and its audit
+                    // event have both committed, so concurrent/replayed finals
+                    // cannot create a second durable revision.
+                    mapper.commit_final(&final_emission);
+                    projections.push(projection);
+                }
+                Err(error) => {
+                    mapper.abort_final(&final_emission).map_err(|abort_error| {
+                        format!("{error}; could not release final ASR reservation: {abort_error}")
+                    })?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(projections)
+    }
+
+    pub fn list_local_models(&self) -> Result<Vec<RegisteredModel>, String> {
+        let registry = self
+            .model_registry
+            .lock()
+            .map_err(|_| "model registry lock poisoned".to_owned())?;
+        Ok(registry.models().cloned().collect())
+    }
+
+    /// Imports a user-selected model into application-managed local storage.
+    ///
+    /// The file copy is rolled back if the accompanying model/audit database
+    /// transaction cannot commit. This code never creates a network client.
+    pub fn import_local_model(
+        &self,
+        request: ModelImportRequest,
+    ) -> Result<RegisteredModel, String> {
+        let model_root = self.model_root.as_ref().ok_or_else(|| {
+            "local model import requires an absolute application data path".to_owned()
+        })?;
+        let registration = self
+            .model_registry
+            .lock()
+            .map_err(|_| "model registry lock poisoned".to_owned())?
+            .import(model_root, request)
+            .map_err(|error| format!("could not import local model: {error}"))?;
+
+        if let Err(error) = self.record_local_model_imported(&registration) {
+            let mut registry = self
+                .model_registry
+                .lock()
+                .map_err(|_| "model registry lock poisoned during rollback".to_owned())?;
+            let rolled_back = registry.rollback_registration(registration.id);
+            if let Some(rolled_back) = rolled_back {
+                if let Err(cleanup_error) = registry.remove_managed_artifact(&rolled_back) {
+                    return Err(format!(
+                        "{error}; could not remove unregistered local model copy: {cleanup_error}"
+                    ));
+                }
+            }
+            return Err(error);
+        }
+
+        Ok(registration)
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -663,6 +884,32 @@ impl AppState {
         }
         Ok(())
     }
+
+    fn record_local_model_imported(&self, model: &RegisteredModel) -> Result<(), String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let event = trail
+            .next_event(
+                None,
+                None,
+                AuditKind::LocalModelImported,
+                self.monotonic_ns(),
+                Utc::now(),
+                model,
+            )
+            .map_err(|error| format!("could not serialize local model audit payload: {error}"))?;
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .append_local_model_with_audit(&event, model)
+            .map_err(|error| format!("could not persist local model import: {error}"))?;
+        if !trail.append_event(event) {
+            return Err("could not append verified local model import event".to_owned());
+        }
+        Ok(())
+    }
 }
 
 fn policy_reason_message(reason: PolicyReason) -> String {
@@ -681,6 +928,89 @@ fn policy_reason_message(reason: PolicyReason) -> String {
     }
 }
 
+fn transcript_revision_projection(revision: &TranscriptRevision) -> TranscriptSpan {
+    TranscriptSpan {
+        // The timeline renders the latest value for a logical span. The
+        // immutable physical revision ID remains in SQLite and the audit chain.
+        id: revision.logical_span_id,
+        session_id: revision.session_id,
+        capture_start_ns: revision.capture_start_ns,
+        capture_end_ns: revision.capture_end_ns,
+        wall_clock_start: Some(revision.wall_clock_start),
+        speaker_cluster_id: revision.speaker_cluster_id.clone(),
+        text: revision.text.clone(),
+        is_final: revision.is_final,
+        revision: revision.revision,
+        source: revision.source.clone(),
+    }
+}
+
+fn transcript_revision_from_final_emission(
+    session: &CaptureSession,
+    emission: &TranscriptEmission,
+    logical_span_id: Uuid,
+) -> Result<TranscriptRevision, String> {
+    let timing = TranscriptTiming::new(
+        emission.capture_start_ns,
+        emission.capture_end_ns,
+        session_wall_clock_at(session, emission.capture_start_ns)?,
+        session_wall_clock_at(session, emission.capture_end_ns)?,
+    )?;
+    let model = TranscriptModelProvenance::new(
+        emission.model_provenance.provider(),
+        emission.model_provenance.model_id(),
+        emission.model_provenance.model_version(),
+        Some(emission.model_provenance.artifact_sha256().to_owned()),
+    )?;
+
+    TranscriptRevision::original_with_id(
+        logical_span_id,
+        session.id,
+        timing,
+        None,
+        emission.text.clone(),
+        true,
+        TranscriptSource::LocalInference,
+        Some(model),
+        None,
+    )
+}
+
+fn session_wall_clock_at(
+    session: &CaptureSession,
+    capture_ns: u64,
+) -> Result<DateTime<Utc>, String> {
+    let offset_ns = capture_ns
+        .checked_sub(session.started_monotonic_ns)
+        .ok_or_else(|| "ASR emission begins before its capture session".to_owned())?;
+    let offset_ns = i64::try_from(offset_ns)
+        .map_err(|_| "ASR emission offset exceeds the supported wall-clock range".to_owned())?;
+    Ok(session.started_at + chrono::Duration::nanoseconds(offset_ns))
+}
+
+fn timeline_projections(revisions: Vec<TranscriptRevision>) -> BTreeMap<Uuid, Vec<TranscriptSpan>> {
+    let mut latest_by_span = BTreeMap::<(Uuid, Uuid), TranscriptSpan>::new();
+    for revision in revisions.into_iter().filter(|revision| revision.is_final) {
+        let projection = transcript_revision_projection(&revision);
+        let key = (projection.session_id, projection.id);
+        match latest_by_span.get(&key) {
+            Some(previous) if previous.revision > projection.revision => {}
+            _ => {
+                latest_by_span.insert(key, projection);
+            }
+        }
+    }
+
+    let mut timelines = BTreeMap::<Uuid, Vec<TranscriptSpan>>::new();
+    for ((session_id, _), projection) in latest_by_span {
+        timelines.entry(session_id).or_default().push(projection);
+    }
+    for timeline in timelines.values_mut() {
+        timeline.sort_by_key(|span| (span.capture_start_ns, span.revision));
+    }
+    timelines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,9 +1018,18 @@ mod tests {
     use crate::audio::{CaptureGap, CaptureGapReason, CapturePoint};
     #[cfg(target_os = "macos")]
     use crate::domain::CaptureSegment;
-    use crate::domain::TranscriptSource;
-    #[cfg(target_os = "macos")]
+    use crate::domain::{
+        TranscriptModelProvenance, TranscriptRevision, TranscriptSource, TranscriptTiming,
+    };
+    use crate::inference::model_registry::{
+        LicenseAcknowledgement, LocalModelKind, ModelImportRequest,
+    };
+    use crate::inference::{
+        AsrEngine, AsrRequest, FixtureAsr, InferenceAudioWindow, INFERENCE_CHANNELS,
+        INFERENCE_SAMPLE_RATE_HZ,
+    };
     use chrono::Duration;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn starts_and_stops_an_audited_local_session() {
@@ -791,6 +1130,376 @@ mod tests {
             after.active_egress_approvals,
             before.active_egress_approvals
         );
+    }
+
+    #[test]
+    fn persists_a_final_fixture_asr_output_as_an_audited_revision() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let capture_start_ns = session.started_monotonic_ns;
+        let capture_end_ns = capture_start_ns + 1_000_000_000;
+        let window = InferenceAudioWindow::new(
+            session.id,
+            capture_start_ns,
+            capture_end_ns,
+            INFERENCE_SAMPLE_RATE_HZ,
+            INFERENCE_CHANNELS,
+            vec![0.0; INFERENCE_SAMPLE_RATE_HZ as usize],
+        )
+        .unwrap();
+        let request = AsrRequest::new(window, Some("zh".to_owned()), true).unwrap();
+        let mut fixture = FixtureAsr::default();
+        let output = fixture.transcribe(&request).unwrap();
+        let projections = state.append_local_asr_response(session.id, output).unwrap();
+
+        let timeline = state.list_timeline(Some(session.id)).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(projections, timeline);
+        assert_eq!(timeline[0].text, "本次记录仅保存在本机。");
+        assert_eq!(timeline[0].source, TranscriptSource::LocalInference);
+
+        let store = state.audit_store.lock().unwrap();
+        let revisions = store.list_transcript_revisions(session.id).unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].logical_span_id, timeline[0].id);
+        assert_eq!(revisions[0].revision, 1);
+        assert_eq!(revisions[0].text, "本次记录仅保存在本机。");
+        assert!(store.verify().unwrap());
+        drop(store);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn retries_a_final_asr_response_after_persistence_failure_without_duplicates() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let capture_start_ns = session.started_monotonic_ns;
+        let capture_end_ns = capture_start_ns + 1_000_000_000;
+        let window = InferenceAudioWindow::new(
+            session.id,
+            capture_start_ns,
+            capture_end_ns,
+            INFERENCE_SAMPLE_RATE_HZ,
+            INFERENCE_CHANNELS,
+            vec![0.0; INFERENCE_SAMPLE_RATE_HZ as usize],
+        )
+        .unwrap();
+        let request = AsrRequest::new(window, Some("zh".to_owned()), true).unwrap();
+        let mut fixture = FixtureAsr::default();
+        let response = fixture.transcribe(&request).unwrap();
+        let final_response = AsrResponse {
+            emissions: vec![response
+                .emissions
+                .last()
+                .cloned()
+                .expect("fixture emits one final result")],
+        };
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate a transient transcript persistence failure");
+        }))
+        .is_err());
+        let error = state
+            .append_local_asr_response(session.id, response)
+            .unwrap_err();
+        assert!(error.contains("audit store lock poisoned"));
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+
+        state.audit_store.clear_poison();
+        let persisted = state
+            .append_local_asr_response(session.id, final_response.clone())
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert!(state
+            .append_local_asr_response(session.id, final_response)
+            .unwrap()
+            .is_empty());
+
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_transcript_revisions(session.id).unwrap().len(),
+            1
+        );
+        assert!(store.verify().unwrap());
+        drop(store);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn retries_a_final_asr_response_when_the_timeline_lock_fails_before_commit() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let capture_start_ns = session.started_monotonic_ns;
+        let capture_end_ns = capture_start_ns + 1_000_000_000;
+        let window = InferenceAudioWindow::new(
+            session.id,
+            capture_start_ns,
+            capture_end_ns,
+            INFERENCE_SAMPLE_RATE_HZ,
+            INFERENCE_CHANNELS,
+            vec![0.0; INFERENCE_SAMPLE_RATE_HZ as usize],
+        )
+        .unwrap();
+        let request = AsrRequest::new(window, Some("zh".to_owned()), false).unwrap();
+        let mut fixture = FixtureAsr::default();
+        let response = fixture.transcribe(&request).unwrap();
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _timelines = state.timelines.lock().expect("timeline state is available");
+            panic!("simulate a transient timeline lock failure");
+        }))
+        .is_err());
+        let error = state
+            .append_local_asr_response(session.id, response.clone())
+            .unwrap_err();
+        assert!(error.contains("timeline state lock poisoned"));
+
+        state.timelines.clear_poison();
+        let store = state.audit_store.lock().unwrap();
+        assert!(store
+            .list_transcript_revisions(session.id)
+            .unwrap()
+            .is_empty());
+        drop(store);
+
+        let persisted = state
+            .append_local_asr_response(session.id, response)
+            .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn does_not_persist_partial_inference_results() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let revision = TranscriptRevision::original(
+            session.id,
+            TranscriptTiming::new(
+                session.started_monotonic_ns,
+                session.started_monotonic_ns + 1,
+                session.started_at,
+                session.started_at,
+            )
+            .unwrap(),
+            None,
+            "临时输出",
+            false,
+            TranscriptSource::Synthetic,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(state.append_final_transcript_revision(revision).is_err());
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn rebuilds_the_final_timeline_projection_when_reopened() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-reopen-transcript-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let revision = {
+            let state = AppState::open(&database).unwrap();
+            let session = state.start_session().unwrap();
+            let revision = TranscriptRevision::original(
+                session.id,
+                TranscriptTiming::new(
+                    session.started_monotonic_ns,
+                    session.started_monotonic_ns + 1_000_000_000,
+                    session.started_at,
+                    session.started_at + Duration::seconds(1),
+                )
+                .unwrap(),
+                None,
+                "重启后仍可检索的本地记录。",
+                true,
+                TranscriptSource::LocalInference,
+                Some(
+                    TranscriptModelProvenance::new(
+                        "fixture",
+                        "fixture-asr",
+                        "v1",
+                        Some("b".repeat(64)),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap();
+            state
+                .append_final_transcript_revision(revision.clone())
+                .unwrap();
+            revision
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        let timeline = reopened.list_timeline(Some(revision.session_id)).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].id, revision.logical_span_id);
+        assert_eq!(timeline[0].text, "重启后仍可检索的本地记录。");
+        assert!(reopened.audit_is_valid().unwrap());
+        drop(reopened);
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER transcript_revisions_are_immutable_update;")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE transcript_revisions SET text = ?1 WHERE id = ?2",
+                rusqlite::params!["篡改后的记录。", revision.id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            AppState::open(&database),
+            Err(AuditStoreError::Integrity)
+        ));
+        drop(connection);
+
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn reopening_selects_the_latest_persisted_session_with_its_wall_clock_time() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-reopen-latest-session-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let first_wall_clock = DateTime::<Utc>::UNIX_EPOCH + Duration::hours(1);
+        let second_wall_clock = DateTime::<Utc>::UNIX_EPOCH + Duration::hours(2);
+
+        let (first_session_id, second_revision) = {
+            let state = AppState::open(&database).unwrap();
+            let first_session = state.start_session().unwrap();
+            let first_revision = TranscriptRevision::original(
+                first_session.id,
+                TranscriptTiming::new(
+                    first_session.started_monotonic_ns,
+                    first_session.started_monotonic_ns + 1_000_000_000,
+                    first_wall_clock,
+                    first_wall_clock + Duration::seconds(1),
+                )
+                .unwrap(),
+                None,
+                "较早的本地记录。",
+                true,
+                TranscriptSource::LocalInference,
+                Some(
+                    TranscriptModelProvenance::new(
+                        "fixture",
+                        "fixture-asr",
+                        "v1",
+                        Some("c".repeat(64)),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap();
+            state
+                .append_final_transcript_revision(first_revision)
+                .unwrap();
+            state.stop_session().unwrap();
+
+            let second_session = state.start_session().unwrap();
+            let second_revision = TranscriptRevision::original(
+                second_session.id,
+                TranscriptTiming::new(
+                    second_session.started_monotonic_ns,
+                    second_session.started_monotonic_ns + 1_000_000_000,
+                    second_wall_clock,
+                    second_wall_clock + Duration::seconds(1),
+                )
+                .unwrap(),
+                None,
+                "最近的本地记录。",
+                true,
+                TranscriptSource::LocalInference,
+                Some(
+                    TranscriptModelProvenance::new(
+                        "fixture",
+                        "fixture-asr",
+                        "v1",
+                        Some("d".repeat(64)),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap();
+            state
+                .append_final_transcript_revision(second_revision.clone())
+                .unwrap();
+            (first_session.id, second_revision)
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        let latest = reopened.list_timeline(None).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].session_id, second_revision.session_id);
+        assert_eq!(latest[0].text, "最近的本地记录。");
+        assert_eq!(latest[0].wall_clock_start, Some(second_wall_clock));
+        assert_eq!(
+            reopened
+                .list_timeline(Some(first_session_id))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(reopened.audit_is_valid().unwrap());
+
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn imports_and_reopens_an_audited_local_model_without_egress() {
+        let directory = std::env::temp_dir().join(format!(
+            "word-covenant-state-model-import-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("word-covenant.sqlite3");
+        let source_path = directory.join("fixture-model.gguf");
+        let bytes = b"local model fixture bytes";
+        std::fs::write(&source_path, bytes).unwrap();
+        let expected_sha256 = format!("{:x}", Sha256::digest(bytes));
+        let request = ModelImportRequest {
+            id: Uuid::new_v4(),
+            source_path,
+            model_kind: LocalModelKind::SpeechRecognition,
+            version: "fixture-v1".to_owned(),
+            input_format: "gguf".to_owned(),
+            expected_sha256,
+            license_acknowledgement: Some(
+                LicenseAcknowledgement::new(
+                    "word-covenant/fixture-model",
+                    "test-license",
+                    DateTime::<Utc>::UNIX_EPOCH,
+                )
+                .unwrap(),
+            ),
+        };
+
+        let imported = {
+            let state = AppState::open(&database).unwrap();
+            let imported = state.import_local_model(request).unwrap();
+            assert_eq!(state.list_local_models().unwrap(), vec![imported.clone()]);
+            assert!(!imported.file_path.is_absolute());
+            assert!(directory.join("models").join(&imported.file_path).exists());
+            assert!(state.audit_is_valid().unwrap());
+            imported
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        assert_eq!(reopened.list_local_models().unwrap(), vec![imported]);
+        assert!(reopened.audit_is_valid().unwrap());
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

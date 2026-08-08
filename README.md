@@ -24,6 +24,14 @@ WordCovenant 是一款 macOS 优先、本地优先的桌面工作台，用于可
 
 为了能在浏览器中直接查看，M0 UI 会在 Tauri 之外使用本地合成数据。界面会明确标注为 `synthetic`；这不是麦克风或 ASR 的降级替代方案。
 
+## M2：本地模型导入
+
+- 模型文件必须由用户通过原生文件选择器明确选取；取消选择不会产生导入请求。
+- 导入仅处理本机文件，必须提供模型卡、确认许可证，并填写用于校验的预期 SHA-256。
+- 模型会复制到应用本地存储；导入过程不发起网络请求，也不下载任何模型。
+- WebView 没有通用文件读取权限；所选源路径仅用于本次导入，不会写入模型登记或审计记录。
+- 目前已具备本地模型登记和离线推理契约；真实原生 ASR 运行时仍是后续工作。
+
 ## 后续里程碑
 
 M0 实现计划见 [docs/plans/2026-08-07-word-covenant-local-first-mvp.md](docs/plans/2026-08-07-word-covenant-local-first-mvp.md)。完整的产品路线图、里程碑、验收门槛、风险和架构决策见 [docs/plans/2026-08-07-word-covenant-roadmap.md](docs/plans/2026-08-07-word-covenant-roadmap.md)。

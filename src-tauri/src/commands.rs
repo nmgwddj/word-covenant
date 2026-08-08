@@ -1,10 +1,15 @@
 use crate::domain::{DataCategory, TranscriptSpan};
+use crate::inference::model_registry::{
+    LicenseAcknowledgement, LocalModelKind, ModelImportRequest, RegisteredModel,
+};
 use crate::policy::{EgressApproval, PolicyDecision};
 use crate::state::{AgentAction, AppState, PrivacyStatus};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use tauri::State;
+use std::path::PathBuf;
+use tauri::{State, WebviewWindow};
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -28,6 +33,19 @@ pub struct HttpProfileAttemptInput {
 #[serde(rename_all = "camelCase")]
 pub struct SelectInputDeviceInput {
     pub device_uid: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportLocalModelInput {
+    pub source_path: String,
+    pub model_kind: LocalModelKind,
+    pub version: String,
+    pub input_format: String,
+    pub expected_sha256: String,
+    pub model_card_id: String,
+    pub license_id: String,
+    pub license_acknowledged: bool,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -103,6 +121,71 @@ pub fn list_timeline(
 }
 
 #[tauri::command]
+pub fn list_local_models(state: State<'_, AppState>) -> Result<Vec<RegisteredModel>, String> {
+    state.list_local_models()
+}
+
+#[tauri::command]
+pub async fn select_local_model_file(window: WebviewWindow) -> Result<Option<String>, String> {
+    let dialog = window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("选择本地模型文件");
+    let selected_file = tauri::async_runtime::spawn_blocking(move || dialog.blocking_pick_file())
+        .await
+        .map_err(|error| format!("local model file picker did not complete: {error}"))?;
+    let selected_path = selected_file
+        .map(|file| {
+            file.into_path()
+                .map_err(|_| "selected model file is not a local filesystem path".to_owned())
+        })
+        .transpose()?;
+
+    selected_local_model_path(selected_path)
+}
+
+#[tauri::command]
+pub fn import_local_model(
+    state: State<'_, AppState>,
+    input: ImportLocalModelInput,
+) -> Result<RegisteredModel, String> {
+    if !input.license_acknowledged {
+        return Err("confirm the model card and license before importing a local model".to_owned());
+    }
+    let source_path = PathBuf::from(input.source_path);
+    if !source_path.is_absolute() {
+        return Err("select an absolute local model file path".to_owned());
+    }
+    let acknowledgement =
+        LicenseAcknowledgement::new(input.model_card_id, input.license_id, Utc::now())
+            .map_err(|error| format!("invalid model license acknowledgement: {error}"))?;
+    state.import_local_model(ModelImportRequest {
+        id: uuid::Uuid::new_v4(),
+        source_path,
+        model_kind: input.model_kind,
+        version: input.version,
+        input_format: input.input_format,
+        expected_sha256: input.expected_sha256,
+        license_acknowledgement: Some(acknowledgement),
+    })
+}
+
+fn selected_local_model_path(selected_path: Option<PathBuf>) -> Result<Option<String>, String> {
+    selected_path
+        .map(|path| {
+            if !path.is_absolute() {
+                return Err("selected model file must use an absolute local path".to_owned());
+            }
+
+            path.into_os_string()
+                .into_string()
+                .map_err(|_| "selected model file path must be valid Unicode".to_owned())
+        })
+        .transpose()
+}
+
+#[tauri::command]
 pub fn create_egress_approval(
     state: State<'_, AppState>,
     input: CreateEgressApprovalInput,
@@ -139,4 +222,27 @@ pub fn attempt_http_profile(
     input: HttpProfileAttemptInput,
 ) -> Result<PolicyDecision, String> {
     state.evaluate_http_profile(input.tool_id, input.origin, input.data_categories)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_local_model_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_model_file_selection_returns_none_when_the_picker_is_cancelled() {
+        assert_eq!(selected_local_model_path(None).unwrap(), None);
+    }
+
+    #[test]
+    fn local_model_file_selection_only_returns_absolute_paths() {
+        assert_eq!(
+            selected_local_model_path(Some(PathBuf::from("/tmp/model.gguf"))).unwrap(),
+            Some("/tmp/model.gguf".to_owned())
+        );
+        assert_eq!(
+            selected_local_model_path(Some(PathBuf::from("model.gguf"))).unwrap_err(),
+            "selected model file must use an absolute local path"
+        );
+    }
 }
