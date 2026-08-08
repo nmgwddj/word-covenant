@@ -1,6 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   AgentAction,
+  CaptureProjection,
   CaptureSession,
   DevelopmentMockProgress,
   PrivacyStatus,
@@ -14,6 +16,16 @@ const developmentMockTotalNs = 12_000_000_000
 let demoSession: CaptureSession | null = null
 let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
+
+const browserCaptureProjection: CaptureProjection = {
+  revision: 0,
+  status: 'idle',
+  permission: 'not_determined',
+  selectedDevice: null,
+  devices: [],
+  meter: null,
+  lastIssue: null,
+}
 
 interface BrowserDevelopmentMock {
   active: boolean
@@ -154,8 +166,31 @@ export const wordCovenantApi = {
       return invoke<CaptureSession>('start_session')
     }
 
-    demoSession = createDemoSession()
-    return demoSession
+    throw new Error('浏览器预览不提供真实麦克风输入；请选择开发模拟音频输入')
+  },
+
+  async getCaptureProjection(): Promise<CaptureProjection> {
+    if (isTauriRuntime()) {
+      return invoke<CaptureProjection>('get_capture_projection')
+    }
+
+    return browserCaptureProjection
+  },
+
+  async selectInputDevice(deviceUid: string): Promise<CaptureProjection> {
+    if (isTauriRuntime()) {
+      return invoke<CaptureProjection>('select_input_device', { input: { deviceUid } })
+    }
+
+    throw new Error('浏览器预览不提供真实麦克风选择')
+  },
+
+  async onCaptureProjection(listener: (projection: CaptureProjection) => void): Promise<UnlistenFn> {
+    if (isTauriRuntime()) {
+      return listen<CaptureProjection>('capture-projection', (event) => listener(event.payload))
+    }
+
+    return () => {}
   },
 
   async stopSession(): Promise<CaptureSession | null> {

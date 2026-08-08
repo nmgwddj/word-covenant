@@ -1,12 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
 import AgentActionPanel from '@/components/AgentActionPanel.vue'
+import CaptureStatus from '@/components/CaptureStatus.vue'
 import DevelopmentCaptureControl from '@/components/DevelopmentCaptureControl.vue'
 import PrivacyStatus from '@/components/PrivacyStatus.vue'
 import RecordingControl from '@/components/RecordingControl.vue'
 import TimelinePanel from '@/components/TimelinePanel.vue'
 import { usePrivacyStore } from '@/stores/privacy'
 import { useSessionStore } from '@/stores/session'
+import { wordCovenantApi } from '@/lib/wordCovenantApi'
 
 const privacyStore = usePrivacyStore()
 const sessionStore = useSessionStore()
@@ -16,8 +18,12 @@ const recordingLabel = computed(() => {
   return sessionStore.captureInput === 'development_mock' ? '模拟记录中' : '记录中'
 })
 let developmentMockTimer: number | undefined
+let unlistenCaptureProjection: (() => void) | undefined
 
 onMounted(async () => {
+  unlistenCaptureProjection = await wordCovenantApi.onCaptureProjection((projection) => {
+    sessionStore.applyCaptureProjection(projection)
+  })
   await Promise.all([privacyStore.refresh(), sessionStore.initialize()])
 })
 
@@ -35,6 +41,12 @@ function toggleDevelopmentCaptureInput() {
   sessionStore.setCaptureInput(
     sessionStore.captureInput === 'development_mock' ? 'microphone' : 'development_mock',
   )
+}
+
+async function selectInputDevice(deviceUid: string) {
+  if (deviceUid) {
+    await sessionStore.selectInputDevice(deviceUid)
+  }
 }
 
 function stopDevelopmentMockTimer() {
@@ -67,7 +79,10 @@ async function advanceDevelopmentMock() {
 
 watch(() => sessionStore.isDevelopmentMockActive, synchronizeDevelopmentMockTimer)
 
-onBeforeUnmount(stopDevelopmentMockTimer)
+onBeforeUnmount(() => {
+  stopDevelopmentMockTimer()
+  unlistenCaptureProjection?.()
+})
 </script>
 
 <template>
@@ -86,6 +101,11 @@ onBeforeUnmount(stopDevelopmentMockTimer)
         <span class="recording-state" :class="{ 'recording-state--active': sessionStore.isRecording }">
           <span aria-hidden="true" />{{ recordingLabel }}
         </span>
+        <CaptureStatus
+          :capture="sessionStore.capture"
+          :disabled="sessionStore.isLoading || sessionStore.isDevelopmentMockActive"
+          @select="selectInputDevice"
+        />
         <DevelopmentCaptureControl
           v-if="isDevelopmentBuild"
           :selected="sessionStore.captureInput === 'development_mock'"
@@ -94,7 +114,7 @@ onBeforeUnmount(stopDevelopmentMockTimer)
         />
         <RecordingControl
           :recording="sessionStore.isRecording"
-          :disabled="sessionStore.isLoading"
+          :disabled="sessionStore.isLoading || sessionStore.isAwaitingPermission"
           @toggle="toggleRecording"
         />
       </div>

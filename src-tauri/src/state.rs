@@ -1,6 +1,12 @@
+#[cfg(all(target_os = "macos", not(test)))]
+use crate::audio::CaptureStart;
+#[cfg(target_os = "macos")]
+use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
 #[cfg(any(test, debug_assertions))]
 use crate::audio::{DevelopmentMockProgress, DevelopmentMockRunner};
 use crate::audit::{AuditKind, AuditStore, AuditStoreError, AuditTrail};
+#[cfg(target_os = "macos")]
+use crate::domain::CaptureSegment;
 use crate::domain::{CaptureSession, DataCategory, TranscriptSpan};
 use crate::policy::{EgressApproval, EgressPolicy, EgressRequest, PolicyDecision, PolicyReason};
 use chrono::{DateTime, Utc};
@@ -46,6 +52,8 @@ pub struct AppState {
     policy: Mutex<EgressPolicy>,
     audit_trail: Mutex<AuditTrail>,
     audit_store: Mutex<AuditStore>,
+    #[cfg(target_os = "macos")]
+    capture_service: Mutex<CaptureService>,
     #[cfg(any(test, debug_assertions))]
     development_mock: Mutex<Option<DevelopmentMockRunner>>,
 }
@@ -76,6 +84,8 @@ impl AppState {
             policy: Mutex::new(EgressPolicy::default()),
             audit_trail: Mutex::new(audit_trail),
             audit_store: Mutex::new(audit_store),
+            #[cfg(target_os = "macos")]
+            capture_service: Mutex::new(CaptureService::new()),
             #[cfg(any(test, debug_assertions))]
             development_mock: Mutex::new(None),
         }
@@ -135,7 +145,236 @@ impl AppState {
     }
 
     pub fn start_session(&self) -> Result<CaptureSession, String> {
-        self.start_session_with_active(false)
+        #[cfg(test)]
+        {
+            return self.start_session_with_active(false);
+        }
+
+        #[cfg(not(test))]
+        self.start_microphone_session()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn capture_projection(&self) -> Result<CaptureProjection, String> {
+        let (projection, gaps) = {
+            let mut service = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?;
+            let projection = service.projection();
+            let gaps = service.take_pending_gaps();
+            (projection, gaps)
+        };
+        if let Some(session) = self.active_recording_session()? {
+            if let Err(error) = self.record_capture_gaps(session.id, gaps) {
+                let _ = self.stop_session();
+                return Err(error);
+            }
+        }
+        if matches!(
+            projection.status,
+            crate::audio::CaptureStatus::Interrupted | crate::audio::CaptureStatus::Failed
+        ) && self.active_recording_session()?.is_some()
+        {
+            let _ = self.stop_session()?;
+        }
+        Ok(projection)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn select_input_device(&self, device_uid: String) -> Result<CaptureProjection, String> {
+        self.capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .select_input_device(device_uid)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[cfg(not(test))]
+    fn start_microphone_session(&self) -> Result<CaptureSession, String> {
+        if let Some(active) = self.active_recording_session()? {
+            return Ok(active);
+        }
+
+        let capture_start = self
+            .capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .start()?;
+        let session = match self.start_session_at(capture_start.anchor.clone(), false) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self
+                    .capture_service
+                    .lock()
+                    .map_err(|_| "capture service lock poisoned".to_owned())
+                    .and_then(|mut service| service.stop().map(|_| ()));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.record_capture_started(&session, &capture_start) {
+            let _ = self.stop_session();
+            return Err(error);
+        }
+        Ok(session)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(test))]
+    fn start_microphone_session(&self) -> Result<CaptureSession, String> {
+        Err("microphone capture is only available on macOS".to_owned())
+    }
+
+    fn active_recording_session(&self) -> Result<Option<CaptureSession>, String> {
+        self.sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())
+            .map(|sessions| {
+                sessions
+                    .values()
+                    .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
+                    .cloned()
+            })
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn record_capture_started(
+        &self,
+        session: &CaptureSession,
+        capture_start: &CaptureStart,
+    ) -> Result<(), String> {
+        let segment = CaptureSegment::new(
+            session.id,
+            capture_start.device.uid(),
+            capture_start.device.name(),
+            capture_start.sample_rate,
+            capture_start.channels,
+            capture_start.anchor.monotonic_ns,
+            capture_start.anchor.wall_clock,
+        )?;
+        self.record_capture_segment(&segment)?;
+        self.record_audit(
+            AuditKind::CaptureInputStarted,
+            capture_start.anchor.monotonic_ns,
+            &serde_json::json!({
+                "sessionId": session.id,
+                "deviceUid": capture_start.device.uid(),
+                "deviceName": capture_start.device.name(),
+                "sampleRate": capture_start.sample_rate,
+                "channels": capture_start.channels,
+                "anchor": capture_start.anchor,
+            }),
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_capture_segment(&self, segment: &CaptureSegment) -> Result<(), String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let event = trail
+            .next_event(
+                Some(segment.session_id),
+                None,
+                AuditKind::CaptureSegmentRecorded,
+                segment.anchor_monotonic_ns,
+                segment.anchor_wall_clock,
+                segment,
+            )
+            .map_err(|error| format!("could not serialize capture segment: {error}"))?;
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .append_capture_segment_with_audit(&event, segment)
+            .map_err(|error| format!("could not persist capture segment: {error}"))?;
+        if !trail.append_event(event) {
+            return Err("could not append verified capture segment event".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_capture_gaps(&self, session_id: Uuid, gaps: Vec<CaptureGap>) -> Result<(), String> {
+        for gap in gaps {
+            self.record_capture_gap(session_id, &gap)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn record_capture_gap(&self, session_id: Uuid, gap: &CaptureGap) -> Result<(), String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let event = trail
+            .next_event(
+                Some(session_id),
+                None,
+                AuditKind::CaptureGapRecorded,
+                gap.ended_at.monotonic_ns,
+                gap.ended_at.wall_clock,
+                gap,
+            )
+            .map_err(|error| format!("could not serialize capture gap: {error}"))?;
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .append_capture_gap_with_audit(&event, session_id, gap)
+            .map_err(|error| format!("could not persist capture gap: {error}"))?;
+        if !trail.append_event(event) {
+            return Err("could not append verified capture gap event".to_owned());
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn start_session_with_active(
+        &self,
+        reject_active_session: bool,
+    ) -> Result<CaptureSession, String> {
+        self.start_session_at(
+            crate::audio::CapturePoint {
+                monotonic_ns: self.monotonic_ns(),
+                wall_clock: Utc::now(),
+            },
+            reject_active_session,
+        )
+    }
+
+    fn start_session_at(
+        &self,
+        point: crate::audio::CapturePoint,
+        reject_active_session: bool,
+    ) -> Result<CaptureSession, String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?;
+
+        if let Some(active) = sessions
+            .values()
+            .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
+        {
+            if reject_active_session {
+                return Err(
+                    "stop the active recording session before starting a development mock"
+                        .to_owned(),
+                );
+            }
+            return Ok(active.clone());
+        }
+
+        let session = CaptureSession::begin(point.monotonic_ns, point.wall_clock);
+        self.record_audit(AuditKind::SessionStarted, point.monotonic_ns, &session)?;
+        self.timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?
+            .entry(session.id)
+            .or_default();
+        sessions.insert(session.id, session.clone());
+        Ok(session)
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -181,42 +420,28 @@ impl AppState {
         Ok(progress)
     }
 
-    fn start_session_with_active(
-        &self,
-        reject_active_session: bool,
-    ) -> Result<CaptureSession, String> {
-        let now = Utc::now();
-        let monotonic_ns = self.monotonic_ns();
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "session state lock poisoned".to_owned())?;
-
-        if let Some(active) = sessions
-            .values()
-            .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
-        {
-            if reject_active_session {
-                return Err(
-                    "stop the active recording session before starting a development mock"
-                        .to_owned(),
-                );
-            }
-            return Ok(active.clone());
-        }
-
-        let session = CaptureSession::begin(monotonic_ns, now);
-        self.record_audit(AuditKind::SessionStarted, monotonic_ns, &session)?;
-        self.timelines
-            .lock()
-            .map_err(|_| "timeline state lock poisoned".to_owned())?
-            .entry(session.id)
-            .or_default();
-        sessions.insert(session.id, session.clone());
-        Ok(session)
-    }
-
     pub fn stop_session(&self) -> Result<Option<CaptureSession>, String> {
+        #[cfg(all(target_os = "macos", not(test)))]
+        let (stopped_native_input, pending_gaps) = {
+            let mut service = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?;
+            let stopped_native_input = service.stop()?;
+            let pending_gaps = service.take_pending_gaps();
+            (stopped_native_input, pending_gaps)
+        };
+        #[cfg(any(not(target_os = "macos"), test))]
+        let stopped_native_input = false;
+
+        #[cfg(all(target_os = "macos", not(test)))]
+        let active_session = self.active_recording_session()?;
+        #[cfg(all(target_os = "macos", not(test)))]
+        let capture_gap_result = active_session
+            .as_ref()
+            .map(|session| self.record_capture_gaps(session.id, pending_gaps))
+            .transpose();
+
         let now = Utc::now();
         let monotonic_ns = self.monotonic_ns();
         let stopped = {
@@ -239,6 +464,18 @@ impl AppState {
 
         #[cfg(any(test, debug_assertions))]
         self.stop_development_mock(stopped.id)?;
+
+        #[cfg(target_os = "macos")]
+        if stopped_native_input {
+            self.record_audit(
+                AuditKind::CaptureInputStopped,
+                monotonic_ns,
+                &serde_json::json!({ "sessionId": stopped.id }),
+            )?;
+        }
+
+        #[cfg(all(target_os = "macos", not(test)))]
+        capture_gap_result?;
 
         Ok(Some(stopped))
     }
@@ -447,7 +684,13 @@ fn policy_reason_message(reason: PolicyReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use crate::audio::{CaptureGap, CaptureGapReason, CapturePoint};
+    #[cfg(target_os = "macos")]
+    use crate::domain::CaptureSegment;
     use crate::domain::TranscriptSource;
+    #[cfg(target_os = "macos")]
+    use chrono::Duration;
 
     #[test]
     fn starts_and_stops_an_audited_local_session() {
@@ -459,6 +702,51 @@ mod tests {
             Some(session.id)
         );
         assert!(state.stop_session().unwrap().is_some());
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn persists_capture_segment_and_gap_through_the_application_state() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let anchor = CapturePoint {
+            monotonic_ns: 5_000,
+            wall_clock: Utc::now(),
+        };
+        let segment = CaptureSegment::new(
+            session.id,
+            "built-in-mic",
+            "Built-in Microphone",
+            48_000,
+            2,
+            anchor.monotonic_ns,
+            anchor.wall_clock,
+        )
+        .unwrap();
+        let gap = CaptureGap {
+            started_at: CapturePoint {
+                monotonic_ns: 8_000,
+                wall_clock: anchor.wall_clock + Duration::milliseconds(3),
+            },
+            ended_at: CapturePoint {
+                monotonic_ns: 9_500,
+                wall_clock: anchor.wall_clock + Duration::milliseconds(4),
+            },
+            reason: CaptureGapReason::InputDeviceUnavailable,
+        };
+
+        state.record_capture_segment(&segment).unwrap();
+        state.record_capture_gap(session.id, &gap).unwrap();
+
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_capture_segments(session.id).unwrap(),
+            vec![segment]
+        );
+        assert_eq!(store.list_capture_gaps(session.id).unwrap(), vec![gap]);
+        assert!(store.verify().unwrap());
+        drop(store);
         assert!(state.audit_is_valid().unwrap());
     }
 

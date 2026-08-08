@@ -8,6 +8,10 @@ use uuid::Uuid;
 pub enum AuditKind {
     SessionStarted,
     SessionStopped,
+    CaptureInputStarted,
+    CaptureInputStopped,
+    CaptureSegmentRecorded,
+    CaptureGapRecorded,
     TranscriptRecorded,
     PlanProposed,
     EgressApprovalCreated,

@@ -50,6 +50,10 @@ impl fmt::Display for CaptureLifecycleAction {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureFailureCode {
+    PermissionDenied,
+    PermissionRestricted,
+    NoInputDevice,
+    StreamStartFailed,
     InputDeviceUnavailable,
     CaptureQueueClosed,
     External,
@@ -169,7 +173,11 @@ impl CaptureLifecycle {
     ) -> Result<(), CaptureLifecycleError> {
         self.require_status(
             CaptureLifecycleAction::BeginPermissionResolution,
-            &[CaptureStatus::Idle, CaptureStatus::Failed],
+            &[
+                CaptureStatus::Idle,
+                CaptureStatus::Interrupted,
+                CaptureStatus::Failed,
+            ],
         )?;
         self.transition(CaptureStatus::AwaitingPermission, at);
         Ok(())
@@ -180,6 +188,17 @@ impl CaptureLifecycle {
     pub fn fail(
         &mut self,
         at: CapturePoint,
+        message: impl Into<String>,
+    ) -> Result<(), CaptureLifecycleError> {
+        self.fail_with_code(at, CaptureFailureCode::External, message)
+    }
+
+    /// Record an application-observed failure with a stable code suitable for
+    /// a compact UI projection and audit event.
+    pub fn fail_with_code(
+        &mut self,
+        at: CapturePoint,
+        code: CaptureFailureCode,
         message: impl Into<String>,
     ) -> Result<(), CaptureLifecycleError> {
         self.require_status(
@@ -197,7 +216,7 @@ impl CaptureLifecycle {
             return Err(CaptureLifecycleError::EmptyFailureMessage);
         }
 
-        self.record_failure(CaptureFailureCode::External, message, at);
+        self.record_failure(code, message, at);
         Ok(())
     }
 

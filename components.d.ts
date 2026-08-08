@@ -12,6 +12,7 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AgentActionPanel: typeof import('./src/components/AgentActionPanel.vue')['default']
+    CaptureStatus: typeof import('./src/components/CaptureStatus.vue')['default']
     DevelopmentCaptureControl: typeof import('./src/components/DevelopmentCaptureControl.vue')['default']
     GreetComponent: typeof import('./src/components/GreetComponent.vue')['default']
     OutboundAccessControl: typeof import('./src/components/OutboundAccessControl.vue')['default']

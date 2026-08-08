@@ -35,4 +35,21 @@ describe('wordCovenantApi browser development mock', () => {
     expect((await wordCovenantApi.listTimeline(session.id))).toHaveLength(3)
     expect(fetchSpy).not.toHaveBeenCalled()
   })
+
+  test('keeps microphone projection APIs inert in browser preview', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    const projection = await wordCovenantApi.getCaptureProjection()
+    const unlisten = await wordCovenantApi.onCaptureProjection(vi.fn())
+
+    expect(projection.status).toBe('idle')
+    expect(projection.devices).toEqual([])
+    expect(unlisten()).toBeUndefined()
+    await expect(wordCovenantApi.startSession()).rejects.toThrow('浏览器预览不提供真实麦克风输入')
+    await expect(wordCovenantApi.selectInputDevice('coreaudio:demo')).rejects.toThrow('浏览器预览')
+    expect((await wordCovenantApi.getPrivacyStatus()).recordingSessionId).toBeNull()
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
 })

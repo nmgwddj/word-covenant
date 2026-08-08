@@ -35,7 +35,6 @@
 }
 
 body {
-  min-width: 960px;
   min-height: 100vh;
   margin: 0;
   background: var(--canvas);
@@ -131,6 +130,91 @@ button:focus-visible {
   background: var(--surface-subtle);
   font-size: 11px;
   font-weight: 650;
+}
+
+.capture-status {
+  display: grid;
+  grid-template-columns: 7px minmax(112px, 176px) 56px auto;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 8px;
+  color: var(--ink-muted);
+  background: var(--surface-subtle);
+  font-size: 10px;
+}
+
+.capture-status__signal {
+  width: 6px;
+  height: 6px;
+  background: #b8b8bd;
+  border-radius: 50%;
+}
+
+.capture-status__device {
+  min-width: 0;
+  height: 24px;
+  padding: 0 18px 0 0;
+  border: 0;
+  color: var(--ink-soft);
+  background: transparent;
+  font: inherit;
+  line-height: 1;
+  text-overflow: ellipsis;
+}
+
+.capture-status__device:disabled {
+  cursor: default;
+  opacity: 0.72;
+}
+
+.capture-status__meter {
+  display: block;
+  width: 56px;
+  height: 3px;
+  overflow: hidden;
+  background: var(--surface-muted);
+}
+
+.capture-status__meter > span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: var(--ink-soft);
+  transition: width 100ms linear;
+}
+
+.capture-status__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.capture-status--recording {
+  color: var(--recording);
+  background: var(--recording-soft);
+}
+
+.capture-status--recording .capture-status__signal {
+  background: var(--recording);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+
+.capture-status--recording .capture-status__meter > span {
+  background: var(--recording);
+}
+
+.capture-status--awaiting_permission .capture-status__signal {
+  background: var(--ink-soft);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+
+.capture-status--interrupted,
+.capture-status--failed {
+  color: var(--ink-soft);
+  background: var(--surface-muted);
 }
 
 .privacy-status--egress {

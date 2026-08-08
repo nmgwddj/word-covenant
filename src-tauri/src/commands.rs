@@ -24,6 +24,12 @@ pub struct HttpProfileAttemptInput {
     pub data_categories: BTreeSet<DataCategory>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectInputDeviceInput {
+    pub device_uid: String,
+}
+
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +53,21 @@ pub fn set_egress_enabled(
 #[tauri::command]
 pub fn start_session(state: State<'_, AppState>) -> Result<crate::domain::CaptureSession, String> {
     state.start_session()
+}
+
+#[tauri::command]
+pub fn get_capture_projection(
+    state: State<'_, AppState>,
+) -> Result<crate::audio::CaptureProjection, String> {
+    state.capture_projection()
+}
+
+#[tauri::command]
+pub fn select_input_device(
+    state: State<'_, AppState>,
+    input: SelectInputDeviceInput,
+) -> Result<crate::audio::CaptureProjection, String> {
+    state.select_input_device(input.device_uid)
 }
 
 #[cfg(any(test, debug_assertions))]

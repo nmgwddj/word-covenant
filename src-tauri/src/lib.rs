@@ -1,4 +1,4 @@
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub mod audio;
 pub mod audit;
@@ -17,6 +17,28 @@ pub fn run() {
                 data_dir.join("word-covenant.sqlite3"),
             )?);
 
+            #[cfg(target_os = "macos")]
+            {
+                let app_handle = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("word-covenant-capture-projection".to_owned())
+                    .spawn(move || {
+                        let mut emitted_revision = None;
+                        loop {
+                            let projection =
+                                app_handle.state::<state::AppState>().capture_projection();
+                            if let Ok(projection) = projection {
+                                let revision = projection.revision;
+                                if emitted_revision != Some(revision) {
+                                    let _ = app_handle.emit("capture-projection", &projection);
+                                    emitted_revision = Some(revision);
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                    })?;
+            }
+
             #[cfg(debug_assertions)] // only include this code on debug builds
             {
                 if let Some(window) = tauri::Manager::get_webview_window(app, "main") {
@@ -32,6 +54,8 @@ pub fn run() {
         commands::get_privacy_status,
         commands::set_egress_enabled,
         commands::start_session,
+        commands::get_capture_projection,
+        commands::select_input_device,
         commands::start_development_mock_session,
         commands::advance_development_mock,
         commands::stop_session,
@@ -48,6 +72,8 @@ pub fn run() {
         commands::get_privacy_status,
         commands::set_egress_enabled,
         commands::start_session,
+        commands::get_capture_projection,
+        commands::select_input_device,
         commands::stop_session,
         commands::list_timeline,
         commands::create_egress_approval,
