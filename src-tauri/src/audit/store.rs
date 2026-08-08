@@ -3,9 +3,13 @@ use crate::audio::{CaptureGap, CapturePoint};
 use crate::domain::{
     CaptureSegment, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
 };
+use crate::inference::asr::logical_span_id_for_asr_utterance_digest;
 use crate::inference::model_registry::{LocalModelKind, RegisteredModel};
+use crate::inference::AsrFinalIdempotencyKey;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use uuid::Uuid;
 
@@ -120,6 +124,88 @@ pub struct AuditStore {
     connection: Connection,
 }
 
+/// Durable result of one native ASR final emission. This is deliberately
+/// separate from `transcript_revisions`: final-ASR revisions may have an
+/// adapter revision that differs from the first durable transcript revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AsrFinalIdempotencyRecord {
+    pub revision_id: Uuid,
+    pub emission_payload_sha256: String,
+}
+
+/// The immutable facts that bind a native ASR final emission to its durable
+/// transcript revision. This object is included in the transcript audit
+/// event's hashed payload, so changing SQLite idempotency metadata is
+/// detectable during verification.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrFinalIdempotencyBinding {
+    pub session_id: Uuid,
+    pub utterance_key_sha256: String,
+    pub emission_revision: u32,
+    pub revision_id: Uuid,
+    pub logical_span_id: Uuid,
+    pub emission_payload_sha256: String,
+}
+
+impl AsrFinalIdempotencyBinding {
+    pub fn new(
+        key: &AsrFinalIdempotencyKey,
+        revision: &TranscriptRevision,
+        emission_payload_sha256: impl Into<String>,
+    ) -> Result<Self, String> {
+        key.validate()?;
+        let emission_payload_sha256 = emission_payload_sha256.into();
+        if emission_payload_sha256.len() != 64
+            || !emission_payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err("ASR final payload SHA-256 must be 64 hexadecimal characters".to_owned());
+        }
+        let utterance_key_sha256 = key.opaque_utterance_key_sha256();
+        let expected_logical_span_id =
+            logical_span_id_for_asr_utterance_digest(key.session_id, &utterance_key_sha256);
+        if revision.logical_span_id != expected_logical_span_id {
+            return Err("ASR final logical span ID does not match its utterance key".to_owned());
+        }
+        if revision.id != revision.logical_span_id {
+            return Err("ASR final must bind its first durable transcript revision".to_owned());
+        }
+
+        Ok(Self {
+            session_id: key.session_id,
+            utterance_key_sha256,
+            emission_revision: key.emission_revision,
+            revision_id: revision.id,
+            logical_span_id: revision.logical_span_id,
+            emission_payload_sha256,
+        })
+    }
+}
+
+/// Payload committed by the existing transcript-revision audit event when
+/// the revision originated from native ASR. It preserves the standard
+/// transcript event kind while binding ASR replay metadata into its digest.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AsrFinalAuditPayload<'a> {
+    pub revision: &'a TranscriptRevision,
+    pub idempotency: &'a AsrFinalIdempotencyBinding,
+}
+
+impl<'a> AsrFinalAuditPayload<'a> {
+    pub fn new(
+        revision: &'a TranscriptRevision,
+        idempotency: &'a AsrFinalIdempotencyBinding,
+    ) -> Self {
+        Self {
+            revision,
+            idempotency,
+        }
+    }
+}
+
 impl AuditStore {
     pub fn open_in_memory() -> Result<Self, AuditStoreError> {
         let connection = Connection::open_in_memory()?;
@@ -210,6 +296,27 @@ impl AuditStore {
             BEFORE DELETE ON transcript_revisions
             BEGIN
                 SELECT RAISE(ABORT, 'transcript revisions are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS asr_final_idempotency (
+                session_id TEXT NOT NULL,
+                utterance_key_sha256 TEXT NOT NULL,
+                emission_revision INTEGER NOT NULL CHECK (emission_revision > 0),
+                revision_id TEXT NOT NULL UNIQUE,
+                emission_payload_sha256 TEXT NOT NULL,
+                PRIMARY KEY (session_id, utterance_key_sha256, emission_revision)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS asr_final_idempotency_utterance
+                ON asr_final_idempotency(session_id, utterance_key_sha256);
+            CREATE TRIGGER IF NOT EXISTS asr_final_idempotency_is_immutable_update
+            BEFORE UPDATE ON asr_final_idempotency
+            BEGIN
+                SELECT RAISE(ABORT, 'ASR final idempotency records are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS asr_final_idempotency_is_immutable_delete
+            BEFORE DELETE ON asr_final_idempotency
+            BEGIN
+                SELECT RAISE(ABORT, 'ASR final idempotency records are immutable');
             END;
 
             CREATE VIRTUAL TABLE IF NOT EXISTS transcript_revision_fts USING fts5(
@@ -311,11 +418,18 @@ impl AuditStore {
             .filter(|event| event.kind == AuditKind::TranscriptRevisionRecorded)
             .collect::<Vec<_>>();
         let revisions = self.list_all_transcript_revisions()?;
+        let Some(asr_bindings) = self.verified_asr_final_idempotency_bindings()? else {
+            return Ok(false);
+        };
         if transcript_events.len() != revisions.len()
             || !revisions.iter().all(|revision| {
-                transcript_events
-                    .iter()
-                    .any(|event| validate_transcript_audit_event(event, revision).is_ok())
+                let matches_event = |event: &&AuditEvent| match asr_bindings.get(&revision.id) {
+                    Some(binding) => {
+                        validate_asr_final_audit_event(event, revision, binding).is_ok()
+                    }
+                    None => validate_transcript_audit_event(event, revision).is_ok(),
+                };
+                transcript_events.iter().any(matches_event)
             })
         {
             return Ok(false);
@@ -500,6 +614,59 @@ impl AuditStore {
         Ok(())
     }
 
+    /// Returns the durable final-ASR record for one source emission identity.
+    /// Callers compare its payload digest before treating a replay as benign.
+    pub fn lookup_asr_final_idempotency(
+        &self,
+        key: &AsrFinalIdempotencyKey,
+    ) -> Result<Option<AsrFinalIdempotencyRecord>, AuditStoreError> {
+        validate_asr_final_idempotency_key(key)?;
+        self.connection
+            .query_row(
+                "
+                SELECT revision_id, emission_payload_sha256
+                FROM asr_final_idempotency
+                WHERE session_id = ?1 AND utterance_key_sha256 = ?2 AND emission_revision = ?3
+                ",
+                params![
+                    key.session_id.to_string(),
+                    key.opaque_utterance_key_sha256(),
+                    i64::from(key.emission_revision),
+                ],
+                |row| {
+                    Ok(AsrFinalIdempotencyRecord {
+                        revision_id: parse_uuid(&row.get::<_, String>(0)?).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?,
+                        emission_payload_sha256: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(AuditStoreError::from)
+    }
+
+    /// Writes an audit event, its immutable transcript revision, and the
+    /// native final-ASR idempotency key in one transaction.
+    pub fn append_asr_final_transcript_revision_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        revision: &TranscriptRevision,
+        idempotency: &AsrFinalIdempotencyBinding,
+    ) -> Result<(), AuditStoreError> {
+        validate_asr_final_audit_event(event, revision, idempotency)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_transcript_revision(&transaction, revision)?;
+        insert_asr_final_idempotency(&transaction, idempotency, revision.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn list_transcript_revisions(
         &self,
         session_id: Uuid,
@@ -601,6 +768,82 @@ impl AuditStore {
         let rows =
             statement.query_map(params![query, stored_session_id], transcript_revision_row)?;
         rows.map(|row| parse_transcript_revision(row?)).collect()
+    }
+
+    fn verified_asr_final_idempotency_bindings(
+        &self,
+    ) -> Result<Option<BTreeMap<Uuid, AsrFinalIdempotencyBinding>>, AuditStoreError> {
+        let broken_references = self.connection.query_row(
+            "
+            SELECT COUNT(*)
+            FROM asr_final_idempotency AS keys
+            LEFT JOIN transcript_revisions AS revisions
+                ON revisions.id = keys.revision_id
+            WHERE revisions.id IS NULL
+               OR revisions.session_id != keys.session_id
+               OR revisions.is_final != 1
+               OR revisions.source != ?1
+            ",
+            params![serde_json::to_string(&TranscriptSource::LocalInference)
+                .expect("transcript source serializes")],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if broken_references != 0 {
+            return Ok(None);
+        }
+
+        let mut statement = self.connection.prepare(
+            "
+            SELECT keys.session_id, keys.utterance_key_sha256, keys.emission_revision,
+                   keys.revision_id, keys.emission_payload_sha256,
+                   revisions.logical_span_id
+            FROM asr_final_idempotency AS keys
+            INNER JOIN transcript_revisions AS revisions
+                ON revisions.id = keys.revision_id
+            ",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut bindings = BTreeMap::new();
+        for row in rows {
+            let (
+                session_id,
+                utterance_key_sha256,
+                emission_revision,
+                revision_id,
+                emission_payload_sha256,
+                logical_span_id,
+            ) = row?;
+            let emission_revision = emission_revision.try_into().map_err(|_| {
+                AuditStoreError::InvalidTranscriptMetadata {
+                    field: "ASR final idempotency revision",
+                    value: emission_revision.to_string(),
+                }
+            })?;
+            let binding = AsrFinalIdempotencyBinding {
+                session_id: parse_uuid(&session_id)?,
+                utterance_key_sha256,
+                emission_revision,
+                revision_id: parse_uuid(&revision_id)?,
+                logical_span_id: parse_uuid(&logical_span_id)?,
+                emission_payload_sha256,
+            };
+            if validate_persisted_asr_final_idempotency_binding(&binding).is_err()
+                || bindings.insert(binding.revision_id, binding).is_some()
+            {
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(bindings))
     }
 }
 
@@ -860,12 +1103,14 @@ fn validate_transcript_audit_event(
     event: &AuditEvent,
     revision: &TranscriptRevision,
 ) -> Result<(), AuditStoreError> {
-    if event.kind != AuditKind::TranscriptRevisionRecorded {
+    if revision.source == TranscriptSource::LocalInference {
         return Err(AuditStoreError::InvalidTranscriptMetadata {
-            field: "audit event kind",
-            value: serde_json::to_string(&event.kind).expect("audit kind serializes"),
+            field: "local inference audit binding",
+            value: "native ASR transcript revisions must use the idempotency-bound write path"
+                .to_owned(),
         });
     }
+    validate_transcript_audit_event_metadata(event, revision)?;
     if !event.matches_payload(revision).map_err(|error| {
         AuditStoreError::InvalidTranscriptMetadata {
             field: "audit event payload",
@@ -875,6 +1120,42 @@ fn validate_transcript_audit_event(
         return Err(AuditStoreError::InvalidTranscriptMetadata {
             field: "audit event payload",
             value: "digest does not match transcript revision".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_asr_final_audit_event(
+    event: &AuditEvent,
+    revision: &TranscriptRevision,
+    idempotency: &AsrFinalIdempotencyBinding,
+) -> Result<(), AuditStoreError> {
+    validate_asr_final_idempotency_binding(idempotency, revision)?;
+    validate_transcript_audit_event_metadata(event, revision)?;
+    let payload = AsrFinalAuditPayload::new(revision, idempotency);
+    if !event.matches_payload(&payload).map_err(|error| {
+        AuditStoreError::InvalidTranscriptMetadata {
+            field: "audit event payload",
+            value: error.to_string(),
+        }
+    })? {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "audit event payload",
+            value: "digest does not match transcript revision and ASR idempotency binding"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_transcript_audit_event_metadata(
+    event: &AuditEvent,
+    revision: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    if event.kind != AuditKind::TranscriptRevisionRecorded {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "audit event kind",
+            value: serde_json::to_string(&event.kind).expect("audit kind serializes"),
         });
     }
     if event.run_id != Some(revision.session_id) {
@@ -897,6 +1178,86 @@ fn validate_transcript_audit_event(
                 "monotonic_ns={}, wall_clock={}",
                 event.monotonic_ns,
                 event.wall_clock.to_rfc3339()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_asr_final_idempotency_binding(
+    idempotency: &AsrFinalIdempotencyBinding,
+    revision: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    validate_persisted_asr_final_idempotency_binding(idempotency)?;
+    if idempotency.session_id != revision.session_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency session",
+            value: format!(
+                "binding session {}, revision session {}",
+                idempotency.session_id, revision.session_id
+            ),
+        });
+    }
+    if idempotency.revision_id != revision.id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency revision ID",
+            value: format!(
+                "binding revision {}, transcript revision {}",
+                idempotency.revision_id, revision.id
+            ),
+        });
+    }
+    if idempotency.logical_span_id != revision.logical_span_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency logical span",
+            value: format!(
+                "binding logical span {}, transcript logical span {}",
+                idempotency.logical_span_id, revision.logical_span_id
+            ),
+        });
+    }
+    if revision.id != revision.logical_span_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency revision",
+            value: "native ASR final must create the first durable revision".to_owned(),
+        });
+    }
+    if revision.source != TranscriptSource::LocalInference {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency source",
+            value: format!("{:?}", revision.source),
+        });
+    }
+    Ok(())
+}
+
+fn validate_persisted_asr_final_idempotency_binding(
+    idempotency: &AsrFinalIdempotencyBinding,
+) -> Result<(), AuditStoreError> {
+    if idempotency.emission_revision == 0 {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency revision",
+            value: "0".to_owned(),
+        });
+    }
+    validate_sha256_hex(
+        "ASR final utterance key SHA-256",
+        &idempotency.utterance_key_sha256,
+    )?;
+    validate_sha256_hex(
+        "ASR final payload SHA-256",
+        &idempotency.emission_payload_sha256,
+    )?;
+    let expected_logical_span_id = logical_span_id_for_asr_utterance_digest(
+        idempotency.session_id,
+        &idempotency.utterance_key_sha256,
+    );
+    if idempotency.logical_span_id != expected_logical_span_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency logical span",
+            value: format!(
+                "expected {expected_logical_span_id}, received {}",
+                idempotency.logical_span_id
             ),
         });
     }
@@ -1029,6 +1390,47 @@ fn insert_transcript_revision(
             revision.logical_span_id.to_string(),
         ],
     )?;
+    Ok(())
+}
+
+fn insert_asr_final_idempotency(
+    connection: &Connection,
+    idempotency: &AsrFinalIdempotencyBinding,
+    revision_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    connection.execute(
+        "
+        INSERT INTO asr_final_idempotency (
+            session_id, utterance_key_sha256, emission_revision, revision_id,
+            emission_payload_sha256
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ",
+        params![
+            idempotency.session_id.to_string(),
+            &idempotency.utterance_key_sha256,
+            i64::from(idempotency.emission_revision),
+            revision_id.to_string(),
+            &idempotency.emission_payload_sha256,
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_asr_final_idempotency_key(key: &AsrFinalIdempotencyKey) -> Result<(), AuditStoreError> {
+    key.validate()
+        .map_err(|value| AuditStoreError::InvalidTranscriptMetadata {
+            field: "ASR final idempotency key",
+            value,
+        })
+}
+
+fn validate_sha256_hex(field: &'static str, value: &str) -> Result<(), AuditStoreError> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field,
+            value: value.to_owned(),
+        });
+    }
     Ok(())
 }
 
@@ -1463,7 +1865,7 @@ mod tests {
             Some("speaker-1".to_owned()),
             "local fixture original",
             true,
-            TranscriptSource::LocalInference,
+            TranscriptSource::Synthetic,
             Some(
                 TranscriptModelProvenance::new(
                     "whisper.cpp",
@@ -1492,6 +1894,190 @@ mod tests {
             previous_hash,
         )
         .unwrap()
+    }
+
+    fn asr_final_fixture(
+        session_id: Uuid,
+        utterance_key: &str,
+        emission_revision: u32,
+        emission_payload_sha256: impl Into<String>,
+    ) -> (
+        TranscriptRevision,
+        AsrFinalIdempotencyKey,
+        AsrFinalIdempotencyBinding,
+    ) {
+        let key = AsrFinalIdempotencyKey::new(session_id, utterance_key, emission_revision)
+            .expect("fixture ASR key is valid");
+        let mut revision = transcript_fixture(session_id);
+        revision.source = TranscriptSource::LocalInference;
+        let logical_span_id = logical_span_id_for_asr_utterance_digest(
+            session_id,
+            &key.opaque_utterance_key_sha256(),
+        );
+        revision.id = logical_span_id;
+        revision.logical_span_id = logical_span_id;
+        let idempotency = AsrFinalIdempotencyBinding::new(&key, &revision, emission_payload_sha256)
+            .expect("fixture ASR idempotency binding is valid");
+
+        (revision, key, idempotency)
+    }
+
+    fn asr_final_event(
+        revision: &TranscriptRevision,
+        idempotency: &AsrFinalIdempotencyBinding,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        let payload = AsrFinalAuditPayload::new(revision, idempotency);
+        AuditEvent::new(
+            Some(revision.session_id),
+            revision.parent_revision_id,
+            AuditKind::TranscriptRevisionRecorded,
+            revision.capture_end_ns,
+            revision.wall_clock_end,
+            &payload,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn atomically_binds_a_final_asr_emission_to_its_revision_across_reopen() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-asr-final-idempotency-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let payload_sha256 = "d".repeat(64);
+        let (revision, key, idempotency) = asr_final_fixture(
+            Uuid::new_v4(),
+            "fixture-utterance-1",
+            2,
+            payload_sha256.clone(),
+        );
+        let event = asr_final_event(&revision, &idempotency, None);
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            store
+                .append_asr_final_transcript_revision_with_audit(&event, &revision, &idempotency)
+                .unwrap();
+            assert_eq!(
+                store.lookup_asr_final_idempotency(&key).unwrap(),
+                Some(AsrFinalIdempotencyRecord {
+                    revision_id: revision.id,
+                    emission_payload_sha256: payload_sha256.clone(),
+                })
+            );
+            assert!(store.verify().unwrap());
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert_eq!(
+            reopened.lookup_asr_final_idempotency(&key).unwrap(),
+            Some(AsrFinalIdempotencyRecord {
+                revision_id: revision.id,
+                emission_payload_sha256: payload_sha256,
+            })
+        );
+        assert_eq!(
+            reopened
+                .list_transcript_revisions(revision.session_id)
+                .unwrap(),
+            vec![revision]
+        );
+        assert!(reopened.verify().unwrap());
+
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn verification_rejects_an_asr_final_payload_digest_tampered_after_its_audit_event() {
+        let payload_sha256 = "d".repeat(64);
+        let (revision, _key, idempotency) = asr_final_fixture(
+            Uuid::new_v4(),
+            "fixture-utterance-payload-tamper",
+            1,
+            payload_sha256,
+        );
+        let event = asr_final_event(&revision, &idempotency, None);
+        let mut store = AuditStore::open_in_memory().unwrap();
+        store
+            .append_asr_final_transcript_revision_with_audit(&event, &revision, &idempotency)
+            .unwrap();
+        assert!(store.verify().unwrap());
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER asr_final_idempotency_is_immutable_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE asr_final_idempotency SET emission_payload_sha256 = ?1 WHERE revision_id = ?2",
+                params!["e".repeat(64), revision.id.to_string()],
+            )
+            .unwrap();
+
+        assert!(!store.verify().unwrap());
+    }
+
+    #[test]
+    fn verification_rejects_an_asr_final_missing_its_idempotency_binding() {
+        let (revision, _key, idempotency) = asr_final_fixture(
+            Uuid::new_v4(),
+            "fixture-utterance-binding-delete",
+            1,
+            "d".repeat(64),
+        );
+        let event = asr_final_event(&revision, &idempotency, None);
+        let mut store = AuditStore::open_in_memory().unwrap();
+        store
+            .append_asr_final_transcript_revision_with_audit(&event, &revision, &idempotency)
+            .unwrap();
+        assert!(store.verify().unwrap());
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER asr_final_idempotency_is_immutable_delete;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM asr_final_idempotency WHERE revision_id = ?1",
+                params![revision.id.to_string()],
+            )
+            .unwrap();
+
+        assert!(!store.verify().unwrap());
+    }
+
+    #[test]
+    fn verification_rejects_an_asr_final_key_rebound_to_a_different_logical_span() {
+        let (revision, _key, idempotency) = asr_final_fixture(
+            Uuid::new_v4(),
+            "fixture-utterance-key-tamper",
+            1,
+            "d".repeat(64),
+        );
+        let event = asr_final_event(&revision, &idempotency, None);
+        let mut store = AuditStore::open_in_memory().unwrap();
+        store
+            .append_asr_final_transcript_revision_with_audit(&event, &revision, &idempotency)
+            .unwrap();
+        assert!(store.verify().unwrap());
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER asr_final_idempotency_is_immutable_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE asr_final_idempotency SET utterance_key_sha256 = ?1 WHERE revision_id = ?2",
+                params!["e".repeat(64), revision.id.to_string()],
+            )
+            .unwrap();
+
+        assert!(!store.verify().unwrap());
     }
 
     fn local_model_fixture() -> RegisteredModel {
@@ -1710,6 +2296,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unbound_local_inference_revisions_on_write_and_verification() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let mut revision = transcript_fixture(Uuid::new_v4());
+        revision.source = TranscriptSource::LocalInference;
+        let event = transcript_event(&revision, None);
+
+        assert!(matches!(
+            store.append_transcript_revision_with_audit(&event, &revision),
+            Err(AuditStoreError::InvalidTranscriptMetadata {
+                field: "local inference audit binding",
+                ..
+            })
+        ));
+        assert!(store.list().unwrap().is_empty());
+        assert!(store
+            .list_transcript_revisions(revision.session_id)
+            .unwrap()
+            .is_empty());
+
+        // Simulate a legacy or directly-tampered SQLite row. Its generic
+        // audit payload is valid, but a local ASR record without its durable
+        // idempotency binding must fail verification after reopening.
+        insert_audit_event(&store.connection, &event).unwrap();
+        insert_transcript_revision(&store.connection, &revision).unwrap();
+        assert!(!store.verify().unwrap());
+    }
+
+    #[test]
     fn verification_rejects_a_transcript_tampered_after_its_audit_event() {
         let mut store = AuditStore::open_in_memory().unwrap();
         let revision = transcript_fixture(Uuid::new_v4());
@@ -1855,7 +2469,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_nonfinal_asr_output_out_of_durable_storage() {
+    fn keeps_nonfinal_transcript_output_out_of_durable_storage() {
         let mut store = AuditStore::open_in_memory().unwrap();
         let mut transient = transcript_fixture(Uuid::new_v4());
         transient.is_final = false;

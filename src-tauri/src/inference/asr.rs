@@ -3,6 +3,7 @@ use super::{
     MAX_MODEL_IDENTIFIER_BYTES,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -10,6 +11,7 @@ pub const MAX_ASR_EMISSIONS_PER_REQUEST: usize = 16;
 pub const MAX_TRANSCRIPT_TEXT_BYTES: usize = 4_096;
 pub const MAX_WORD_TIMINGS_PER_EMISSION: usize = 256;
 pub const MAX_LANGUAGE_TAG_BYTES: usize = 35;
+pub const MAX_TRANSIENT_ASR_UTTERANCES: usize = 256;
 
 /// Input for one bounded local ASR call.
 #[derive(Clone, Debug, PartialEq)]
@@ -148,16 +150,28 @@ impl AsrResponse {
         expected_model: &ModelProvenance,
         emissions: Vec<TranscriptEmission>,
     ) -> Result<Self, String> {
+        let response = Self { emissions };
+        response.validate_against(request, expected_model)?;
+        Ok(response)
+    }
+
+    /// Validates an adapter response even when the adapter constructed this
+    /// public transport type directly instead of using [`Self::new`].
+    pub fn validate_against(
+        &self,
+        request: &AsrRequest,
+        expected_model: &ModelProvenance,
+    ) -> Result<(), String> {
         request.validate()?;
         expected_model.validate()?;
-        if emissions.len() > MAX_ASR_EMISSIONS_PER_REQUEST {
+        if self.emissions.len() > MAX_ASR_EMISSIONS_PER_REQUEST {
             return Err(format!(
                 "ASR response exceeds {MAX_ASR_EMISSIONS_PER_REQUEST} emissions"
             ));
         }
 
         let mut revisions = BTreeMap::<String, (u32, bool)>::new();
-        for emission in &emissions {
+        for emission in &self.emissions {
             emission.validate()?;
             if &emission.model_provenance != expected_model {
                 return Err("ASR emission model provenance does not match its engine".to_owned());
@@ -184,7 +198,51 @@ impl AsrResponse {
             history.1 = emission.kind == TranscriptEmissionKind::Final;
         }
 
-        Ok(Self { emissions })
+        Ok(())
+    }
+}
+
+/// Stable identity for a final native ASR emission. The SQLite store binds
+/// this to the durable transcript revision in the same transaction, so a
+/// process crash cannot turn a replay into a second transcript record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AsrFinalIdempotencyKey {
+    pub session_id: Uuid,
+    pub utterance_key: String,
+    pub emission_revision: u32,
+}
+
+impl AsrFinalIdempotencyKey {
+    pub fn new(
+        session_id: Uuid,
+        utterance_key: impl Into<String>,
+        emission_revision: u32,
+    ) -> Result<Self, String> {
+        let key = Self {
+            session_id,
+            utterance_key: utterance_key.into(),
+            emission_revision,
+        };
+        validate_utterance_key(&key.utterance_key)?;
+        if key.emission_revision == 0 {
+            return Err("final ASR emission revision must start at 1".to_owned());
+        }
+        Ok(key)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_utterance_key(&self.utterance_key)?;
+        if self.emission_revision == 0 {
+            return Err("final ASR emission revision must start at 1".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Returns the opaque durable representation of the adapter's utterance
+    /// key. Adapter keys are not guaranteed to be non-sensitive, so SQLite
+    /// never stores their raw value.
+    pub(crate) fn opaque_utterance_key_sha256(&self) -> String {
+        opaque_utterance_key_sha256(&self.utterance_key)
     }
 }
 
@@ -203,6 +261,28 @@ pub struct FinalTranscriptEmission {
     reservation_id: Uuid,
 }
 
+impl FinalTranscriptEmission {
+    pub(crate) fn idempotency_key(&self) -> AsrFinalIdempotencyKey {
+        AsrFinalIdempotencyKey::new(
+            self.session_id,
+            self.emission.utterance_key.clone(),
+            self.emission.revision,
+        )
+        .expect("mapped final emissions are already validated")
+    }
+
+    /// A deterministic fingerprint of all final-ASR fields, including
+    /// word-level timing that is intentionally not copied into the compact
+    /// transcript revision. It lets SQLite distinguish a harmless replay from
+    /// a conflicting reuse of the same final-emission key.
+    pub(crate) fn idempotency_payload_sha256(&self) -> String {
+        let bytes = serde_json::to_vec(&self.emission)
+            .expect("a validated transcript emission serializes for idempotency");
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
 /// A local-only result of mapping an ASR emission into application state.
 ///
 /// Partial values intentionally remain transient. A final value carries the
@@ -213,9 +293,10 @@ pub struct FinalTranscriptEmission {
 pub enum MappedTranscriptEmission {
     Partial(TransientTranscriptEmission),
     Final(FinalTranscriptEmission),
-    /// A duplicate final is already pending or durable, so it must not be
-    /// persisted again. Duplicate partials are also ignored when they exactly
-    /// match the latest accepted transient emission.
+    /// A duplicate final is already pending, so it must not be persisted again.
+    /// Durable replay detection belongs to the SQLite idempotency key. Duplicate
+    /// partials are also ignored when they exactly match the latest accepted
+    /// transient emission.
     Ignored,
 }
 
@@ -226,9 +307,10 @@ struct UtteranceState {
     pending_final: Option<FinalTranscriptEmission>,
 }
 
-/// Tracks ASR utterances inside Rust only. It deliberately has no serializer,
-/// storage, or WebView-facing API because partial ASR text is not durable
-/// product data and must stay outside Agent context.
+/// Tracks only in-flight ASR utterances inside Rust. Completed finals are
+/// released after SQLite commits; durable replay detection lives in the local
+/// store. This prevents long recordings from retaining all transcript text in
+/// process memory.
 #[derive(Debug, Default)]
 pub struct TranscriptEmissionMapper {
     utterances: BTreeMap<(Uuid, String), UtteranceState>,
@@ -242,14 +324,28 @@ impl TranscriptEmissionMapper {
     ) -> Result<MappedTranscriptEmission, String> {
         emission.validate()?;
         let key = (session_id, emission.utterance_key.clone());
+        if !self.utterances.contains_key(&key) {
+            if self.utterances.len() >= MAX_TRANSIENT_ASR_UTTERANCES {
+                return Err(format!(
+                    "local ASR has reached its {MAX_TRANSIENT_ASR_UTTERANCES}-utterance transient limit"
+                ));
+            }
+            self.utterances.insert(
+                key.clone(),
+                UtteranceState {
+                    logical_span_id: logical_span_id_for_asr_utterance(
+                        session_id,
+                        &emission.utterance_key,
+                    ),
+                    last_accepted_emission: None,
+                    pending_final: None,
+                },
+            );
+        }
         let state = self
             .utterances
-            .entry(key)
-            .or_insert_with(|| UtteranceState {
-                logical_span_id: Uuid::new_v4(),
-                last_accepted_emission: None,
-                pending_final: None,
-            });
+            .get_mut(&key)
+            .expect("a just-inserted ASR utterance state exists");
 
         if let Some(pending_final) = &state.pending_final {
             if pending_final.emission == emission {
@@ -258,20 +354,6 @@ impl TranscriptEmissionMapper {
             return Err("an utterance final persistence is already pending".to_owned());
         }
 
-        if state
-            .last_accepted_emission
-            .as_ref()
-            .is_some_and(|accepted| accepted.kind == TranscriptEmissionKind::Final)
-        {
-            if state
-                .last_accepted_emission
-                .as_ref()
-                .is_some_and(|accepted| accepted == &emission)
-            {
-                return Ok(MappedTranscriptEmission::Ignored);
-            }
-            return Err("an utterance cannot emit after its final revision".to_owned());
-        }
         if let Some(accepted) = &state.last_accepted_emission {
             if emission.revision <= accepted.revision {
                 if accepted == &emission {
@@ -306,9 +388,9 @@ impl TranscriptEmissionMapper {
         }
     }
 
-    /// Marks a reserved final as durable after its revision and audit event
-    /// have committed together. Callers must retain the reservation until
-    /// persistence succeeds or [`Self::abort_final`] releases it.
+    /// Releases a completed final after its revision and audit event commit.
+    /// SQLite owns durable replay suppression, so the mapper retains no final
+    /// text after this point.
     pub(crate) fn commit_final(&mut self, final_emission: &FinalTranscriptEmission) {
         let key = (
             final_emission.session_id,
@@ -316,15 +398,14 @@ impl TranscriptEmissionMapper {
         );
         let state = self
             .utterances
-            .get_mut(&key)
+            .get(&key)
             .expect("a mapped final transcript reservation must remain registered");
         assert!(
             state.pending_final.as_ref() == Some(final_emission),
             "a final transcript reservation must remain pending until it commits"
         );
 
-        state.pending_final = None;
-        state.last_accepted_emission = Some(final_emission.emission.clone());
+        self.utterances.remove(&key);
     }
 
     /// Releases a final reservation after persistence fails, leaving any
@@ -348,6 +429,31 @@ impl TranscriptEmissionMapper {
         state.pending_final = None;
         Ok(())
     }
+
+    /// End a session only after all final reservations have either committed
+    /// or aborted. This drops any remaining transient partial text.
+    pub(crate) fn clear_session(&mut self, session_id: Uuid) -> Result<(), String> {
+        if self
+            .utterances
+            .iter()
+            .any(|((stored_session_id, _), state)| {
+                *stored_session_id == session_id && state.pending_final.is_some()
+            })
+        {
+            return Err("cannot clear an ASR session with a pending final reservation".to_owned());
+        }
+        self.utterances
+            .retain(|(stored_session_id, _), _| *stored_session_id != session_id);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn session_utterance_count(&self, session_id: Uuid) -> usize {
+        self.utterances
+            .keys()
+            .filter(|(stored_session_id, _)| *stored_session_id == session_id)
+            .count()
+    }
 }
 
 /// A local ASR adapter. Implementors emit only bounded, provenance-carrying
@@ -369,6 +475,43 @@ fn validate_utterance_key(value: &str) -> Result<(), String> {
         return Err("transcript utterance key must not contain control characters".to_owned());
     }
     Ok(())
+}
+
+/// Derives the only logical transcript ID accepted for a native ASR
+/// utterance. The audit store rechecks this after reopening SQLite so an
+/// idempotency key cannot be rebound to a different transcript span.
+pub(crate) fn logical_span_id_for_asr_utterance(session_id: Uuid, utterance_key: &str) -> Uuid {
+    logical_span_id_for_asr_utterance_digest(
+        session_id,
+        &opaque_utterance_key_sha256(utterance_key),
+    )
+}
+
+/// Recomputes the stable logical transcript ID from the opaque utterance-key
+/// representation retained by SQLite and audit verification.
+pub(crate) fn logical_span_id_for_asr_utterance_digest(
+    session_id: Uuid,
+    utterance_key_sha256: &str,
+) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"word-covenant/transcript-logical-span/v1\0");
+    digest.update(session_id.as_bytes());
+    digest.update(utterance_key_sha256.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // Mark the derived value as an RFC 4122 name-based UUID without relying
+    // on uuid's optional v5 feature.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn opaque_utterance_key_sha256(utterance_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"word-covenant/asr-utterance-key/v1\0");
+    digest.update(utterance_key.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 #[cfg(test)]
@@ -475,28 +618,27 @@ mod tests {
         assert_eq!(partial.logical_span_id, final_emission.logical_span_id);
         assert_eq!(final_emission.emission.revision, 2);
         mapper.commit_final(&final_emission);
-        assert!(matches!(
-            mapper
-                .map(session_id, final_emission.emission.clone())
-                .unwrap(),
-            MappedTranscriptEmission::Ignored
-        ));
-        let mut changed_final = final_emission.emission.clone();
-        changed_final.text = "内容不同的重复 final".to_owned();
-        assert!(mapper
-            .map(session_id, changed_final)
-            .unwrap_err()
-            .contains("after its final"));
-        let mut after_final = final_emission.emission;
-        after_final.revision = 3;
-        assert!(mapper
-            .map(session_id, after_final)
-            .unwrap_err()
-            .contains("after its final"));
+        assert_eq!(mapper.session_utterance_count(session_id), 0);
+
+        // After a successful SQLite commit the mapper deliberately forgets
+        // final text. A replay is mapped with the same durable identity; the
+        // SQLite idempotency table, rather than process memory, suppresses it.
+        let replay = match mapper
+            .map(session_id, final_emission.emission.clone())
+            .unwrap()
+        {
+            MappedTranscriptEmission::Final(replay) => replay,
+            MappedTranscriptEmission::Partial(_) => panic!("replayed final became transient"),
+            MappedTranscriptEmission::Ignored => panic!("completed final remained in mapper"),
+        };
+        assert_eq!(replay.logical_span_id, final_emission.logical_span_id);
+        assert_eq!(replay.idempotency_key(), final_emission.idempotency_key());
+        mapper.commit_final(&replay);
+        assert_eq!(mapper.session_utterance_count(session_id), 0);
     }
 
     #[test]
-    fn releases_a_reserved_final_for_retry_and_suppresses_duplicate_finals() {
+    fn releases_a_reserved_final_for_retry_and_forgets_it_after_commit() {
         let session_id = Uuid::new_v4();
         let mut mapper = TranscriptEmissionMapper::default();
         let final_emission = emission(1_000_000_000);
@@ -519,10 +661,14 @@ mod tests {
         };
         mapper.commit_final(&retry);
 
-        assert!(matches!(
-            mapper.map(session_id, final_emission).unwrap(),
-            MappedTranscriptEmission::Ignored
-        ));
+        let replay = match mapper.map(session_id, final_emission).unwrap() {
+            MappedTranscriptEmission::Final(replay) => replay,
+            MappedTranscriptEmission::Partial(_) => panic!("replayed final became transient"),
+            MappedTranscriptEmission::Ignored => panic!("completed final remained in mapper"),
+        };
+        assert_eq!(replay.idempotency_key(), retry.idempotency_key());
+        mapper.commit_final(&replay);
+        assert_eq!(mapper.session_utterance_count(session_id), 0);
     }
 
     #[test]

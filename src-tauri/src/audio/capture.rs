@@ -144,7 +144,7 @@ impl CaptureIngress {
             return CaptureWriteResult::Dropped;
         };
         if samples.len() > slot.samples.len() {
-            self.return_slot(slot);
+            self.return_unconsumed_slot(slot);
             self.record_drop();
             return CaptureWriteResult::Dropped;
         }
@@ -163,7 +163,7 @@ impl CaptureIngress {
         match self.ready.push(slot) {
             Ok(()) => CaptureWriteResult::Enqueued,
             Err(slot) => {
-                self.return_slot(slot);
+                self.return_unconsumed_slot(slot);
                 self.record_drop();
                 CaptureWriteResult::Dropped
             }
@@ -181,7 +181,7 @@ impl CaptureIngress {
             channels: slot.channels,
             samples: &slot.samples[..slot.len],
         });
-        self.return_slot(slot);
+        self.return_consumed_slot(slot);
         true
     }
 
@@ -189,11 +189,16 @@ impl CaptureIngress {
         self.dropped_packets.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn return_slot(&self, mut slot: CaptureSlot) {
+    fn return_unconsumed_slot(&self, mut slot: CaptureSlot) {
         slot.len = 0;
         if self.available.push(slot).is_err() {
             debug_assert!(false, "capture ingress slot was returned twice");
         }
+    }
+
+    fn return_consumed_slot(&self, mut slot: CaptureSlot) {
+        slot.samples[..slot.len].fill(0.0);
+        self.return_unconsumed_slot(slot);
     }
 }
 
@@ -278,6 +283,26 @@ mod tests {
             ingress.try_write(10, 16_000, 1, &[0.3, 0.4]),
             CaptureWriteResult::Enqueued
         );
+    }
+
+    #[test]
+    fn ingress_clears_consumed_pcm_before_recycling_its_slot() {
+        let ingress = CaptureIngress::new(1, 4).unwrap();
+        assert_eq!(
+            ingress.try_write(8, 16_000, 1, &[0.1, -0.2, 0.3]),
+            CaptureWriteResult::Enqueued
+        );
+
+        assert!(ingress.try_consume(|packet| {
+            assert_eq!(packet.samples, &[0.1, -0.2, 0.3]);
+        }));
+
+        let recycled = ingress
+            .available
+            .pop()
+            .expect("consuming a packet returns its slot to the available queue");
+        assert_eq!(recycled.len, 0);
+        assert_eq!(&recycled.samples[..3], &[0.0, 0.0, 0.0]);
     }
 
     #[test]

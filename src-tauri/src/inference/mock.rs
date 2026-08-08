@@ -12,6 +12,7 @@ use super::vad::{
 };
 use super::{InferenceEngine, InferenceError, ModelProvenance, MAX_INFERENCE_WINDOW_DURATION_NS};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const FIXTURE_ARTIFACT_SHA256: &str =
     "f3a6e1ab2873d47c5f3299d42110f6b9e5c8472d3a91bc6d0482f4e7a50619cd";
@@ -223,7 +224,7 @@ impl AsrEngine for FixtureAsr {
                 continue;
             }
             emissions.push(TranscriptEmission {
-                utterance_key: cue.utterance_key.clone(),
+                utterance_key: fixture_utterance_key(cue, request),
                 capture_start_ns: apply_offset(
                     request.audio.capture_start_ns(),
                     cue.start_offset_ns,
@@ -240,6 +241,17 @@ impl AsrEngine for FixtureAsr {
         AsrResponse::new(request, &self.model_provenance, emissions)
             .map_err(InferenceError::invalid)
     }
+}
+
+/// The fixture can replay a request deterministically while still assigning
+/// independent utterance lineage to distinct audio ranges.
+fn fixture_utterance_key(cue: &FixtureAsrCue, request: &AsrRequest) -> String {
+    let mut digest = Sha256::new();
+    digest.update(cue.utterance_key.as_bytes());
+    digest.update([0]);
+    digest.update(request.audio.capture_start_ns().to_le_bytes());
+    digest.update(request.audio.capture_end_ns().to_le_bytes());
+    format!("fixture-{:x}", digest.finalize())
 }
 
 fn fixture_provenance(model_id: &str) -> ModelProvenance {
@@ -268,10 +280,14 @@ mod tests {
     use uuid::Uuid;
 
     fn audio_window() -> InferenceAudioWindow {
+        audio_window_at(10_000)
+    }
+
+    fn audio_window_at(capture_start_ns: u64) -> InferenceAudioWindow {
         InferenceAudioWindow::new(
             Uuid::nil(),
-            10_000,
-            1_000_010_000,
+            capture_start_ns,
+            capture_start_ns + 1_000_000_000,
             INFERENCE_SAMPLE_RATE_HZ,
             INFERENCE_CHANNELS,
             vec![0.0; 16_000],
@@ -316,6 +332,33 @@ mod tests {
         assert_eq!(
             first.emissions[1].model_provenance.model_id(),
             "fixture-asr"
+        );
+    }
+
+    #[test]
+    fn fixture_asr_uses_distinct_stable_keys_for_distinct_audio_windows() {
+        let mut fixture = FixtureAsr::default();
+        let first_request =
+            AsrRequest::new(audio_window_at(10_000), Some("zh".to_owned()), true).unwrap();
+        let second_request =
+            AsrRequest::new(audio_window_at(1_000_010_000), Some("zh".to_owned()), true).unwrap();
+
+        let first = fixture.transcribe(&first_request).unwrap();
+        let first_replay = fixture.transcribe(&first_request).unwrap();
+        let second = fixture.transcribe(&second_request).unwrap();
+
+        assert_eq!(first, first_replay);
+        assert_ne!(
+            first.emissions[0].utterance_key,
+            second.emissions[0].utterance_key
+        );
+        assert_eq!(
+            first.emissions[0].utterance_key,
+            first.emissions[1].utterance_key
+        );
+        assert_eq!(
+            second.emissions[0].utterance_key,
+            second.emissions[1].utterance_key
         );
     }
 

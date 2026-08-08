@@ -42,14 +42,17 @@ Not MVP: automatic human identification from a voiceprint, ambient/background re
 | Done | M0 audio boundary | Sample clock, bounded queue, gap events, test source, macOS callback boundary |
 | Done | M0.1 explicit egress control | Session-only Rust master gate, visible confirmation/disable UI, and regression coverage; no HTTP client exists |
 | Done | M1 lifecycle foundation | Typed permission/recording/interruption state machine behind the macOS callback boundary |
-| Pending | M1 native input adapter | Add a real CoreAudio/CPAL stream, microphone permission integration, and manual device validation; no ASR/model loading yet |
+| Awaiting manual acceptance | M1 native input adapter | CoreAudio/CPAL input and microphone lifecycle code exist; the real-device exit gate remains the M1 manual acceptance run. The native source is not yet an ASR ingress. |
+| In progress | M2.1 pure Rust/local mock speech pipeline contract | Deterministic local mock PCM exercises the bounded pipeline and final transcript persistence. It does not consume the real CPAL ingress and does not claim a real VAD or `whisper.cpp` adapter. |
+| Pending | M2.2 native capture-to-inference bridge | Replace the current single-consumer meter path with one dispatcher, use two-phase startup and bounded ASR job/result queues, define backpressure/inference-gap behavior, then complete a real macOS manual run. |
 
 ## Target Architecture
 
 ```mermaid
 flowchart LR
   MIC["macOS input device"] --> CAP["Rust capture adapter\nclock + bounded PCM queue"]
-  CAP --> PIPE["Local pipeline\nresample, VAD, ASR, diarization"]
+  CAP --> DISPATCH["Single native dispatcher\nmeter + bounded ASR job queue"]
+  DISPATCH --> PIPE["Local pipeline\nresample, VAD, ASR, diarization"]
   PIPE --> DB["Encrypted local records\nSQLite / audio chunks"]
   DB --> UI["Vue timeline, search, corrections"]
   UI --> TRIGGER["Manual Agent trigger"]
@@ -64,7 +67,7 @@ flowchart LR
 
 ### Data and time model
 
-Every capture-derived record carries `session_id`, a monotonic capture range, a wall-clock anchor, a sample rate, a revision number, and model versions. CoreAudio host time / `mach_continuous_time` becomes the source of truth once native capture lands; browser `Date.now()` is display metadata only. Device changes, sleep, source loss, and queue overflow become explicit gap events rather than fabricated continuous time.
+Every capture-derived record carries `session_id`, a monotonic capture range, a wall-clock anchor, a sample rate, a revision number, and model versions. CoreAudio host time / `mach_continuous_time` becomes the source of truth once native capture lands; browser `Date.now()` is display metadata only. Device changes, sleep, source loss, and capture-queue overflow become explicit capture-gap events rather than fabricated continuous time. M2.2 must separately represent inference job/result backpressure as an inference/transcript gap or another range-bearing terminal outcome; it must not silently present that range as continuously transcribed.
 
 The minimum final transcript projection is:
 
@@ -132,16 +135,51 @@ TranscriptSpan {
 
 **Outcome:** Explicitly installed local models produce revisioned Chinese transcript spans without automatic downloads.
 
-**Tasks:**
+#### M2.1：纯 Rust / 本地 mock 管线合约（进行中）
 
-1. Create a local model registry containing file path, SHA-256, model card/license acknowledgement, input format, size, and model version. Import copies or registers a local user-selected file only.
-2. Add `ModelProvider` traits for VAD, ASR, and embedding inference. Test each with deterministic fixture adapters before native runtimes.
-3. Add 48 kHz-to-16 kHz resampling, VAD pre-roll/hangover, rolling windows, and finalization rules.
-4. Integrate `whisper.cpp`/Metal as the first ASR adapter. Emit partial spans for display and immutable final revisions for Agent input.
-5. Store transcript spans and FTS5 search projections locally. Corrections create a revision, never overwrite original model output.
-6. Build a consented fixture benchmark: Chinese CER/WER, p95 partial/final latency, real-time factor, RAM, thermal/energy, and model import time.
+**边界：** M2.1 只验证开发 mock 产生的本地 `CapturePacket` 如何进入 Rust
+管线、如何保留采集时钟，以及 final ASR 响应如何写入既有审计转写存储。
+它可以使用确定性 fixture VAD/ASR 来测试接口和时序；fixture 不是实际的
+VAD，也不是 `whisper.cpp`/Metal 绑定。M2.1 不会给真实 CPAL ingress 增加第二
+个消费者，也不会把真实麦克风 PCM 接入该管线。
 
-**Acceptance targets:** offline after model import; Agent only receives final spans; model/file/license provenance is visible; quality claims are benchmarked rather than assumed.
+**M2.1 验收：** 仅以离线 Rust 单元/集成测试和开发 mock 验证 16 kHz 身份路径、
+48 kHz 到 16 kHz 的受限转换、有限 pre-roll/hangover、源时钟不连续、partial 不
+持久化及 final 的审计写入。通过这些测试不等于真实 macOS 采集、真实 VAD、真实
+ASR 或质量指标已通过。
+
+#### M2.2：真实采集到推理的桥接（待实现）
+
+**目标：** 把 M2.1 的本地管线接到真实原生采集，但不让实时回调、WebView 或任意
+未授权的网络路径拥有推理或外发能力。M2.2 是 ingress、生命周期和背压的工作，
+不是对真实模型质量的声明。
+
+**必做项：**
+
+1. 用一个原生 dispatcher 取代当前 `CaptureIngress` 的单一电平消费者。该 dispatcher
+   是唯一读取 PCM 的位置，并向紧凑电平投影和 ASR job 路径分发；不得通过第二个
+   `try_consume` 循环竞争同一队列。
+2. 实现两阶段启动：先创建会话、dispatcher 与所有有界工作资源且不公布 `Recording`；
+   仅在这些资源就绪后启动/交接 CPAL 流，并在交接成功后才公布录音状态。任一阶段
+   失败都必须回收已创建资源，保留非录音的可见状态，且不伪造时间线。
+3. 为 ASR job 和 result 各建立有界队列，定义容量、停止语义和可观察计数。job 或
+   result 满时的行为必须是显式的背压和带采集范围的 inference/transcript gap（或
+   等价的可审计终态），不能无声丢弃，也不能让回调阻塞或让内存无界增长。
+4. 保持 PCM 不跨 Tauri IPC；回调仍只做有限归一化和入队，推理、持久化、UI 更新都
+   在回调之外执行。停止、设备丢失和重启期间，未完成范围要么按已定义顺序完成，
+   要么被明确标记为未推理/缺口。
+5. 完成 [M1 macOS 真实采集人工验收清单](2026-08-08-m1-macos-real-capture-manual-acceptance.md)
+   中新增的 M2.2 追加场景；没有同一构建的真实硬件记录，不得把桥接路径标记为完成。
+
+**后续本地模型适配：** 真实 VAD 与 `whisper.cpp`/Metal 仍是 M2 的独立工作，必须
+在选定模型、显式导入和本地基准完成后才可宣称可用。模型注册表继续记录文件路径、
+SHA-256、模型卡/许可证确认、输入格式、大小和版本；partial 只用于显示，Agent
+只能收到不可变 final，修订不能覆盖原始模型输出。
+
+**M2 验收目标：** M2.1 的离线 fixture 测试只证明管线合约；M2.2 的真实 macOS
+验收只证明 ingress/队列/时间线语义。离线模型导入、Agent 只接收 final、可见模型
+来源以及中文 CER/WER、p95 partial/final 延迟、实时因子、内存、热/能耗和导入时间，
+仍须由已同意、已授权的 fixture 与实际模型基准分别证明。
 
 ### M3: Speaker Workflow
 
@@ -204,15 +242,16 @@ TranscriptSpan {
 ## Dependencies and Parallelization
 
 ```text
-M0.1 egress gate -----------+------------------> M4 HTTP profiles
-M1 capture lifecycle -------+--> M2 ASR --------+--> M3 clustering
-M2 model registry ----------+
-M2 final transcript events -+--> M4 Agent context --> M5 declarative skills
-M0 audit core ------------------------------------> M4 / M5 / M6
-M1 permission/release work ----------------------> M6 notarization
+M0.1 egress gate -------------------------------------------> M4 HTTP profiles
+M1 native input ---------------------------------------------+
+M2.1 pure Rust/mock contract --------------------------------+--> M2.2 dispatcher + queues --> native VAD/ASR --> M3 clustering
+M2 model registry -------------------------------------------+
+M2 final transcript events --------------------------------------> M4 Agent context --> M5 declarative skills
+M0 audit core ---------------------------------------------------> M4 / M5 / M6
+M1 permission/release work -------------------------------------> M6 notarization
 ```
 
-The safe parallel units are UI-only policy projections, pure Rust policy tests, capture adapter code, fixture/benchmark tooling, and documentation. The following must stay sequenced: actual HTTP client after M0.1+M4 policy/approval paths; voiceprint naming after anonymous clustering; executable hooks after declarative skills; encryption migration after a threat-model decision.
+The safe parallel units are UI-only policy projections, pure Rust policy tests, M2.1 fixture/benchmark tooling, and documentation. M2.1 may remain independent of the real CPAL consumer while its deterministic contract is tested. The following must stay sequenced: M2.2's single dispatcher before any native ASR consumer; two-phase startup and bounded job/result queues before M2.2 hardware acceptance; real VAD/ASR bindings and model benchmarks after the bridge; actual HTTP client after M0.1+M4 policy/approval paths; voiceprint naming after anonymous clustering; executable hooks after declarative skills; encryption migration after a threat-model decision.
 
 ## Non-Functional Gates
 
@@ -223,6 +262,7 @@ The safe parallel units are UI-only policy projections, pure Rust policy tests, 
 | UI | Recording and egress state always visible | Component tests, desktop screenshot/manual QA |
 | Audio latency | Benchmark before promising a target; record p95 and RTF per model/device | Versioned local benchmark report |
 | Reliability | No unbounded audio queue; recoverable device loss | Stress fixture, queue-overrun and unplug tests |
+| Inference bridge | One PCM dispatcher; bounded job/result queues; every overload range has an explicit outcome | Offline queue tests plus M2.2 real-macOS pressure run |
 | Data integrity | Audit chain verifies on open | Tamper/reopen tests |
 | Accessibility | Keyboard usable controls and programmatic labels | Component tests plus manual VoiceOver pass |
 | Release | Signed/notarized macOS bundle | CI/release checklist and clean-machine smoke test |
@@ -251,4 +291,4 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-For M1 onward, add a manual macOS run before marking a milestone complete. Record machine model, macOS version, input device, permission result, expected/observed event sequence, and whether any local network monitor observed egress. Do not mark an untested hardware/model path complete based solely on compilation.
+M2.1 may be verified through its offline Rust/mock matrix, but that result is not hardware acceptance. Before marking M1, M2.2, or any real-model path complete, run the applicable macOS manual scenarios and record machine model, macOS version, input device, permission result, expected/observed event sequence, queue/gap evidence where applicable, and whether any local network monitor observed egress. Do not mark an untested hardware/model path complete based solely on compilation.

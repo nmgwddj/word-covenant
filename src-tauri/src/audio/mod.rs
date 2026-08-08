@@ -13,6 +13,7 @@ mod test_source;
 
 pub use capture::{
     BoundedCaptureWriter, CaptureIngress, CaptureIngressPacket, CapturePacket, CaptureWriteResult,
+    MAX_CAPTURE_SAMPLES_PER_PACKET,
 };
 pub use clock::{CaptureClock, CaptureGap, CaptureGapReason, CapturePoint};
 #[cfg(target_os = "macos")]

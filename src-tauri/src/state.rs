@@ -4,7 +4,10 @@ use crate::audio::CaptureStart;
 use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
 #[cfg(any(test, debug_assertions))]
 use crate::audio::{DevelopmentMockProgress, DevelopmentMockRunner};
-use crate::audit::{AuditKind, AuditStore, AuditStoreError, AuditTrail};
+use crate::audit::{
+    AsrFinalAuditPayload, AsrFinalIdempotencyBinding, AuditKind, AuditStore, AuditStoreError,
+    AuditTrail,
+};
 #[cfg(target_os = "macos")]
 use crate::domain::CaptureSegment;
 use crate::domain::{
@@ -439,7 +442,8 @@ impl AppState {
         let active_session_id = self
             .recording_session_id()?
             .ok_or_else(|| "no recording session is active".to_owned())?;
-        let progress = {
+        let mut persisted_spans = self.flush_development_mock_responses(active_session_id)?;
+        let mut progress = {
             let mut development_mock = self
                 .development_mock
                 .lock()
@@ -452,10 +456,8 @@ impl AppState {
             }
             runner.advance(packet_count)?
         };
-
-        for span in progress.spans.iter().cloned() {
-            self.append_transcript(span)?;
-        }
+        persisted_spans.extend(self.flush_development_mock_responses(active_session_id)?);
+        progress.spans = persisted_spans;
         Ok(progress)
     }
 
@@ -481,6 +483,21 @@ impl AppState {
             .map(|session| self.record_capture_gaps(session.id, pending_gaps))
             .transpose();
 
+        #[cfg(any(test, debug_assertions))]
+        if let Some(session) = self.active_recording_session()? {
+            // A development final must be durable before the stop event is
+            // sealed, otherwise an evidence trail could claim a stopped
+            // session before its last local inference result exists.
+            self.flush_development_mock_responses(session.id)?;
+            self.stop_development_mock(session.id)?;
+            self.flush_development_mock_responses(session.id)?;
+            self.finish_development_mock(session.id)?;
+        }
+
+        if let Some(session) = self.active_recording_session()? {
+            self.clear_local_asr_session(session.id)?;
+        }
+
         let now = Utc::now();
         let monotonic_ns = self.monotonic_ns();
         let stopped = {
@@ -500,9 +517,6 @@ impl AppState {
             self.record_audit(AuditKind::SessionStopped, monotonic_ns, &stopped)?;
             stopped
         };
-
-        #[cfg(any(test, debug_assertions))]
-        self.stop_development_mock(stopped.id)?;
 
         #[cfg(target_os = "macos")]
         if stopped_native_input {
@@ -554,9 +568,10 @@ impl AppState {
         self.record_audit(AuditKind::TranscriptRecorded, monotonic_ns, &span)
     }
 
-    /// Persist a final inference/correction revision before exposing its compact
-    /// timeline projection. Partial ASR output remains transient Rust/UI state
-    /// and never enters Agent context through this path.
+    /// Persist a final non-ASR correction or synthetic revision before exposing
+    /// its compact timeline projection. Native ASR finals must use
+    /// [`Self::append_local_asr_response`] so their replay binding is committed
+    /// with the transcript audit event.
     pub fn append_final_transcript_revision(
         &self,
         revision: TranscriptRevision,
@@ -564,6 +579,12 @@ impl AppState {
         if !revision.is_final {
             return Err(
                 "only final transcript revisions may be persisted for Agent context".to_owned(),
+            );
+        }
+        if revision.source == TranscriptSource::LocalInference {
+            return Err(
+                "local inference transcript revisions must be persisted from an ASR response"
+                    .to_owned(),
             );
         }
         revision
@@ -609,6 +630,80 @@ impl AppState {
 
         Self::upsert_timeline_projection(&mut timelines, projection);
         Ok(())
+    }
+
+    /// Persists a final native ASR emission with a durable replay key. A
+    /// matching payload is an already-committed replay; a different payload
+    /// for the same source identity is an integrity error rather than a new
+    /// transcript revision.
+    fn append_final_asr_transcript_revision(
+        &self,
+        revision: TranscriptRevision,
+        key: &crate::inference::AsrFinalIdempotencyKey,
+        emission_payload_sha256: &str,
+    ) -> Result<Option<TranscriptSpan>, String> {
+        if !revision.is_final {
+            return Err(
+                "only final transcript revisions may be persisted for Agent context".to_owned(),
+            );
+        }
+        revision
+            .validate()
+            .map_err(|error| format!("invalid final transcript revision: {error}"))?;
+        let idempotency = AsrFinalIdempotencyBinding::new(key, &revision, emission_payload_sha256)
+            .map_err(|error| format!("invalid local ASR idempotency binding: {error}"))?;
+
+        let projection = transcript_revision_projection(&revision);
+        // Keep the same lock order as other audit writes. Checking for an
+        // existing key before generating the in-memory audit event means a
+        // harmless replay cannot advance the hash chain.
+        let mut timelines = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut audit_store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        if let Some(existing) = audit_store
+            .lookup_asr_final_idempotency(key)
+            .map_err(|error| format!("could not query local ASR idempotency: {error}"))?
+        {
+            if existing.emission_payload_sha256 == idempotency.emission_payload_sha256 {
+                return Ok(None);
+            }
+            return Err(
+                "a local ASR final conflicts with its durable idempotency record".to_owned(),
+            );
+        }
+
+        let audit_payload = AsrFinalAuditPayload::new(&revision, &idempotency);
+        let event = trail
+            .next_event(
+                Some(revision.session_id),
+                revision.parent_revision_id,
+                AuditKind::TranscriptRevisionRecorded,
+                revision.capture_end_ns,
+                revision.wall_clock_end,
+                &audit_payload,
+            )
+            .map_err(|error| format!("could not serialize transcript revision: {error}"))?;
+        audit_store
+            .append_asr_final_transcript_revision_with_audit(&event, &revision, &idempotency)
+            .map_err(|error| format!("could not persist transcript revision: {error}"))?;
+        assert!(
+            trail.append_event(event),
+            "an audit event generated while holding the trail lock must append"
+        );
+        drop(audit_store);
+        drop(trail);
+
+        Self::upsert_timeline_projection(&mut timelines, projection.clone());
+        Ok(Some(projection))
     }
 
     fn upsert_timeline_projection(
@@ -660,17 +755,25 @@ impl AppState {
                     &final_emission.emission,
                     final_emission.logical_span_id,
                 )?;
-                let projection = transcript_revision_projection(&revision);
-                self.append_final_transcript_revision(revision)?;
-                Ok::<_, String>(projection)
+                self.append_final_asr_transcript_revision(
+                    revision,
+                    &final_emission.idempotency_key(),
+                    &final_emission.idempotency_payload_sha256(),
+                )
             })();
             match persisted {
-                Ok(projection) => {
+                Ok(Some(projection)) => {
                     // Keep the reservation pending until SQLite and its audit
                     // event have both committed, so concurrent/replayed finals
                     // cannot create a second durable revision.
                     mapper.commit_final(&final_emission);
                     projections.push(projection);
+                }
+                Ok(None) => {
+                    // SQLite already owns this exact final; releasing the
+                    // mapper reservation prevents a replay from retaining its
+                    // text in memory.
+                    mapper.commit_final(&final_emission);
                 }
                 Err(error) => {
                     mapper.abort_final(&final_emission).map_err(|abort_error| {
@@ -681,6 +784,14 @@ impl AppState {
             }
         }
         Ok(projections)
+    }
+
+    fn clear_local_asr_session(&self, session_id: Uuid) -> Result<(), String> {
+        self.inference_mapper
+            .lock()
+            .map_err(|_| "inference mapper lock poisoned".to_owned())?
+            .clear_session(session_id)
+            .map_err(|error| format!("could not finish local ASR session: {error}"))
     }
 
     pub fn list_local_models(&self) -> Result<Vec<RegisteredModel>, String> {
@@ -742,20 +853,82 @@ impl AppState {
     }
 
     #[cfg(any(test, debug_assertions))]
+    fn flush_development_mock_responses(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<TranscriptSpan>, String> {
+        let mut projections = Vec::new();
+        loop {
+            // Keep the mock delivery claimed until its synchronous native
+            // persistence either commits or aborts. Releasing this lock in
+            // between could leave the queue head permanently in-flight when
+            // acknowledgement itself fails.
+            let mut development_mock = self
+                .development_mock
+                .lock()
+                .map_err(|_| "development mock state lock poisoned".to_owned())?;
+            let Some(runner) = development_mock.as_mut() else {
+                return Ok(projections);
+            };
+            if runner.session_id() != session_id {
+                return Ok(projections);
+            }
+            let delivery = runner.begin_pending_asr_delivery()?;
+            let Some(delivery) = delivery else {
+                return Ok(projections);
+            };
+            let delivery_id = delivery.id;
+            let persisted = self.append_local_asr_response(session_id, delivery.response);
+            match persisted {
+                Ok(mut next_projections) => {
+                    runner.commit_pending_asr_delivery(delivery_id)?;
+                    projections.append(&mut next_projections);
+                }
+                Err(error) => {
+                    if let Err(release_error) = runner.abort_pending_asr_delivery(delivery_id) {
+                        return Err(format!(
+                            "{error}; could not retain the failed development mock ASR response: {release_error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    #[cfg(any(test, debug_assertions))]
     fn stop_development_mock(&self, session_id: Uuid) -> Result<(), String> {
         let mut development_mock = self
             .development_mock
             .lock()
             .map_err(|_| "development mock state lock poisoned".to_owned())?;
-        let Some(mut runner) = development_mock.take() else {
+        let Some(runner) = development_mock.as_mut() else {
             return Ok(());
         };
         if runner.session_id() == session_id {
             runner.stop()
         } else {
-            *development_mock = Some(runner);
             Ok(())
         }
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    fn finish_development_mock(&self, session_id: Uuid) -> Result<(), String> {
+        let mut development_mock = self
+            .development_mock
+            .lock()
+            .map_err(|_| "development mock state lock poisoned".to_owned())?;
+        let Some(runner) = development_mock.as_ref() else {
+            return Ok(());
+        };
+        if runner.session_id() != session_id {
+            return Ok(());
+        }
+        if runner.has_pending_asr_responses() {
+            return Err("development mock cannot stop while an ASR response is pending".to_owned());
+        }
+        development_mock.take();
+        Ok(())
     }
 
     pub fn create_egress_approval(
@@ -848,10 +1021,18 @@ impl AppState {
     }
 
     pub fn audit_is_valid(&self) -> Result<bool, String> {
-        self.audit_trail
+        let trail = self
+            .audit_trail
             .lock()
-            .map_err(|_| "audit state lock poisoned".to_owned())
-            .map(|trail| trail.verify())
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let audit_store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let durable_valid = audit_store
+            .verify()
+            .map_err(|error| format!("could not verify durable audit records: {error}"))?;
+        Ok(trail.verify() && durable_valid)
     }
 
     fn monotonic_ns(&self) -> u64 {
@@ -1025,8 +1206,8 @@ mod tests {
         LicenseAcknowledgement, LocalModelKind, ModelImportRequest,
     };
     use crate::inference::{
-        AsrEngine, AsrRequest, FixtureAsr, InferenceAudioWindow, INFERENCE_CHANNELS,
-        INFERENCE_SAMPLE_RATE_HZ,
+        AsrEngine, AsrRequest, FixtureAsr, InferenceAudioWindow, TranscriptEmissionKind,
+        TranscriptEmissionMapper, INFERENCE_CHANNELS, INFERENCE_SAMPLE_RATE_HZ,
     };
     use chrono::Duration;
     use sha2::{Digest, Sha256};
@@ -1090,12 +1271,50 @@ mod tests {
     }
 
     #[test]
-    fn development_mock_records_the_fixed_script_locally_and_stops_cleanly() {
+    fn development_mock_persists_only_final_local_asr_results_and_stops_cleanly() {
         let state = AppState::in_memory();
         let before = state.privacy_status().unwrap();
         let session = state.start_development_mock_session().unwrap();
-        let mut spans = Vec::new();
 
+        // The first 2.8-second scripted sentence has ended after 140 packets,
+        // but its partial text remains inside the native inference mapper
+        // until the pipeline's silence hangover finalizes it.
+        for _ in 0..14 {
+            let progress = state.advance_development_mock(10).unwrap();
+            assert_eq!(progress.session_id, session.id);
+            assert!(progress.spans.is_empty());
+        }
+        {
+            let store = state.audit_store.lock().unwrap();
+            assert!(store
+                .list_transcript_revisions(session.id)
+                .unwrap()
+                .is_empty());
+            assert!(store
+                .search_transcript_revisions(Some(session.id), "partialonlyone")
+                .unwrap()
+                .is_empty());
+        }
+
+        let first_final = state.advance_development_mock(10).unwrap();
+        assert_eq!(first_final.spans.len(), 1);
+        assert_eq!(first_final.spans[0].session_id, session.id);
+        assert_eq!(
+            first_final.spans[0].capture_start_ns,
+            session.started_monotonic_ns
+        );
+        assert_eq!(
+            first_final.spans[0].capture_end_ns - first_final.spans[0].capture_start_ns,
+            2_800_000_000
+        );
+        assert_eq!(
+            first_final.spans[0].source,
+            TranscriptSource::LocalInference
+        );
+        assert_eq!(first_final.spans[0].text, "本次记录仅保存在本机。");
+        assert_eq!(first_final.spans[0].speaker_cluster_id, None);
+
+        let mut spans = first_final.spans;
         loop {
             let progress = state.advance_development_mock(10).unwrap();
             assert_eq!(progress.session_id, session.id);
@@ -1107,17 +1326,28 @@ mod tests {
         }
 
         assert_eq!(spans.len(), 3);
-        assert!(spans.iter().all(
-            |span| span.session_id == session.id && span.source == TranscriptSource::Synthetic
-        ));
+        assert!(spans
+            .iter()
+            .all(|span| span.session_id == session.id
+                && span.source == TranscriptSource::LocalInference));
         assert_eq!(spans[0].capture_start_ns, session.started_monotonic_ns);
         assert_eq!(
             spans[0].capture_end_ns - spans[0].capture_start_ns,
             2_800_000_000
         );
-        assert_eq!(spans[1].speaker_cluster_id.as_deref(), Some("speaker-2"));
         assert_eq!(spans[2].text, "先生成一份待确认的行动草案。");
         assert_eq!(state.list_timeline(Some(session.id)).unwrap().len(), 3);
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_transcript_revisions(session.id).unwrap().len(),
+            3
+        );
+        assert!(store
+            .search_transcript_revisions(Some(session.id), "partialonlyone")
+            .unwrap()
+            .is_empty());
+        assert!(store.verify().unwrap());
+        drop(store);
         assert!(state.audit_is_valid().unwrap());
 
         assert!(state.stop_session().unwrap().is_some());
@@ -1130,6 +1360,183 @@ mod tests {
             after.active_egress_approvals,
             before.active_egress_approvals
         );
+    }
+
+    #[test]
+    fn development_mock_retries_a_pending_response_after_persistence_failure() {
+        let state = AppState::in_memory();
+        let session = state.start_development_mock_session().unwrap();
+        for _ in 0..14 {
+            assert!(state.advance_development_mock(10).unwrap().spans.is_empty());
+        }
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate a transient mock transcript persistence failure");
+        }))
+        .is_err());
+        let error = state.advance_development_mock(10).unwrap_err();
+        assert!(error.contains("audit store lock poisoned"));
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+
+        state.audit_store.clear_poison();
+        let retry = state.advance_development_mock(1).unwrap();
+        assert_eq!(retry.spans.len(), 1);
+        assert_eq!(retry.spans[0].text, "本次记录仅保存在本机。");
+
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_transcript_revisions(session.id).unwrap().len(),
+            1
+        );
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn development_mock_flushes_before_session_stopped_and_retries_stop_failures() {
+        let state = AppState::in_memory();
+        let session = state.start_development_mock_session().unwrap();
+        for _ in 0..14 {
+            assert!(state.advance_development_mock(10).unwrap().spans.is_empty());
+        }
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate a transient stop-flush persistence failure");
+        }))
+        .is_err());
+        let error = state.stop_session().unwrap_err();
+        assert!(error.contains("audit store lock poisoned"));
+        assert_eq!(
+            state.privacy_status().unwrap().recording_session_id,
+            Some(session.id)
+        );
+        assert!(!state
+            .audit_trail
+            .lock()
+            .unwrap()
+            .events()
+            .iter()
+            .any(|event| event.kind == AuditKind::SessionStopped));
+
+        state.audit_store.clear_poison();
+        assert_eq!(state.stop_session().unwrap().unwrap().id, session.id);
+
+        let events = state.audit_trail.lock().unwrap().events().to_vec();
+        let transcript_index = events
+            .iter()
+            .position(|event| event.kind == AuditKind::TranscriptRevisionRecorded)
+            .expect("the mock final was persisted before stopping");
+        let stopped_index = events
+            .iter()
+            .position(|event| event.kind == AuditKind::SessionStopped)
+            .expect("the session stop event was recorded");
+        assert!(transcript_index < stopped_index);
+
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_transcript_revisions(session.id).unwrap().len(),
+            1
+        );
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn replaying_a_scripted_mock_final_does_not_create_a_second_revision() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let mut runner = DevelopmentMockRunner::new(&session).unwrap();
+        let response = (0..15)
+            .find_map(|_| {
+                runner.advance(10).unwrap();
+                runner
+                    .begin_pending_asr_delivery()
+                    .unwrap()
+                    .map(|delivery| delivery.response)
+            })
+            .expect("the first scripted sentence finalizes within 15 advances");
+
+        assert_eq!(
+            state
+                .append_local_asr_response(session.id, response.clone())
+                .unwrap()
+                .len(),
+            1
+        );
+        let event_count = state.audit_trail.lock().unwrap().events().len();
+        assert!(state
+            .append_local_asr_response(session.id, response)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            state.audit_trail.lock().unwrap().events().len(),
+            event_count
+        );
+
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_transcript_revisions(session.id).unwrap().len(),
+            1
+        );
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn durable_asr_idempotency_survives_mapper_loss_and_rejects_payload_conflicts() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let mut runner = DevelopmentMockRunner::new(&session).unwrap();
+        let response = (0..15)
+            .find_map(|_| {
+                runner.advance(10).unwrap();
+                runner
+                    .begin_pending_asr_delivery()
+                    .unwrap()
+                    .map(|delivery| delivery.response)
+            })
+            .expect("the first scripted sentence finalizes within 15 advances");
+
+        assert_eq!(
+            state
+                .append_local_asr_response(session.id, response.clone())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Model a process crash after SQLite commits but before the
+        // in-memory mapper could retain any completion history.
+        *state.inference_mapper.lock().unwrap() = TranscriptEmissionMapper::default();
+        assert!(state
+            .append_local_asr_response(session.id, response.clone())
+            .unwrap()
+            .is_empty());
+
+        let event_count = state.audit_trail.lock().unwrap().events().len();
+        let mut conflicting = response;
+        let final_emission = conflicting
+            .emissions
+            .iter_mut()
+            .find(|emission| emission.kind == TranscriptEmissionKind::Final)
+            .expect("scripted response includes a final emission");
+        final_emission.text = "冲突的重放内容。".to_owned();
+
+        *state.inference_mapper.lock().unwrap() = TranscriptEmissionMapper::default();
+        let error = state
+            .append_local_asr_response(session.id, conflicting)
+            .unwrap_err();
+        assert!(error.contains("conflicts with its durable idempotency record"));
+        assert_eq!(
+            state.audit_trail.lock().unwrap().events().len(),
+            event_count
+        );
+
+        let store = state.audit_store.lock().unwrap();
+        assert_eq!(
+            store.list_transcript_revisions(session.id).unwrap().len(),
+            1
+        );
+        assert!(store.verify().unwrap());
     }
 
     #[test]
@@ -1167,6 +1574,57 @@ mod tests {
         assert!(store.verify().unwrap());
         drop(store);
         assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn audit_status_detects_a_tampered_durable_asr_binding() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-audit-status-binding-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let state = AppState::open(&database).unwrap();
+        let session = state.start_session().unwrap();
+        let capture_start_ns = session.started_monotonic_ns;
+        let capture_end_ns = capture_start_ns + 1_000_000_000;
+        let window = InferenceAudioWindow::new(
+            session.id,
+            capture_start_ns,
+            capture_end_ns,
+            INFERENCE_SAMPLE_RATE_HZ,
+            INFERENCE_CHANNELS,
+            vec![0.0; INFERENCE_SAMPLE_RATE_HZ as usize],
+        )
+        .unwrap();
+        let request = AsrRequest::new(window, Some("zh".to_owned()), true).unwrap();
+        let mut fixture = FixtureAsr::default();
+        let output = fixture.transcribe(&request).unwrap();
+        state.append_local_asr_response(session.id, output).unwrap();
+        assert!(state.audit_is_valid().unwrap());
+
+        let revision = state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_transcript_revisions(session.id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("fixture final is durable");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER asr_final_idempotency_is_immutable_delete;")
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM asr_final_idempotency WHERE revision_id = ?1",
+                rusqlite::params![revision.id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(!state.audit_is_valid().unwrap());
+        drop(state);
+        std::fs::remove_file(database).unwrap();
     }
 
     #[test]
@@ -1298,6 +1756,44 @@ mod tests {
     }
 
     #[test]
+    fn rejects_direct_local_inference_revisions_without_an_asr_binding() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let revision = TranscriptRevision::original(
+            session.id,
+            TranscriptTiming::new(
+                session.started_monotonic_ns,
+                session.started_monotonic_ns + 1_000_000_000,
+                session.started_at,
+                session.started_at + Duration::seconds(1),
+            )
+            .unwrap(),
+            None,
+            "未经映射的本地推理结果",
+            true,
+            TranscriptSource::LocalInference,
+            Some(
+                TranscriptModelProvenance::new(
+                    "fixture",
+                    "fixture-asr",
+                    "v1",
+                    Some("b".repeat(64)),
+                )
+                .unwrap(),
+            ),
+            None,
+        )
+        .unwrap();
+
+        let error = state
+            .append_final_transcript_revision(revision)
+            .unwrap_err();
+        assert!(error.contains("must be persisted from an ASR response"));
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
     fn rebuilds_the_final_timeline_projection_when_reopened() {
         let database = std::env::temp_dir().join(format!(
             "word-covenant-reopen-transcript-{}.sqlite3",
@@ -1318,7 +1814,7 @@ mod tests {
                 None,
                 "重启后仍可检索的本地记录。",
                 true,
-                TranscriptSource::LocalInference,
+                TranscriptSource::UserEdited,
                 Some(
                     TranscriptModelProvenance::new(
                         "fixture",
@@ -1388,7 +1884,7 @@ mod tests {
                 None,
                 "较早的本地记录。",
                 true,
-                TranscriptSource::LocalInference,
+                TranscriptSource::UserEdited,
                 Some(
                     TranscriptModelProvenance::new(
                         "fixture",
@@ -1419,7 +1915,7 @@ mod tests {
                 None,
                 "最近的本地记录。",
                 true,
-                TranscriptSource::LocalInference,
+                TranscriptSource::UserEdited,
                 Some(
                     TranscriptModelProvenance::new(
                         "fixture",

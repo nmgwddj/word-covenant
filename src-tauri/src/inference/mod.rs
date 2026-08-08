@@ -7,12 +7,13 @@
 pub mod asr;
 pub mod mock;
 pub mod model_registry;
+pub mod pipeline;
 pub mod vad;
 
 pub use asr::{
-    AsrEngine, AsrRequest, AsrResponse, FinalTranscriptEmission, MappedTranscriptEmission,
-    TranscriptEmission, TranscriptEmissionKind, TranscriptEmissionMapper, TranscriptWordTiming,
-    TransientTranscriptEmission,
+    AsrEngine, AsrFinalIdempotencyKey, AsrRequest, AsrResponse, FinalTranscriptEmission,
+    MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionKind, TranscriptEmissionMapper,
+    TranscriptWordTiming, TransientTranscriptEmission,
 };
 pub use mock::{FixtureAsr, FixtureAsrCue, FixtureVad, FixtureVadCue};
 pub use vad::{VadEngine, VadRequest, VadResponse, VoiceActivitySegment};
