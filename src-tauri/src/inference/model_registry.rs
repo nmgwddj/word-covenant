@@ -96,6 +96,27 @@ pub struct RegisteredModel {
     pub imported_at: DateTime<Utc>,
 }
 
+/// A model artifact that the native registry has just re-opened and verified.
+///
+/// This type intentionally has no Serde implementation and keeps its absolute
+/// managed path private. Native inference adapters consume it immediately;
+/// filesystem paths must never reach Tauri IPC, audit payloads, or the WebView.
+#[derive(Debug)]
+pub struct VerifiedModelArtifact {
+    model: RegisteredModel,
+    path: PathBuf,
+}
+
+impl VerifiedModelArtifact {
+    pub fn model(&self) -> &RegisteredModel {
+        &self.model
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// An in-memory index of locally imported models.
 ///
 /// Persistence is intentionally owned by a higher layer. This keeps the file
@@ -160,6 +181,14 @@ impl ModelRegistry {
     /// loading rather than reopen this path, closing the remaining TOCTOU
     /// window. This absolute path is never serializable or WebView-facing.
     pub fn verified_artifact_path(&self, id: Uuid) -> Result<PathBuf, ModelRegistryError> {
+        Ok(self.verified_artifact(id)?.path)
+    }
+
+    /// Resolves a registered artifact into a native-only capability after
+    /// verifying its managed location, size, and SHA-256 immediately before
+    /// loading. The capability deliberately cannot be serialized or created
+    /// from an arbitrary path.
+    pub fn verified_artifact(&self, id: Uuid) -> Result<VerifiedModelArtifact, ModelRegistryError> {
         let model = self
             .get(id)
             .ok_or(ModelRegistryError::UnknownModelId { id })?;
@@ -168,7 +197,11 @@ impl ModelRegistry {
             .as_deref()
             .ok_or(ModelRegistryError::ManagedRootNotConfigured)?;
         verify_persisted_artifact(managed_root, model)?;
-        resolve_persisted_artifact(managed_root, &model.file_path)
+        let path = resolve_persisted_artifact(managed_root, &model.file_path)?;
+        Ok(VerifiedModelArtifact {
+            model: model.clone(),
+            path,
+        })
     }
 
     pub fn models(&self) -> impl Iterator<Item = &RegisteredModel> {
@@ -1294,7 +1327,15 @@ mod tests {
         let managed_root = directory.child("managed-models");
         let model = write_persisted_model(&managed_root, "existing.model", b"original model");
         let registry = ModelRegistry::from_persisted(&managed_root, [model.clone()]).unwrap();
+        let artifact = registry.verified_artifact(model.id).unwrap();
 
+        assert_eq!(
+            artifact.path(),
+            fs::canonicalize(managed_root.join(&model.file_path))
+                .unwrap()
+                .as_path()
+        );
+        assert_eq!(artifact.model(), &model);
         assert_eq!(
             registry.verified_artifact_path(model.id).unwrap(),
             fs::canonicalize(managed_root.join(&model.file_path)).unwrap()
@@ -1302,7 +1343,7 @@ mod tests {
 
         fs::write(managed_root.join(&model.file_path), b"replaced model").unwrap();
         assert!(matches!(
-            registry.verified_artifact_path(model.id),
+            registry.verified_artifact(model.id),
             Err(ModelRegistryError::RegisteredArtifactSizeMismatch { .. })
                 | Err(ModelRegistryError::RegisteredArtifactHashMismatch { .. })
         ));

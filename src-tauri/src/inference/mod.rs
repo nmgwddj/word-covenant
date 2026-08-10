@@ -10,6 +10,8 @@ pub mod mock;
 pub mod model_registry;
 pub mod pipeline;
 pub mod vad;
+pub mod webrtc_vad;
+pub mod whisper_cpp;
 
 pub use asr::{
     AsrEngine, AsrFinalIdempotencyKey, AsrRequest, AsrResponse, FinalTranscriptEmission,
@@ -19,6 +21,12 @@ pub use asr::{
 pub use gap::{InferenceGap, InferenceGapReason, InferenceGapStage};
 pub use mock::{FixtureAsr, FixtureAsrCue, FixtureVad, FixtureVadCue};
 pub use vad::{VadEngine, VadRequest, VadResponse, VoiceActivitySegment};
+pub use webrtc_vad::{
+    WebRtcVad, WebRtcVadMode, WEBRTC_VAD_FRAME_DURATION_MS, WEBRTC_VAD_FRAME_SAMPLES,
+};
+pub use whisper_cpp::{
+    is_whisper_cpp_compatible_input_format, WhisperCppAsrEngine, WHISPER_CPP_GGML_INPUT_FORMAT,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt;

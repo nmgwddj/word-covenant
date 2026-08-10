@@ -124,6 +124,11 @@ impl std::error::Error for SpeechSegmenterError {}
 /// pipeline.
 pub trait SpeechActivityDetector: Send {
     fn is_speech(&mut self, frame: &InferenceAudioWindow) -> Result<bool, InferenceError>;
+
+    /// Drops detector state that must not span a capture discontinuity.
+    ///
+    /// Stateless fixture detectors can retain the default implementation.
+    fn reset(&mut self) {}
 }
 
 /// Explicitly temporary energy gate for deterministic local pipeline tests.
@@ -777,6 +782,7 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
         self.pre_roll.clear();
         self.active = None;
         self.trailing_silence_frames = 0;
+        self.detector.reset();
     }
 
     fn request_event(&self, request: AsrRequest) -> SpeechWindowEvent {
@@ -921,7 +927,10 @@ mod tests {
         InferenceEngine, ModelProvenance, TranscriptEmission, TranscriptEmissionKind,
     };
     use chrono::{DateTime, Duration, Utc};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
 
     #[derive(Clone)]
     struct RecordingAsr {
@@ -1023,6 +1032,37 @@ mod tests {
     impl SpeechActivityDetector for ScriptedSpeechDetector {
         fn is_speech(&mut self, _frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
             self.decisions.pop_front().unwrap_or(Ok(true))
+        }
+    }
+
+    struct ResetRequiredDetector {
+        saw_frame: bool,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl ResetRequiredDetector {
+        fn new(resets: Arc<AtomicUsize>) -> Self {
+            Self {
+                saw_frame: false,
+                resets,
+            }
+        }
+    }
+
+    impl SpeechActivityDetector for ResetRequiredDetector {
+        fn is_speech(&mut self, _frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
+            if self.saw_frame {
+                return Err(InferenceError::failed(
+                    "detector state crossed a capture discontinuity",
+                ));
+            }
+            self.saw_frame = true;
+            Ok(true)
+        }
+
+        fn reset(&mut self) {
+            self.saw_frame = false;
+            self.resets.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1301,6 +1341,46 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].audio.capture_start_ns(), 20_001_000);
         assert_eq!(requests[0].audio.capture_end_ns(), 30_001_000);
+    }
+
+    #[test]
+    fn resets_stateful_vad_before_processing_audio_after_a_discontinuity() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut segmenter = SpeechSegmenter::new(
+            Uuid::new_v4(),
+            clock(INFERENCE_SAMPLE_RATE_HZ),
+            ResetRequiredDetector::new(Arc::clone(&resets)),
+            config(),
+        )
+        .unwrap();
+
+        assert!(segmenter
+            .push_packet(NativePcmPacket::from(&packet(
+                0,
+                INFERENCE_SAMPLE_RATE_HZ,
+                1,
+                vec![0.2; PIPELINE_FRAME_SAMPLES],
+            )))
+            .unwrap()
+            .is_empty());
+        let events = segmenter
+            .push_packet(NativePcmPacket::from(&packet(
+                (PIPELINE_FRAME_SAMPLES * 2) as u64,
+                INFERENCE_SAMPLE_RATE_HZ,
+                1,
+                vec![0.2; PIPELINE_FRAME_SAMPLES],
+            )))
+            .unwrap();
+
+        assert!(matches!(
+            events.first(),
+            Some(SpeechWindowEvent::Request { .. })
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(SpeechWindowEvent::Discontinuity { .. })
+        ));
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
     }
 
     #[test]
