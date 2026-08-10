@@ -9,7 +9,7 @@ const importedModel = {
   fileSizeBytes: 2_048_000,
   sha256: 'a'.repeat(64),
   version: 'fixture-v1',
-  inputFormat: 'gguf',
+  inputFormat: 'whisper.cpp-ggml',
   modelCardId: 'word-covenant/fixture',
   licenseId: 'test-license',
   licenseConfirmedAt: '2026-08-08T00:00:00.000Z',
@@ -24,12 +24,26 @@ describe('model store', () => {
 
   test('loads only local model registrations during initialization', async () => {
     vi.spyOn(wordCovenantApi, 'listLocalModels').mockResolvedValue([importedModel])
+    vi.spyOn(wordCovenantApi, 'getActiveLocalAsrProfile').mockResolvedValue(null)
     const store = useModelStore()
 
     await store.initialize()
 
     expect(store.models).toEqual([importedModel])
     expect(store.isLoading).toBe(false)
+  })
+
+  test('loads the active compatible local ASR profile with its registered model', async () => {
+    vi.spyOn(wordCovenantApi, 'listLocalModels').mockResolvedValue([importedModel])
+    vi.spyOn(wordCovenantApi, 'getActiveLocalAsrProfile').mockResolvedValue({ modelId: importedModel.id })
+    const store = useModelStore()
+
+    await store.initialize()
+
+    expect(store.activeAsrProfile).toEqual({ modelId: importedModel.id })
+    expect(store.compatibleAsrModels).toEqual([importedModel])
+    expect(store.activeAsrModel).toEqual(importedModel)
+    expect(store.hasActiveCompatibleAsrModel).toBe(true)
   })
 
   test('records a successful local import without changing egress state', async () => {
@@ -40,7 +54,7 @@ describe('model store', () => {
       sourcePath: '/local/source/model.gguf',
       modelKind: 'speech_recognition',
       version: 'fixture-v1',
-      inputFormat: 'gguf',
+      inputFormat: 'whisper.cpp-ggml',
       expectedSha256: 'a'.repeat(64),
       modelCardId: 'word-covenant/fixture',
       licenseId: 'test-license',
@@ -51,6 +65,30 @@ describe('model store', () => {
     expect(store.models).toEqual([importedModel])
     expect(store.importError).toBeNull()
     expect(store.isImporting).toBe(false)
+  })
+
+  test('only enables an imported whisper.cpp-ggml ASR model for local transcription', async () => {
+    const selectActiveLocalAsrModel = vi
+      .spyOn(wordCovenantApi, 'selectActiveLocalAsrModel')
+      .mockResolvedValue({ modelId: importedModel.id })
+    const store = useModelStore()
+    store.models = [
+      importedModel,
+      {
+        ...importedModel,
+        id: 'model-incompatible',
+        inputFormat: 'gguf',
+      },
+    ]
+
+    await expect(store.selectActiveLocalAsrModel('model-incompatible')).rejects.toThrow('whisper.cpp-ggml')
+    expect(selectActiveLocalAsrModel).not.toHaveBeenCalled()
+    expect(store.activeAsrError).toContain('whisper.cpp-ggml')
+
+    await expect(store.selectActiveLocalAsrModel(importedModel.id)).resolves.toEqual({ modelId: importedModel.id })
+    expect(selectActiveLocalAsrModel).toHaveBeenCalledWith(importedModel.id)
+    expect(store.activeAsrProfile).toEqual({ modelId: importedModel.id })
+    expect(store.activeAsrError).toBeNull()
   })
 
   test('clears stale import errors before native local model selection, including cancellation', async () => {
@@ -81,7 +119,7 @@ describe('model store', () => {
       sourcePath: '/local/source/model.gguf',
       modelKind: 'speech_recognition',
       version: 'fixture-v1',
-      inputFormat: 'gguf',
+      inputFormat: 'whisper.cpp-ggml',
       expectedSha256: 'b'.repeat(64),
       modelCardId: 'word-covenant/fixture',
       licenseId: 'test-license',

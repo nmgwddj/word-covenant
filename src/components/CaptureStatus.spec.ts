@@ -86,6 +86,17 @@ describe('CaptureStatus', () => {
     expect(wrapper.text()).toContain('麦克风权限被拒绝')
   })
 
+  test('shows a local ASR selection requirement before microphone recording can begin', () => {
+    const wrapper = mount(CaptureStatus, {
+      props: {
+        capture,
+        asrModelReady: false,
+      },
+    })
+
+    expect(wrapper.text()).toContain('请选择本地转写模型')
+  })
+
   test('renders bounded bridge state and queue counts without transcript content', () => {
     const wrapper = mount(CaptureStatus, {
       props: {

@@ -1,21 +1,33 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
-import type { LocalModelImportInput, LocalModelKind, RegisteredModel } from '@/types'
+import { isWhisperCppAsrModel, WHISPER_CPP_GGML_INPUT_FORMAT } from '@/stores/models'
+import type { ActiveLocalAsrProfile, LocalModelImportInput, LocalModelKind, RegisteredModel } from '@/types'
 
 const props = withDefaults(defineProps<{
   models: RegisteredModel[]
+  compatibleAsrModels?: RegisteredModel[]
+  activeAsrProfile?: ActiveLocalAsrProfile | null
   importing?: boolean
+  selectingActiveAsrModel?: boolean
+  activeAsrSelectionDisabled?: boolean
   error?: string | null
+  activeAsrError?: string | null
   selectSourcePath?: () => Promise<string | null>
 }>(), {
+  activeAsrProfile: null,
   importing: false,
+  selectingActiveAsrModel: false,
+  activeAsrSelectionDisabled: false,
   error: null,
+  activeAsrError: null,
   selectSourcePath: undefined,
 })
 
 const emit = defineEmits<{
   import: [input: LocalModelImportInput]
+  selectActiveAsrModel: [modelId: string]
   clearError: []
+  clearActiveAsrError: []
 }>()
 
 const formOpen = ref(false)
@@ -25,7 +37,7 @@ const form = reactive<LocalModelImportInput>({
   sourcePath: '',
   modelKind: 'speech_recognition',
   version: '',
-  inputFormat: 'gguf',
+  inputFormat: WHISPER_CPP_GGML_INPUT_FORMAT,
   expectedSha256: '',
   modelCardId: '',
   licenseId: '',
@@ -47,6 +59,24 @@ const canImport = computed(() => (
   && form.modelCardId.trim().length > 0
   && form.licenseId.trim().length > 0
 ))
+
+const selectableAsrModels = computed(() =>
+  (props.compatibleAsrModels ?? props.models).filter(isWhisperCppAsrModel)
+)
+
+const activeAsrModel = computed(() => {
+  const modelId = props.activeAsrProfile?.modelId
+  if (!modelId) return null
+  return selectableAsrModels.value.find(model => model.id === modelId) ?? null
+})
+
+const hasStaleActiveAsrProfile = computed(
+  () => Boolean(props.activeAsrProfile && !activeAsrModel.value)
+)
+
+const activeAsrSelectorDisabled = computed(
+  () => props.activeAsrSelectionDisabled || props.selectingActiveAsrModel || !selectableAsrModels.value.length
+)
 
 watch(() => props.models.length, (count) => {
   if (modelCountAtSubmit.value !== null && count > modelCountAtSubmit.value && !props.error) {
@@ -76,7 +106,7 @@ function closeForm() {
     sourcePath: '',
     modelKind: 'speech_recognition',
     version: '',
-    inputFormat: 'gguf',
+    inputFormat: WHISPER_CPP_GGML_INPUT_FORMAT,
     expectedSha256: '',
     modelCardId: '',
     licenseId: '',
@@ -104,6 +134,13 @@ function submitImport() {
   modelCountAtSubmit.value = props.models.length
   emit('import', { ...form })
 }
+
+function selectActiveAsrModel(event: Event) {
+  const modelId = (event.target as HTMLSelectElement).value
+  if (!modelId || activeAsrSelectorDisabled.value) return
+  emit('clearActiveAsrError')
+  emit('selectActiveAsrModel', modelId)
+}
 </script>
 
 <template>
@@ -124,6 +161,36 @@ function submitImport() {
       </button>
     </div>
 
+    <div class="model-registry__asr-profile" data-testid="active-asr-profile">
+      <div class="model-registry__asr-profile-heading">
+        <span class="i-mdi-waveform" aria-hidden="true" />
+        <span>本地转写模型</span>
+      </div>
+      <strong v-if="activeAsrModel">{{ activeAsrModel.version }}</strong>
+      <span v-else>{{ hasStaleActiveAsrProfile ? '当前选择不可用' : '未选择' }}</span>
+      <code v-if="activeAsrModel">{{ activeAsrModel.inputFormat }}</code>
+    </div>
+    <label class="model-registry__asr-selector">
+      <span>启用模型</span>
+      <select
+        data-testid="active-asr-model-select"
+        :value="activeAsrModel?.id ?? ''"
+        :disabled="activeAsrSelectorDisabled"
+        aria-label="本地转写模型"
+        @change="selectActiveAsrModel"
+      >
+        <option value="" disabled>选择兼容模型</option>
+        <option v-for="model in selectableAsrModels" :key="model.id" :value="model.id">
+          {{ model.version }} · {{ model.sha256.slice(0, 8) }}
+        </option>
+      </select>
+    </label>
+    <p v-if="!selectableAsrModels.length" class="model-registry__asr-note">
+      导入 {{ WHISPER_CPP_GGML_INPUT_FORMAT }} 语音识别模型后可开始本地转写
+    </p>
+    <p v-else-if="activeAsrSelectionDisabled" class="model-registry__asr-note">记录中不可更换本地转写模型</p>
+    <p v-if="activeAsrError" class="model-registry__asr-error" role="alert">{{ activeAsrError }}</p>
+
     <ul v-if="models.length" class="model-registry__list" aria-label="已导入模型">
       <li v-for="model in models" :key="model.id" class="model-row">
         <span class="model-row__icon i-mdi-chip" aria-hidden="true" />
@@ -131,6 +198,7 @@ function submitImport() {
           <strong>{{ kindLabel(model.modelKind) }}</strong>
           <span>{{ model.version }} · {{ formatSize(model.fileSizeBytes) }}</span>
           <code>{{ model.sha256.slice(0, 12) }}</code>
+          <span v-if="activeAsrModel?.id === model.id" class="model-row__active">当前转写</span>
         </div>
       </li>
     </ul>
@@ -138,16 +206,15 @@ function submitImport() {
 
     <form v-if="formOpen" class="model-import" aria-label="导入本地模型" @submit.prevent="submitImport">
       <label class="model-import__field">
-        <span>文件路径</span>
+        <span>本地模型文件</span>
         <div class="model-import__source-row">
-          <input
-            v-model="form.sourcePath"
+          <span
+            class="model-import__source-state"
             data-testid="model-source-path"
-            type="text"
-            autocomplete="off"
-            readonly
-            required
+            :data-selected="Boolean(form.sourcePath)"
           >
+            {{ form.sourcePath ? '已选择本地文件' : '尚未选择文件' }}
+          </span>
           <button
             class="model-import__choose-source"
             type="button"
@@ -173,7 +240,7 @@ function submitImport() {
       </label>
       <label class="model-import__field">
         <span>输入格式</span>
-        <input v-model.trim="form.inputFormat" type="text" autocomplete="off" required>
+        <input v-model.trim="form.inputFormat" data-testid="model-input-format" type="text" autocomplete="off" required>
       </label>
       <label class="model-import__field">
         <span>SHA-256</span>

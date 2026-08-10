@@ -22,6 +22,20 @@ const recordingLabel = computed(() => {
   if (!sessionStore.isRecording) return '待命'
   return sessionStore.captureInput === 'development_mock' ? '模拟记录中' : '记录中'
 })
+const asrModelReadyForCurrentInput = computed(
+  () => sessionStore.captureInput === 'development_mock' || modelStore.hasActiveCompatibleAsrModel
+)
+const recordingControlDisabled = computed(
+  () =>
+    sessionStore.isLoading ||
+    sessionStore.isAwaitingPermission ||
+    (!sessionStore.isRecording && !asrModelReadyForCurrentInput.value)
+)
+const recordingControlHint = computed(() =>
+  !sessionStore.isRecording && !asrModelReadyForCurrentInput.value
+    ? '请选择兼容的本地转写模型后开始录音'
+    : undefined
+)
 let developmentMockTimer: number | undefined
 let unlistenCaptureProjection: (() => void) | undefined
 let unlistenFinalTranscriptProjection: (() => void) | undefined
@@ -63,6 +77,14 @@ async function selectInputDevice(deviceUid: string) {
 
 async function importLocalModel(input: LocalModelImportInput) {
   await modelStore.importLocalModel(input)
+}
+
+async function selectActiveLocalAsrModel(modelId: string) {
+  try {
+    await modelStore.selectActiveLocalAsrModel(modelId)
+  } catch {
+    // The model panel renders the local selection error without exposing native details.
+  }
 }
 
 async function selectLocalModelFile() {
@@ -168,6 +190,7 @@ onBeforeUnmount(() => {
         </span>
         <CaptureStatus
           :capture="sessionStore.capture"
+          :asr-model-ready="asrModelReadyForCurrentInput"
           :disabled="sessionStore.isLoading || sessionStore.isDevelopmentMockActive"
           @select="selectInputDevice"
         />
@@ -179,7 +202,8 @@ onBeforeUnmount(() => {
         />
         <RecordingControl
           :recording="sessionStore.isRecording"
-          :disabled="sessionStore.isLoading || sessionStore.isAwaitingPermission"
+          :disabled="recordingControlDisabled"
+          :title="recordingControlHint"
           @toggle="toggleRecording"
         />
       </div>
@@ -198,11 +222,18 @@ onBeforeUnmount(() => {
         </button>
         <ModelRegistryPanel
           :models="modelStore.models"
+          :compatible-asr-models="modelStore.compatibleAsrModels"
+          :active-asr-profile="modelStore.activeAsrProfile"
           :importing="modelStore.isImporting"
+          :selecting-active-asr-model="modelStore.isSelectingActiveAsrModel"
+          :active-asr-selection-disabled="sessionStore.isRecording"
           :error="modelStore.importError"
+          :active-asr-error="modelStore.activeAsrError"
           :select-source-path="selectLocalModelFile"
           @clear-error="clearLocalModelImportError"
+          @clear-active-asr-error="modelStore.clearActiveAsrError"
           @import="importLocalModel"
+          @select-active-asr-model="selectActiveLocalAsrModel"
         />
       </aside>
 
