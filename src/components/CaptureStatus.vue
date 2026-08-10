@@ -23,6 +23,9 @@ const statusLabel = computed(() => {
   if (props.capture.permission === 'denied') return '麦克风权限被拒绝'
   if (props.capture.permission === 'restricted') return '麦克风权限受系统限制'
   if (props.capture.lastIssue?.code === 'no_input_device') return '未检测到输入设备'
+  if (props.capture.lastIssue?.code === 'stream_start_failed') {
+    return '本地记录无法启动，请检查麦克风和本地转写模型'
+  }
   if (props.capture.status === 'failed') return '麦克风不可用'
   if (props.asrModelReady === false) return '请选择本地转写模型'
   return '麦克风待命'

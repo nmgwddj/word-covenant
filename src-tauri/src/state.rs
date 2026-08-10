@@ -17,6 +17,11 @@ use crate::domain::{
     TranscriptRevision, TranscriptSource, TranscriptSpan, TranscriptTiming,
 };
 use crate::inference::asr::MAX_ASR_EMISSIONS_PER_REQUEST;
+#[cfg(all(target_os = "macos", not(test)))]
+use crate::inference::bundled_model::verified_bundled_model;
+use crate::inference::bundled_model::{
+    verified_bundled_model_metadata, BundledAsrStatus, BUNDLED_ASR_MODEL_ID,
+};
 use crate::inference::model_registry::{
     LocalModelKind, ModelImportRequest, ModelRegistry, RegisteredModel,
 };
@@ -94,10 +99,10 @@ pub struct FinalTranscriptProjection {
 
 /// The explicitly chosen local speech-recognition model for this app run.
 ///
-/// This is intentionally not persisted: reopening WordCovenant requires a
-/// fresh visible choice before microphone recording can load a local model.
-/// It contains an opaque model ID only, never a file path, audio, or model
-/// artifact bytes.
+/// This is intentionally not persisted: a verified bundled model becomes the
+/// visible default on each launch, while a user-selected advanced local model
+/// only replaces it for the current run. It contains an opaque model ID only,
+/// never a file path, audio, or model artifact bytes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActiveLocalAsrProfile {
@@ -108,6 +113,70 @@ pub struct ActiveLocalAsrProfile {
 struct FinalTranscriptProjectionState {
     revision: u64,
     latest: Option<FinalTranscriptProjection>,
+}
+
+/// Native-only lifetime for the resource shipped within the application
+/// bundle. The path never crosses Tauri IPC; the compact status is separately
+/// projected for the model panel.
+struct BundledAsrRuntime {
+    resource_dir: Option<PathBuf>,
+    model: Option<RegisteredModel>,
+    status: BundledAsrStatus,
+}
+
+impl Default for BundledAsrRuntime {
+    fn default() -> Self {
+        Self {
+            resource_dir: None,
+            model: None,
+            status: BundledAsrStatus::unavailable(),
+        }
+    }
+}
+
+impl BundledAsrRuntime {
+    fn initialize(&mut self, resource_dir: PathBuf) -> BundledAsrStatus {
+        match verified_bundled_model_metadata(&resource_dir) {
+            Ok(model) => {
+                self.model = Some(model);
+                self.resource_dir = Some(resource_dir);
+                self.status = BundledAsrStatus::ready();
+            }
+            Err(_) => {
+                self.resource_dir = None;
+                self.model = None;
+                self.status = BundledAsrStatus::unavailable();
+            }
+        }
+        self.status.clone()
+    }
+
+    fn model(&self) -> Option<RegisteredModel> {
+        self.model.clone()
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn verified_artifact(
+        &mut self,
+    ) -> Result<crate::inference::model_registry::VerifiedModelArtifact, ()> {
+        let Some(resource_dir) = self.resource_dir.as_deref() else {
+            self.status = BundledAsrStatus::unavailable();
+            self.model = None;
+            return Err(());
+        };
+        match verified_bundled_model(resource_dir) {
+            Ok(artifact) => {
+                self.model = Some(artifact.model().clone());
+                self.status = BundledAsrStatus::ready();
+                Ok(artifact)
+            }
+            Err(_) => {
+                self.status = BundledAsrStatus::unavailable();
+                self.model = None;
+                Err(())
+            }
+        }
+    }
 }
 
 /// The application-owned lifecycle fence for one native dispatcher generation.
@@ -146,6 +215,7 @@ pub struct AppState {
     audit_trail: Mutex<AuditTrail>,
     audit_store: Mutex<AuditStore>,
     model_registry: Mutex<ModelRegistry>,
+    bundled_asr_runtime: Mutex<BundledAsrRuntime>,
     active_local_asr_profile: Mutex<Option<ActiveLocalAsrProfile>>,
     inference_mapper: Mutex<TranscriptEmissionMapper>,
     final_transcript_projection: Mutex<FinalTranscriptProjectionState>,
@@ -214,6 +284,7 @@ impl AppState {
             audit_trail: Mutex::new(audit_trail),
             audit_store: Mutex::new(audit_store),
             model_registry: Mutex::new(model_registry),
+            bundled_asr_runtime: Mutex::new(BundledAsrRuntime::default()),
             active_local_asr_profile: Mutex::new(None),
             inference_mapper: Mutex::new(TranscriptEmissionMapper::default()),
             final_transcript_projection: Mutex::new(FinalTranscriptProjectionState::default()),
@@ -2180,11 +2251,48 @@ impl AppState {
     }
 
     pub fn list_local_models(&self) -> Result<Vec<RegisteredModel>, String> {
+        let bundled_model = self
+            .bundled_asr_runtime
+            .lock()
+            .map_err(|_| "bundled ASR state lock poisoned".to_owned())?
+            .model();
         let registry = self
             .model_registry
             .lock()
             .map_err(|_| "model registry lock poisoned".to_owned())?;
-        Ok(registry.models().cloned().collect())
+        let mut models = registry.models().cloned().collect::<Vec<_>>();
+        if let Some(bundled_model) = bundled_model {
+            models.insert(0, bundled_model);
+        }
+        Ok(models)
+    }
+
+    /// Initializes the reviewed, app-packaged ASR resource for this process.
+    /// Failure is deliberately contained to local transcription availability:
+    /// the application remains usable and never attempts a download or cloud
+    /// fallback.
+    pub fn initialize_bundled_asr(&self, resource_dir: impl AsRef<Path>) -> BundledAsrStatus {
+        let status = match self.bundled_asr_runtime.lock() {
+            Ok(mut runtime) => runtime.initialize(resource_dir.as_ref().to_path_buf()),
+            Err(_) => BundledAsrStatus::unavailable(),
+        };
+
+        if status.available {
+            if let Ok(mut profile) = self.active_local_asr_profile.lock() {
+                *profile = Some(ActiveLocalAsrProfile {
+                    model_id: BUNDLED_ASR_MODEL_ID,
+                });
+            }
+        }
+
+        status
+    }
+
+    pub fn bundled_asr_status(&self) -> Result<BundledAsrStatus, String> {
+        self.bundled_asr_runtime
+            .lock()
+            .map_err(|_| "bundled ASR state lock poisoned".to_owned())
+            .map(|runtime| runtime.status.clone())
     }
 
     /// Returns the deliberately selected ASR model for this application run.
@@ -2214,13 +2322,24 @@ impl AppState {
             return Err("cannot change the local transcription model while recording".to_owned());
         }
 
-        let model = self
-            .model_registry
+        let bundled_model = self
+            .bundled_asr_runtime
             .lock()
-            .map_err(|_| "model registry lock poisoned".to_owned())?
-            .get(model_id)
-            .cloned()
-            .ok_or_else(|| "the selected local transcription model is not registered".to_owned())?;
+            .map_err(|_| "bundled ASR state lock poisoned".to_owned())?
+            .model()
+            .filter(|model| model.id == model_id);
+        let model = match bundled_model {
+            Some(model) => model,
+            None => self
+                .model_registry
+                .lock()
+                .map_err(|_| "model registry lock poisoned".to_owned())?
+                .get(model_id)
+                .cloned()
+                .ok_or_else(|| {
+                    "the selected local transcription model is not registered".to_owned()
+                })?,
+        };
         validate_active_local_asr_model(&model)?;
 
         let profile = ActiveLocalAsrProfile { model_id };
@@ -2240,15 +2359,22 @@ impl AppState {
                     .to_owned()
             })
         })?;
-        let artifact = self
-            .model_registry
-            .lock()
-            .map_err(|_| "model registry lock poisoned".to_owned())?
-            .verified_artifact(profile.model_id)
-            .map_err(|error| format!("could not verify the selected local ASR model: {error}"))?;
+        let artifact = if profile.model_id == BUNDLED_ASR_MODEL_ID {
+            self.bundled_asr_runtime
+                .lock()
+                .map_err(|_| "bundled ASR state lock poisoned".to_owned())?
+                .verified_artifact()
+                .map_err(|_| "内置离线转写模型不可用，请重新安装应用".to_owned())?
+        } else {
+            self.model_registry
+                .lock()
+                .map_err(|_| "model registry lock poisoned".to_owned())?
+                .verified_artifact(profile.model_id)
+                .map_err(|_| "已选择的本地转写模型无法验证，请重新选择或重新导入模型".to_owned())?
+        };
         validate_active_local_asr_model(artifact.model())?;
         let asr = WhisperCppAsrEngine::from_registered_artifact(artifact)
-            .map_err(|error| format!("could not load the selected local ASR model: {error}"))?;
+            .map_err(|_| "已选择的本地转写模型无法加载，请重新选择或重新安装应用".to_owned())?;
         Ok(NativeInferenceEngines::new(WebRtcVad::new(), asr))
     }
 
@@ -4721,6 +4847,48 @@ mod tests {
         assert!(reopened.audit_is_valid().unwrap());
 
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn projects_a_verified_bundled_model_as_the_per_run_default() {
+        let state = AppState::in_memory();
+        let bundled_model = RegisteredModel {
+            id: BUNDLED_ASR_MODEL_ID,
+            model_kind: LocalModelKind::SpeechRecognition,
+            file_path: "bundled-fixture.model".into(),
+            file_size_bytes: 1,
+            sha256: "a".repeat(64),
+            version: "whisper.cpp-base-fixture".to_owned(),
+            input_format: WHISPER_CPP_GGML_INPUT_FORMAT.to_owned(),
+            model_card_id: "openai/whisper-base".to_owned(),
+            license_id: "MIT".to_owned(),
+            license_confirmed_at: DateTime::<Utc>::UNIX_EPOCH,
+            imported_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+
+        {
+            let mut runtime = state.bundled_asr_runtime.lock().unwrap();
+            runtime.model = Some(bundled_model.clone());
+            runtime.status = BundledAsrStatus::ready();
+        }
+        *state.active_local_asr_profile.lock().unwrap() = Some(ActiveLocalAsrProfile {
+            model_id: BUNDLED_ASR_MODEL_ID,
+        });
+
+        assert_eq!(
+            state.bundled_asr_status().unwrap(),
+            BundledAsrStatus::ready()
+        );
+        assert_eq!(state.list_local_models().unwrap(), vec![bundled_model]);
+        assert_eq!(
+            state
+                .select_active_local_asr_model(BUNDLED_ASR_MODEL_ID)
+                .unwrap(),
+            ActiveLocalAsrProfile {
+                model_id: BUNDLED_ASR_MODEL_ID,
+            }
+        );
+        assert!(state.audit_is_valid().unwrap());
     }
 
     #[test]

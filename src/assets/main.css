@@ -492,6 +492,18 @@ button:focus-visible {
   font-size: 10px;
 }
 
+.model-registry__asr-profile-state {
+  color: var(--ink-soft) !important;
+  font-family: var(--font-sans) !important;
+  font-size: 9px;
+  font-weight: 700;
+  text-align: right;
+}
+
+.model-registry__asr-profile--unavailable {
+  background: var(--surface-muted);
+}
+
 .model-registry__asr-profile > span,
 .model-registry__asr-profile code {
   color: var(--ink-muted);
@@ -545,6 +557,14 @@ button:focus-visible {
 
 .model-registry__asr-error {
   color: var(--recording);
+}
+
+.model-registry__bundled-error {
+  margin: 6px 5px 0;
+  color: var(--recording);
+  font-size: 9px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
 }
 
 .model-registry__list {
@@ -606,6 +626,12 @@ button:focus-visible {
   color: var(--ink-soft) !important;
   font-family: var(--font-sans) !important;
   font-weight: 700;
+}
+
+.model-row__origin {
+  color: var(--ink-soft) !important;
+  font-family: var(--font-sans) !important;
+  font-weight: 650;
 }
 
 .model-registry__empty {

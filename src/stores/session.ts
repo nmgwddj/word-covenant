@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { wordCovenantApi } from '@/lib/wordCovenantApi'
+import { useModelStore } from '@/stores/models'
 import type {
   AgentAction,
   CaptureInputKind,
@@ -84,24 +85,32 @@ export const useSessionStore = defineStore('session', {
           try {
             session = await wordCovenantApi.startSession()
           } catch {
+            let startProjection: CaptureProjection | null = null
             try {
-              this.applyCaptureProjection(await wordCovenantApi.getCaptureProjection())
-              if (this.capture.status !== 'awaiting_permission') {
-                return
-              }
+              startProjection = await wordCovenantApi.getCaptureProjection()
+              this.applyCaptureProjection(startProjection)
             } catch {
               // The fallback below makes a failed native start recoverable in the UI.
             }
 
-            this.capture = {
-              ...this.capture,
-              revision: this.capture.revision + 1,
-              status: 'failed',
-              meter: null,
-              lastIssue: {
-                code: 'stream_start_failed',
-                deviceName: this.capture.selectedDevice?.name ?? null,
-              },
+            if (startProjection?.status !== 'recording') {
+              if (this.capture.status !== 'failed' && this.capture.status !== 'interrupted') {
+                this.capture = {
+                  ...this.capture,
+                  revision: this.capture.revision + 1,
+                  status: 'failed',
+                  meter: null,
+                  lastIssue: {
+                    code: 'stream_start_failed',
+                    deviceName: this.capture.selectedDevice?.name ?? null,
+                  },
+                }
+              }
+
+              // Native model verification happens immediately before microphone
+              // activation. Refresh its compact, path-free projection after a
+              // rejected start so an invalid bundled model is visible to users.
+              await useModelStore().refreshRuntimeState()
             }
             return
           }

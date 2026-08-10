@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
   ActiveLocalAsrProfile,
   AgentAction,
+  BundledAsrStatus,
   CaptureProjection,
   CaptureSession,
   DevelopmentMockProgress,
@@ -23,6 +24,11 @@ let demoSession: CaptureSession | null = null
 let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
 let browserActiveLocalAsrProfile: ActiveLocalAsrProfile | null = null
+const browserBundledAsrStatus: BundledAsrStatus = {
+  available: false,
+  modelId: null,
+  message: '浏览器预览不包含内置本地转写模型',
+}
 const browserSpeakerClustersBySession = new Map<string, SpeakerCluster[]>()
 
 const browserCaptureProjection: CaptureProjection = {
@@ -466,6 +472,14 @@ export const wordCovenantApi = {
     }
 
     return []
+  },
+
+  async getBundledAsrStatus(): Promise<BundledAsrStatus> {
+    if (isTauriRuntime()) {
+      return invoke<BundledAsrStatus>('get_bundled_asr_status')
+    }
+
+    return { ...browserBundledAsrStatus }
   },
 
   async getActiveLocalAsrProfile(): Promise<ActiveLocalAsrProfile | null> {

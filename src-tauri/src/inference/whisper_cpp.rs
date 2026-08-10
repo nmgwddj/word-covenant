@@ -71,10 +71,10 @@ pub struct WhisperCppAsrEngine {
 impl WhisperCppAsrEngine {
     /// Loads a model from a native-only registry capability.
     ///
-    /// The registry checks the managed file's type, size, and digest immediately
-    /// before issuing the capability. `whisper-rs` then opens that native path;
-    /// the path is dropped after the context is initialized and is never exposed
-    /// through a serializable application type.
+    /// Every model provides the exact owned bytes that were SHA-256 checked
+    /// from a no-follow file descriptor, so Whisper is initialized from a
+    /// buffer and cannot reopen a substituted resource path. The bytes are
+    /// neither serializable nor exposed through application IPC.
     pub fn from_registered_artifact(
         artifact: VerifiedModelArtifact,
     ) -> Result<Self, InferenceError> {
@@ -83,11 +83,17 @@ impl WhisperCppAsrEngine {
         // Avoid whisper.cpp's default stderr logging, which can expose native
         // model-load details outside the application's audited boundaries.
         whisper_rs::install_logging_hooks();
-        let context =
-            WhisperContext::new_with_params(artifact.path(), WhisperContextParameters::default())
-                .map_err(|_| {
-                InferenceError::failed("could not initialize the registered local Whisper model")
-            })?;
+        let bytes = artifact.into_verified_bytes();
+        // whisper-rs exposes this as a borrowed slice and its Context has no
+        // buffer lifetime, so whisper.cpp consumes the bytes synchronously
+        // during initialization. `bytes` drops after this call returns.
+        let context = WhisperContext::new_from_buffer_with_params(
+            &bytes,
+            WhisperContextParameters::default(),
+        )
+        .map_err(|_| {
+            InferenceError::failed("could not initialize the registered local Whisper model")
+        })?;
         if !context.is_multilingual() {
             return Err(InferenceError::invalid(
                 "the selected Whisper model must support multilingual transcription",

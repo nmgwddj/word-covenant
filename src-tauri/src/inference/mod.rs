@@ -5,6 +5,7 @@
 //! not serialize a PCM window across the WebView boundary.
 
 pub mod asr;
+pub(crate) mod bundled_model;
 pub mod gap;
 pub mod mock;
 pub mod model_registry;

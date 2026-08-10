@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from 'pinia'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { wordCovenantApi } from '@/lib/wordCovenantApi'
+import { useModelStore } from '@/stores/models'
 import { useSessionStore } from './session'
 
 const recordingSession = {
@@ -200,6 +201,62 @@ describe('session store', () => {
     expect(store.capture.status).toBe('failed')
     expect(store.capture.lastIssue?.code).toBe('stream_start_failed')
     expect(store.isAwaitingPermission).toBe(false)
+  })
+
+  test('turns an idle rejected start into a safe failure and refreshes local ASR availability', async () => {
+    const store = useSessionStore()
+    const modelStore = useModelStore()
+    const rawNativeError = 'failed to open /Users/example/WordCovenant/ggml-base.bin'
+    const advancedModel = {
+      id: 'advanced-local-model',
+      modelKind: 'speech_recognition' as const,
+      fileSizeBytes: 2_048_000,
+      sha256: 'a'.repeat(64),
+      version: 'advanced-local-v1',
+      inputFormat: 'whisper.cpp-ggml',
+      modelCardId: 'word-covenant/advanced',
+      licenseId: 'test-license',
+      licenseConfirmedAt: '2026-08-08T00:00:00.000Z',
+      importedAt: '2026-08-08T00:00:00.000Z',
+    }
+    vi.spyOn(wordCovenantApi, 'startSession').mockRejectedValue(new Error(rawNativeError))
+    vi.spyOn(wordCovenantApi, 'getCaptureProjection').mockResolvedValue({
+      revision: 3,
+      status: 'idle',
+      permission: 'granted',
+      selectedDevice: { uid: 'coreaudio:built-in', name: 'MacBook 麦克风' },
+      devices: [{ uid: 'coreaudio:built-in', name: 'MacBook 麦克风' }],
+      meter: null,
+      lastIssue: null,
+    })
+    const listLocalModels = vi.spyOn(wordCovenantApi, 'listLocalModels').mockResolvedValue([advancedModel])
+    const getActiveLocalAsrProfile = vi
+      .spyOn(wordCovenantApi, 'getActiveLocalAsrProfile')
+      .mockResolvedValue({ modelId: advancedModel.id })
+    const getBundledAsrStatus = vi.spyOn(wordCovenantApi, 'getBundledAsrStatus').mockResolvedValue({
+      available: false,
+      modelId: 'bundled-model-id',
+      message: rawNativeError,
+    })
+
+    await store.toggleRecording()
+
+    expect(store.capture.status).toBe('failed')
+    expect(store.capture.lastIssue).toEqual({
+      code: 'stream_start_failed',
+      deviceName: 'MacBook 麦克风',
+    })
+    expect(JSON.stringify(store.$state)).not.toContain(rawNativeError)
+    expect(listLocalModels).toHaveBeenCalledOnce()
+    expect(getActiveLocalAsrProfile).toHaveBeenCalledOnce()
+    expect(getBundledAsrStatus).toHaveBeenCalledOnce()
+    expect(modelStore.models).toEqual([advancedModel])
+    expect(modelStore.activeAsrProfile).toEqual({ modelId: advancedModel.id })
+    expect(modelStore.bundledAsrStatus).toEqual({
+      available: false,
+      modelId: null,
+      message: '内置离线转写模型不可用，请重新安装应用',
+    })
   })
 
   test('reloads the active timeline once for each newer native final transcript projection', async () => {

@@ -51,9 +51,15 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            app.manage(state::AppState::open(
-                data_dir.join("word-covenant.sqlite3"),
-            )?);
+            let state = state::AppState::open(data_dir.join("word-covenant.sqlite3"))?;
+            // The resource directory is native-only. If a development build
+            // lacks a staged model, the state records an unavailable default
+            // instead of downloading or preventing the rest of the app from
+            // opening.
+            if let Ok(resource_dir) = app.path().resource_dir() {
+                state.initialize_bundled_asr(resource_dir);
+            }
+            app.manage(state);
 
             #[cfg(target_os = "macos")]
             {
@@ -113,6 +119,7 @@ pub fn run() {
         commands::rename_speaker_cluster,
         commands::reassign_transcript_speaker,
         commands::list_local_models,
+        commands::get_bundled_asr_status,
         commands::get_active_local_asr_profile,
         commands::select_active_local_asr_model,
         commands::select_local_model_file,
@@ -138,6 +145,7 @@ pub fn run() {
         commands::rename_speaker_cluster,
         commands::reassign_transcript_speaker,
         commands::list_local_models,
+        commands::get_bundled_asr_status,
         commands::get_active_local_asr_profile,
         commands::select_active_local_asr_model,
         commands::select_local_model_file,

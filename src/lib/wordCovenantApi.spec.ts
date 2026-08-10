@@ -65,6 +65,11 @@ describe('wordCovenantApi browser development mock', () => {
     await expect(wordCovenantApi.selectInputDevice('coreaudio:demo')).rejects.toThrow('浏览器预览')
     expect((await wordCovenantApi.getPrivacyStatus()).recordingSessionId).toBeNull()
     expect(await wordCovenantApi.listLocalModels()).toEqual([])
+    expect(await wordCovenantApi.getBundledAsrStatus()).toEqual({
+      available: false,
+      modelId: null,
+      message: '浏览器预览不包含内置本地转写模型',
+    })
     await expect(wordCovenantApi.selectLocalModelFile()).rejects.toThrow('浏览器预览不能打开本机模型文件选择器')
     await expect(
       wordCovenantApi.importLocalModel({
@@ -102,6 +107,22 @@ describe('wordCovenantApi browser development mock', () => {
     await expect(wordCovenantApi.selectLocalModelFile()).resolves.toBeNull()
     expect(invokeMock).toHaveBeenNthCalledWith(1, 'select_local_model_file')
     expect(invokeMock).toHaveBeenNthCalledWith(2, 'select_local_model_file')
+  })
+
+  test('uses the typed native command for bundled local ASR status', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {})
+    const invokeMock = vi.mocked(invoke)
+    const status = {
+      available: true,
+      modelId: 'b1a7f91b-0799-4af1-97e9-0d55aa8a5b9b',
+      message: null,
+    }
+    invokeMock.mockResolvedValue(status)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await expect(wordCovenantApi.getBundledAsrStatus()).resolves.toEqual(status)
+
+    expect(invokeMock).toHaveBeenCalledWith('get_bundled_asr_status')
   })
 
   test('keeps browser speaker corrections local and returns durable revisions', async () => {

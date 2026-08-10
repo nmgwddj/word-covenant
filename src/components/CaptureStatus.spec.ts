@@ -86,6 +86,23 @@ describe('CaptureStatus', () => {
     expect(wrapper.text()).toContain('麦克风权限被拒绝')
   })
 
+  test('uses a fixed Chinese message when local recording cannot start', () => {
+    const wrapper = mount(CaptureStatus, {
+      props: {
+        capture: {
+          ...capture,
+          status: 'failed',
+          meter: null,
+          lastIssue: { code: 'stream_start_failed', deviceName: 'MacBook 麦克风' },
+        },
+      },
+    })
+
+    const label = wrapper.get('.capture-status__label')
+    expect(label.text()).toBe('本地记录无法启动，请检查麦克风和本地转写模型')
+    expect(label.text()).not.toContain('MacBook 麦克风')
+  })
+
   test('shows a local ASR selection requirement before microphone recording can begin', () => {
     const wrapper = mount(CaptureStatus, {
       props: {

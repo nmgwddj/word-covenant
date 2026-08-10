@@ -122,6 +122,17 @@ export interface ActiveLocalAsrProfile {
   modelId: string
 }
 
+/**
+ * Compact availability of the release-bundled local ASR model. Native code
+ * owns resource paths and artifact verification; the WebView receives only
+ * whether the bundled default can be selected for this app run.
+ */
+export interface BundledAsrStatus {
+  available: boolean
+  modelId: string | null
+  message: string | null
+}
+
 export interface LocalModelImportInput {
   sourcePath: string
   modelKind: LocalModelKind

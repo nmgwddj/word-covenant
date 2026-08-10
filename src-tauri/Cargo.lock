@@ -5326,6 +5326,7 @@ dependencies = [
  "chrono",
  "cpal",
  "crossbeam-queue",
+ "libc",
  "mach2",
  "objc2",
  "objc2-av-foundation",

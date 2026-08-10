@@ -1,4 +1,5 @@
 use crate::domain::{DataCategory, SpeakerCluster, TranscriptSpan};
+use crate::inference::bundled_model::BundledAsrStatus;
 use crate::inference::model_registry::{
     LicenseAcknowledgement, LocalModelKind, ModelImportRequest, RegisteredModel,
 };
@@ -197,6 +198,11 @@ pub fn reassign_transcript_speaker(
 #[tauri::command]
 pub fn list_local_models(state: State<'_, AppState>) -> Result<Vec<RegisteredModel>, String> {
     state.list_local_models()
+}
+
+#[tauri::command]
+pub fn get_bundled_asr_status(state: State<'_, AppState>) -> Result<BundledAsrStatus, String> {
+    state.bundled_asr_status()
 }
 
 #[tauri::command]

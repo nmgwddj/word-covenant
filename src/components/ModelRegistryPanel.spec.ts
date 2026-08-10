@@ -47,8 +47,9 @@ describe('ModelRegistryPanel', () => {
     expect(wrapper.text()).not.toContain('/local/source/model.gguf')
     await wrapper.get('[data-testid="model-version"]').setValue('fixture-v1')
     await wrapper.get('[data-testid="model-sha256"]').setValue('a'.repeat(64))
-    expect((wrapper.get('[data-testid="model-input-format"]').element as HTMLInputElement).value)
-      .toBe('whisper.cpp-ggml')
+    expect((wrapper.get('[data-testid="model-input-format"]').element as HTMLInputElement).value).toBe(
+      'whisper.cpp-ggml'
+    )
 
     await wrapper.get('[data-testid="model-card-id"]').setValue('word-covenant/fixture')
     await wrapper.get('[data-testid="model-license-id"]').setValue('test-license')
@@ -57,24 +58,24 @@ describe('ModelRegistryPanel', () => {
     await wrapper.get('[data-testid="model-license-acknowledged"]').setValue(true)
     await wrapper.get('form').trigger('submit')
 
-    expect(wrapper.emitted('import')).toEqual([[
-      {
-        sourcePath: '/local/source/model.gguf',
-        modelKind: 'speech_recognition',
-        version: 'fixture-v1',
-        inputFormat: 'whisper.cpp-ggml',
-        expectedSha256: 'a'.repeat(64),
-        modelCardId: 'word-covenant/fixture',
-        licenseId: 'test-license',
-        licenseAcknowledged: true,
-      },
-    ]])
+    expect(wrapper.emitted('import')).toEqual([
+      [
+        {
+          sourcePath: '/local/source/model.gguf',
+          modelKind: 'speech_recognition',
+          version: 'fixture-v1',
+          inputFormat: 'whisper.cpp-ggml',
+          expectedSha256: 'a'.repeat(64),
+          modelCardId: 'word-covenant/fixture',
+          licenseId: 'test-license',
+          licenseAcknowledged: true,
+        },
+      ],
+    ])
   })
 
   test('keeps a selected local file when the native picker is cancelled and clears errors when dismissed', async () => {
-    const selectSourcePath = vi.fn()
-      .mockResolvedValueOnce('/local/source/model.gguf')
-      .mockResolvedValueOnce(null)
+    const selectSourcePath = vi.fn().mockResolvedValueOnce('/local/source/model.gguf').mockResolvedValueOnce(null)
     const wrapper = mount(ModelRegistryPanel, {
       props: {
         models: [],
@@ -146,5 +147,96 @@ describe('ModelRegistryPanel', () => {
     expect(wrapper.emitted('selectActiveAsrModel')).toEqual([[compatibleAlternative.id]])
     expect(wrapper.text()).toContain('当前转写')
     expect(wrapper.text()).not.toContain('/local/')
+  })
+
+  test('shows a verified bundled model as the selected local default while retaining advanced choices', async () => {
+    const advancedModel = {
+      ...model,
+      id: 'model-advanced',
+      sha256: 'b'.repeat(64),
+      version: 'advanced-local-v1',
+    }
+    const wrapper = mount(ModelRegistryPanel, {
+      props: {
+        models: [advancedModel, model],
+        compatibleAsrModels: [advancedModel, model],
+        bundledAsrStatus: {
+          available: true,
+          modelId: model.id,
+          message: null,
+        },
+        activeAsrProfile: { modelId: model.id },
+      },
+    })
+
+    expect(wrapper.get('[data-testid="active-asr-profile"]').text()).toContain('fixture-v1')
+    expect(wrapper.get('[data-testid="active-asr-source"]').text()).toBe('内置默认 · 已启用')
+    expect(wrapper.findAll('.model-row')[0]?.text()).toContain('内置默认')
+    const selector = wrapper.get('[data-testid="active-asr-model-select"]')
+    expect(selector.findAll('option').map(option => option.text())).toEqual([
+      '选择兼容模型',
+      `advanced-local-v1 · ${'b'.repeat(8)}`,
+      '内置默认 · fixture-v1',
+    ])
+
+    await selector.setValue(advancedModel.id)
+
+    expect(wrapper.emitted('selectActiveAsrModel')).toEqual([[advancedModel.id]])
+    expect(wrapper.text()).toContain('高级本地模型')
+  })
+
+  test('shows a safe local bundled-model error without a download path and keeps imported models selectable', () => {
+    const wrapper = mount(ModelRegistryPanel, {
+      props: {
+        models: [model],
+        compatibleAsrModels: [model],
+        bundledAsrStatus: {
+          available: false,
+          modelId: null,
+          message: '内置离线转写模型不可用，请重新安装应用',
+        },
+        activeAsrProfile: { modelId: model.id },
+      },
+    })
+
+    expect(wrapper.get('[data-testid="bundled-asr-status"]').text()).toBe('内置离线转写模型不可用，请重新安装应用')
+    expect(wrapper.get('[data-testid="active-asr-source"]').text()).toBe('高级本地模型 · 已启用')
+    expect(wrapper.get('[data-testid="active-asr-model-select"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.find('[data-testid="open-model-import"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('下载')
+    expect(wrapper.text()).not.toContain('/local/')
+  })
+
+  test('does not project a path-like native bundled-model error into the WebView', () => {
+    const wrapper = mount(ModelRegistryPanel, {
+      props: {
+        models: [],
+        bundledAsrStatus: {
+          available: false,
+          modelId: null,
+          message: '内置模型读取失败: /Users/example/Library/Application Support/WordCovenant/models/base.bin',
+        },
+      },
+    })
+
+    expect(wrapper.get('[data-testid="bundled-asr-status"]').text()).toBe('内置离线转写模型不可用，请重新安装应用')
+    expect(wrapper.text()).not.toContain('/Users/example/')
+    expect(wrapper.text()).not.toContain('下载')
+  })
+
+  test('does not project a path-free native bundled-model error into the WebView', () => {
+    const wrapper = mount(ModelRegistryPanel, {
+      props: {
+        models: [],
+        bundledAsrStatus: {
+          available: false,
+          modelId: null,
+          message: 'the bundled model lock is invalid',
+        },
+      },
+    })
+
+    expect(wrapper.get('[data-testid="bundled-asr-status"]').text()).toBe('内置离线转写模型不可用，请重新安装应用')
+    expect(wrapper.text()).not.toContain('bundled model lock')
   })
 })

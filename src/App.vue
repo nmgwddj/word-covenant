@@ -223,6 +223,7 @@ onBeforeUnmount(() => {
         <ModelRegistryPanel
           :models="modelStore.models"
           :compatible-asr-models="modelStore.compatibleAsrModels"
+          :bundled-asr-status="modelStore.bundledAsrStatus"
           :active-asr-profile="modelStore.activeAsrProfile"
           :importing="modelStore.isImporting"
           :selecting-active-asr-model="modelStore.isSelectingActiveAsrModel"
