@@ -12,8 +12,9 @@ use crate::audit::{
 #[cfg(target_os = "macos")]
 use crate::domain::CaptureSegment;
 use crate::domain::{
-    CaptureSession, DataCategory, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
-    TranscriptSpan, TranscriptTiming,
+    CaptureSession, DataCategory, SpeakerCluster, SpeakerClusterCreatedAuditPayload,
+    SpeakerClusterLabelRevision, SpeakerClusterRecord, TranscriptModelProvenance,
+    TranscriptRevision, TranscriptSource, TranscriptSpan, TranscriptTiming,
 };
 use crate::inference::asr::MAX_ASR_EMISSIONS_PER_REQUEST;
 use crate::inference::model_registry::{ModelImportRequest, ModelRegistry, RegisteredModel};
@@ -55,6 +56,24 @@ pub struct AgentAction {
     pub detail: String,
     pub status: ActionStatus,
     pub kind: String,
+}
+
+/// A compact reference to a final transcript projection changed by a manual
+/// speaker-catalog operation. The WebView reloads the full timeline only when
+/// this list is non-empty.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerSpanRef {
+    pub id: Uuid,
+    pub revision: u32,
+}
+
+/// Durable result returned by every manual speaker-catalog command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeakerOperationResult {
+    pub clusters: Vec<SpeakerCluster>,
+    pub updated_spans: Vec<SpeakerSpanRef>,
 }
 
 /// The application-owned lifecycle fence for one native dispatcher generation.
@@ -1555,6 +1574,281 @@ impl AppState {
         Ok(spans)
     }
 
+    /// Lists the compact, session-scoped anonymous speaker catalog. With no
+    /// explicit session, prefer the active capture and otherwise mirror the
+    /// timeline's most-recent-session behavior.
+    pub fn list_speaker_clusters(
+        &self,
+        session_id: Option<Uuid>,
+    ) -> Result<Vec<SpeakerCluster>, String> {
+        let Some(session_id) = self.speaker_catalog_session_id(session_id)? else {
+            return Ok(Vec::new());
+        };
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .list_speaker_clusters(session_id)
+            .map_err(|error| format!("could not load speaker catalog: {error}"))
+    }
+
+    /// Creates the next locally generated anonymous speaker catalog entry.
+    /// The catalog never records an inferred identity; the initial label is
+    /// generated from its session-scoped ordinal.
+    pub fn create_speaker_cluster(
+        &self,
+        session_id: Uuid,
+    ) -> Result<SpeakerOperationResult, String> {
+        // Keep this lock order aligned with speaker reassignment and final
+        // transcript persistence: timelines -> audit trail -> audit store.
+        let timelines = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?;
+        if !timelines.contains_key(&session_id) {
+            return Err("speaker cluster session does not exist".to_owned());
+        }
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut audit_store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let current_clusters = audit_store
+            .list_speaker_clusters(session_id)
+            .map_err(|error| format!("could not load speaker catalog: {error}"))?;
+        let ordinal = u32::try_from(current_clusters.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| "speaker cluster ordinal overflowed".to_owned())?;
+        let cluster = SpeakerClusterRecord::new(session_id, ordinal)
+            .map_err(|error| format!("could not create speaker cluster: {error}"))?;
+        let initial_label = SpeakerClusterLabelRevision::initial_generated(&cluster)
+            .map_err(|error| format!("could not create initial speaker label: {error}"))?;
+        let payload =
+            SpeakerClusterCreatedAuditPayload::new(cluster.clone(), initial_label.clone())
+                .map_err(|error| {
+                    format!("could not prepare speaker cluster audit payload: {error}")
+                })?;
+        let event = trail
+            .next_event(
+                Some(session_id),
+                None,
+                AuditKind::SpeakerClusterCreated,
+                self.monotonic_ns(),
+                Utc::now(),
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize speaker cluster: {error}"))?;
+        audit_store
+            .append_speaker_cluster_with_audit(&event, &cluster, &initial_label)
+            .map_err(|error| format!("could not persist speaker cluster: {error}"))?;
+        assert!(
+            trail.append_event(event),
+            "an audit event generated while holding the trail lock must append"
+        );
+        let clusters = audit_store
+            .list_speaker_clusters(session_id)
+            .map_err(|error| format!("could not load speaker catalog: {error}"))?;
+
+        Ok(SpeakerOperationResult {
+            clusters,
+            updated_spans: Vec::new(),
+        })
+    }
+
+    /// Appends a user-entered presentation-label revision after checking the
+    /// caller's current label revision. Labels remain anonymous metadata.
+    pub fn rename_speaker_cluster(
+        &self,
+        session_id: Uuid,
+        cluster_id: String,
+        expected_label_revision: u32,
+        label: String,
+    ) -> Result<SpeakerOperationResult, String> {
+        let _timelines = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut audit_store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let cluster = audit_store
+            .get_speaker_cluster_record(&cluster_id)
+            .map_err(|error| format!("could not load speaker cluster: {error}"))?
+            .ok_or_else(|| "speaker cluster does not exist".to_owned())?;
+        if cluster.session_id != session_id {
+            return Err("speaker cluster does not belong to this session".to_owned());
+        }
+        let previous = audit_store
+            .get_latest_speaker_cluster_label_revision(&cluster_id)
+            .map_err(|error| format!("could not load speaker label revision: {error}"))?
+            .ok_or_else(|| "speaker cluster has no durable label revision".to_owned())?;
+        if previous.revision != expected_label_revision {
+            return Err("speaker label has changed; refresh before renaming".to_owned());
+        }
+        let revision = SpeakerClusterLabelRevision::revision_of(&previous, label)
+            .map_err(|error| format!("invalid speaker label: {error}"))?;
+        if revision.label == previous.label {
+            return Err("speaker cluster already uses that label".to_owned());
+        }
+        let event = trail
+            .next_event(
+                Some(session_id),
+                revision.parent_revision_id,
+                AuditKind::SpeakerClusterLabelRevisionRecorded,
+                self.monotonic_ns(),
+                Utc::now(),
+                &revision,
+            )
+            .map_err(|error| format!("could not serialize speaker label revision: {error}"))?;
+        audit_store
+            .append_speaker_cluster_label_revision_with_audit(&event, &revision)
+            .map_err(|error| format!("could not persist speaker label revision: {error}"))?;
+        assert!(
+            trail.append_event(event),
+            "an audit event generated while holding the trail lock must append"
+        );
+        let clusters = audit_store
+            .list_speaker_clusters(session_id)
+            .map_err(|error| format!("could not load speaker catalog: {error}"))?;
+
+        Ok(SpeakerOperationResult {
+            clusters,
+            updated_spans: Vec::new(),
+        })
+    }
+
+    /// Appends exactly one speaker-only final revision for the durable current
+    /// head of a logical span. No caller-provided text or capture metadata can
+    /// enter this path.
+    pub fn reassign_transcript_speaker(
+        &self,
+        session_id: Uuid,
+        logical_span_id: Uuid,
+        expected_revision: u32,
+        target_cluster_id: Option<String>,
+    ) -> Result<SpeakerOperationResult, String> {
+        let mut timelines = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut audit_store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let revisions = audit_store
+            .list_transcript_revisions(session_id)
+            .map_err(|error| format!("could not load durable transcript revisions: {error}"))?;
+        let current = durable_current_final_transcript_head(&revisions, logical_span_id)
+            .cloned()
+            .ok_or_else(|| "final transcript span does not exist in this session".to_owned())?;
+        if current.revision != expected_revision {
+            return Err("transcript span has changed; refresh before reassigning".to_owned());
+        }
+
+        let current_clusters = audit_store
+            .list_speaker_clusters(session_id)
+            .map_err(|error| format!("could not load speaker catalog: {error}"))?;
+        if let Some(target_cluster_id) = target_cluster_id.as_deref() {
+            let target = current_clusters
+                .iter()
+                .find(|cluster| cluster.id == target_cluster_id)
+                .ok_or_else(|| {
+                    "target speaker cluster does not exist in this session".to_owned()
+                })?;
+            if target.merged_into_cluster_id.is_some() || target.canonical_cluster_id != target.id {
+                return Err(
+                    "target speaker cluster is merged and cannot receive assignments".to_owned(),
+                );
+            }
+        }
+        if current.speaker_cluster_id == target_cluster_id {
+            return Err("speaker assignment already matches the requested target".to_owned());
+        }
+
+        let revision = TranscriptRevision::revision_of(
+            &current,
+            current.timing(),
+            target_cluster_id,
+            current.text.clone(),
+            true,
+            TranscriptSource::UserEdited,
+            current.model.clone(),
+            current.confidence,
+        )
+        .map_err(|error| format!("could not prepare speaker reassignment: {error}"))?;
+        let event = trail
+            .next_event(
+                Some(session_id),
+                revision.parent_revision_id,
+                AuditKind::TranscriptSpeakerReassigned,
+                self.monotonic_ns(),
+                Utc::now(),
+                &revision,
+            )
+            .map_err(|error| format!("could not serialize speaker reassignment: {error}"))?;
+        audit_store
+            .append_transcript_speaker_reassignment_with_audit(&event, &revision)
+            .map_err(|error| format!("could not persist speaker reassignment: {error}"))?;
+        assert!(
+            trail.append_event(event),
+            "an audit event generated while holding the trail lock must append"
+        );
+
+        // SQLite has committed both immutable records before the WebView's
+        // in-memory projection is allowed to observe the new assignment.
+        Self::upsert_timeline_projection(&mut timelines, transcript_revision_projection(&revision));
+        let clusters = audit_store
+            .list_speaker_clusters(session_id)
+            .map_err(|error| format!("could not load speaker catalog: {error}"))?;
+
+        Ok(SpeakerOperationResult {
+            clusters,
+            updated_spans: vec![SpeakerSpanRef {
+                id: logical_span_id,
+                revision: revision.revision,
+            }],
+        })
+    }
+
+    fn speaker_catalog_session_id(
+        &self,
+        requested_session_id: Option<Uuid>,
+    ) -> Result<Option<Uuid>, String> {
+        if requested_session_id.is_some() {
+            return Ok(requested_session_id);
+        }
+        if let Some(session) = self.active_live_session()? {
+            return Ok(Some(session.id));
+        }
+
+        self.timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())
+            .map(|timelines| {
+                timelines
+                    .iter()
+                    .max_by_key(|(_, timeline)| {
+                        timeline
+                            .iter()
+                            .filter_map(|span| span.wall_clock_start)
+                            .max()
+                    })
+                    .map(|(session_id, _)| *session_id)
+            })
+    }
+
     pub fn append_transcript(&self, span: TranscriptSpan) -> Result<(), String> {
         let monotonic_ns = span.capture_end_ns;
         self.timelines
@@ -2370,6 +2664,19 @@ fn timeline_projections(revisions: Vec<TranscriptRevision>) -> BTreeMap<Uuid, Ve
     timelines
 }
 
+/// Returns the current durable final revision for exactly one logical span.
+/// Revisions are append-only and SQLite validates strict consecutive revision
+/// numbers, so the largest revision is the only current head.
+fn durable_current_final_transcript_head(
+    revisions: &[TranscriptRevision],
+    logical_span_id: Uuid,
+) -> Option<&TranscriptRevision> {
+    revisions
+        .iter()
+        .filter(|revision| revision.logical_span_id == logical_span_id && revision.is_final)
+        .max_by_key(|revision| revision.revision)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2379,7 +2686,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate::domain::CaptureSegment;
     use crate::domain::{
-        TranscriptModelProvenance, TranscriptRevision, TranscriptSource, TranscriptTiming,
+        SpeakerClusterAliasRevision, TranscriptModelProvenance, TranscriptRevision,
+        TranscriptSource, TranscriptTiming,
     };
     use crate::inference::model_registry::{
         LicenseAcknowledgement, LocalModelKind, ModelImportRequest,
@@ -3611,6 +3919,341 @@ mod tests {
         assert!(error.contains("must be persisted from an ASR response"));
         assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
         assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn creates_lists_and_renames_anonymous_speaker_clusters() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+
+        assert!(state
+            .list_speaker_clusters(Some(session.id))
+            .unwrap()
+            .is_empty());
+        let created = state.create_speaker_cluster(session.id).unwrap();
+        assert!(created.updated_spans.is_empty());
+        assert_eq!(created.clusters.len(), 1);
+        let cluster = created.clusters[0].clone();
+        assert_eq!(cluster.session_id, session.id);
+        assert_eq!(cluster.label, "Speaker 1");
+        assert!(!cluster.is_user_named);
+        assert_eq!(cluster.label_revision, 1);
+        assert_eq!(state.list_speaker_clusters(None).unwrap(), created.clusters);
+
+        let renamed = state
+            .rename_speaker_cluster(
+                session.id,
+                cluster.id.clone(),
+                cluster.label_revision,
+                "  会议主持人  ".to_owned(),
+            )
+            .unwrap();
+        assert!(renamed.updated_spans.is_empty());
+        assert_eq!(renamed.clusters.len(), 1);
+        assert_eq!(renamed.clusters[0].label, "会议主持人");
+        assert!(renamed.clusters[0].is_user_named);
+        assert_eq!(renamed.clusters[0].label_revision, 2);
+
+        let event_count = state.audit_trail.lock().unwrap().events().len();
+        let label_revisions = state
+            .audit_store
+            .lock()
+            .unwrap()
+            .get_latest_speaker_cluster_label_revision(&cluster.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(label_revisions.revision, 2);
+        assert!(state
+            .rename_speaker_cluster(session.id, cluster.id, 1, "过期名称".to_owned())
+            .unwrap_err()
+            .contains("changed"));
+        assert_eq!(
+            state.audit_trail.lock().unwrap().events().len(),
+            event_count
+        );
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn rejects_speaker_cluster_creation_for_an_unknown_session_without_audit_writes() {
+        let state = AppState::in_memory();
+        let unknown_session_id = Uuid::new_v4();
+        let event_count = state.audit_trail.lock().unwrap().events().len();
+
+        assert_eq!(
+            state
+                .create_speaker_cluster(unknown_session_id)
+                .unwrap_err(),
+            "speaker cluster session does not exist"
+        );
+        assert_eq!(
+            state.audit_trail.lock().unwrap().events().len(),
+            event_count
+        );
+        assert!(state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_speaker_clusters(unknown_session_id)
+            .unwrap()
+            .is_empty());
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn reassigns_one_current_final_span_without_mutating_its_evidence() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let cluster = state
+            .create_speaker_cluster(session.id)
+            .unwrap()
+            .clusters
+            .remove(0);
+        let wall_clock_start = DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(40);
+        let model =
+            TranscriptModelProvenance::new("fixture", "fixture-asr", "v1", Some("a".repeat(64)))
+                .unwrap();
+        let original = TranscriptRevision::original(
+            session.id,
+            TranscriptTiming::new(
+                session.started_monotonic_ns + 10,
+                session.started_monotonic_ns + 90,
+                wall_clock_start,
+                wall_clock_start + Duration::milliseconds(80),
+            )
+            .unwrap(),
+            None,
+            "不改变原文的说话人修正。",
+            true,
+            TranscriptSource::Synthetic,
+            Some(model),
+            Some(0.73),
+        )
+        .unwrap();
+        state
+            .append_final_transcript_revision(original.clone())
+            .unwrap();
+        let event_count_before = state.audit_trail.lock().unwrap().events().len();
+
+        let result = state
+            .reassign_transcript_speaker(
+                session.id,
+                original.logical_span_id,
+                original.revision,
+                Some(cluster.id.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            result.updated_spans,
+            vec![SpeakerSpanRef {
+                id: original.logical_span_id,
+                revision: 2,
+            }]
+        );
+        assert_eq!(
+            result
+                .clusters
+                .iter()
+                .find(|item| item.id == cluster.id)
+                .unwrap()
+                .span_count,
+            1
+        );
+
+        let revisions = state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_transcript_revisions(session.id)
+            .unwrap();
+        assert_eq!(revisions.len(), 2);
+        let reassigned = revisions.last().unwrap();
+        assert_eq!(reassigned.logical_span_id, original.logical_span_id);
+        assert_eq!(reassigned.parent_revision_id, Some(original.id));
+        assert_eq!(reassigned.revision, 2);
+        assert_eq!(reassigned.source, TranscriptSource::UserEdited);
+        assert_eq!(reassigned.speaker_cluster_id, Some(cluster.id.clone()));
+        assert_eq!(reassigned.text, original.text);
+        assert_eq!(reassigned.timing(), original.timing());
+        assert_eq!(reassigned.model, original.model);
+        assert_eq!(reassigned.confidence, original.confidence);
+        drop(revisions);
+
+        let timeline = state.list_timeline(Some(session.id)).unwrap();
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].id, original.logical_span_id);
+        assert_eq!(timeline[0].revision, 2);
+        assert_eq!(timeline[0].speaker_cluster_id, Some(cluster.id));
+        assert_eq!(timeline[0].text, original.text);
+
+        let trail = state.audit_trail.lock().unwrap();
+        assert_eq!(trail.events().len(), event_count_before + 1);
+        let event = trail.events().last().unwrap();
+        assert_eq!(event.kind, AuditKind::TranscriptSpeakerReassigned);
+        assert_eq!(event.run_id, Some(session.id));
+        assert_eq!(event.causation_id, Some(original.id));
+        assert!(event.wall_clock > original.wall_clock_end);
+        drop(trail);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn rejects_stale_partial_unknown_cross_session_and_aliased_reassignment_targets() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let active_cluster = state
+            .create_speaker_cluster(session.id)
+            .unwrap()
+            .clusters
+            .remove(0);
+        let aliased_cluster = state
+            .create_speaker_cluster(session.id)
+            .unwrap()
+            .clusters
+            .into_iter()
+            .find(|cluster| cluster.id != active_cluster.id)
+            .unwrap();
+        let wall_clock_start = DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(60);
+        let original = TranscriptRevision::original(
+            session.id,
+            TranscriptTiming::new(
+                session.started_monotonic_ns + 10,
+                session.started_monotonic_ns + 20,
+                wall_clock_start,
+                wall_clock_start + Duration::nanoseconds(10),
+            )
+            .unwrap(),
+            None,
+            "只允许修正最终版本。",
+            true,
+            TranscriptSource::Synthetic,
+            None,
+            None,
+        )
+        .unwrap();
+        state
+            .append_final_transcript_revision(original.clone())
+            .unwrap();
+        let partial = TranscriptSpan::new(
+            session.id,
+            original.capture_start_ns,
+            original.capture_end_ns,
+            None,
+            "临时片段。",
+            false,
+            1,
+            TranscriptSource::Synthetic,
+        )
+        .unwrap();
+        state.append_transcript(partial.clone()).unwrap();
+
+        state.stop_session().unwrap();
+        let foreign_session = state.start_session().unwrap();
+        let foreign_cluster = state
+            .create_speaker_cluster(foreign_session.id)
+            .unwrap()
+            .clusters
+            .remove(0);
+        append_test_speaker_alias(&state, session.id, &aliased_cluster.id, &active_cluster.id);
+        let before = speaker_reassignment_snapshot(&state, session.id);
+
+        assert!(state
+            .reassign_transcript_speaker(
+                session.id,
+                original.logical_span_id,
+                original.revision + 1,
+                Some(active_cluster.id.clone()),
+            )
+            .is_err());
+        assert_eq!(speaker_reassignment_snapshot(&state, session.id), before);
+
+        assert!(state
+            .reassign_transcript_speaker(
+                session.id,
+                partial.id,
+                partial.revision,
+                Some(active_cluster.id.clone()),
+            )
+            .is_err());
+        assert_eq!(speaker_reassignment_snapshot(&state, session.id), before);
+
+        assert!(state
+            .reassign_transcript_speaker(
+                session.id,
+                Uuid::new_v4(),
+                1,
+                Some(active_cluster.id.clone()),
+            )
+            .is_err());
+        assert_eq!(speaker_reassignment_snapshot(&state, session.id), before);
+
+        assert!(state
+            .reassign_transcript_speaker(
+                session.id,
+                original.logical_span_id,
+                original.revision,
+                Some(foreign_cluster.id),
+            )
+            .is_err());
+        assert_eq!(speaker_reassignment_snapshot(&state, session.id), before);
+
+        assert!(state
+            .reassign_transcript_speaker(
+                session.id,
+                original.logical_span_id,
+                original.revision,
+                Some(aliased_cluster.id),
+            )
+            .is_err());
+        assert_eq!(speaker_reassignment_snapshot(&state, session.id), before);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    fn append_test_speaker_alias(
+        state: &AppState,
+        session_id: Uuid,
+        source_cluster_id: &str,
+        target_cluster_id: &str,
+    ) {
+        let alias = SpeakerClusterAliasRevision::aliased_to(
+            source_cluster_id.to_owned(),
+            target_cluster_id.to_owned(),
+        )
+        .unwrap();
+        let mut trail = state.audit_trail.lock().unwrap();
+        let event = trail
+            .next_event(
+                Some(session_id),
+                alias.parent_revision_id,
+                AuditKind::SpeakerClusterAliasRevisionRecorded,
+                state.monotonic_ns(),
+                Utc::now(),
+                &alias,
+            )
+            .unwrap();
+        state
+            .audit_store
+            .lock()
+            .unwrap()
+            .append_speaker_cluster_alias_revision_with_audit(&event, &alias)
+            .unwrap();
+        assert!(trail.append_event(event));
+    }
+
+    fn speaker_reassignment_snapshot(
+        state: &AppState,
+        session_id: Uuid,
+    ) -> (Vec<TranscriptSpan>, usize, usize) {
+        let timeline = state.list_timeline(Some(session_id)).unwrap();
+        let revision_count = state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_transcript_revisions(session_id)
+            .unwrap()
+            .len();
+        let audit_event_count = state.audit_trail.lock().unwrap().events().len();
+        (timeline, revision_count, audit_event_count)
     }
 
     #[test]

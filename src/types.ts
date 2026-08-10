@@ -138,6 +138,32 @@ export interface TranscriptSpan {
   source: TranscriptSource
 }
 
+/**
+ * A local, session-scoped speaking-part catalog entry with durable labels and
+ * revision metadata.
+ */
+export interface SpeakerCluster {
+  id: string
+  sessionId: string
+  label: string
+  isUserNamed: boolean
+  labelRevision: number
+  aliasRevision: number
+  mergedIntoClusterId: string | null
+  canonicalClusterId: string
+  spanCount: number
+}
+
+export interface SpeakerSpanRef {
+  id: string
+  revision: number
+}
+
+export interface SpeakerOperationResult {
+  clusters: SpeakerCluster[]
+  updatedSpans: SpeakerSpanRef[]
+}
+
 export interface AgentAction {
   id: string
   title: string

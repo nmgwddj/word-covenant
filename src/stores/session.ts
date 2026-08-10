@@ -5,6 +5,8 @@ import type {
   CaptureInputKind,
   CaptureProjection,
   CaptureSession,
+  SpeakerCluster,
+  SpeakerOperationResult,
   TranscriptSpan,
 } from '@/types'
 
@@ -18,34 +20,42 @@ const emptyCaptureProjection: CaptureProjection = {
   lastIssue: null,
 }
 
+function operationErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : '说话人归类操作未完成'
+}
+
 export const useSessionStore = defineStore('session', {
   state: () => ({
     activeSession: null as CaptureSession | null,
     timeline: [] as TranscriptSpan[],
+    speakerClusters: [] as SpeakerCluster[],
     actions: [] as AgentAction[],
     capture: { ...emptyCaptureProjection } as CaptureProjection,
     captureInput: 'microphone' as CaptureInputKind,
     isDevelopmentMockActive: false,
     isAdvancingDevelopmentMock: false,
+    isSpeakerOperationPending: false,
+    speakerError: null as string | null,
     isLoading: false,
   }),
 
   getters: {
-    isRecording: (state) => (
-      state.capture.status === 'recording'
-      || (state.isDevelopmentMockActive && state.activeSession?.state === 'recording')
-    ),
-    isAwaitingPermission: (state) => state.capture.status === 'awaiting_permission',
+    isRecording: state =>
+      state.capture.status === 'recording' ||
+      (state.isDevelopmentMockActive && state.activeSession?.state === 'recording'),
+    isAwaitingPermission: state => state.capture.status === 'awaiting_permission',
   },
 
   actions: {
     async initialize() {
-      const [timeline, actions, capture] = await Promise.all([
+      const [timeline, actions, capture, speakerClusters] = await Promise.all([
         wordCovenantApi.listTimeline(),
         wordCovenantApi.listActions(),
         wordCovenantApi.getCaptureProjection(),
+        wordCovenantApi.listSpeakerClusters(),
       ])
       this.timeline = timeline
+      this.speakerClusters = speakerClusters
       this.actions = actions
       this.applyCaptureProjection(capture)
     },
@@ -90,8 +100,14 @@ export const useSessionStore = defineStore('session', {
             return
           }
           this.activeSession = session
-          this.timeline = await wordCovenantApi.listTimeline(this.activeSession.id)
-          this.applyCaptureProjection(await wordCovenantApi.getCaptureProjection())
+          const [timeline, speakerClusters, capture] = await Promise.all([
+            wordCovenantApi.listTimeline(this.activeSession.id),
+            wordCovenantApi.listSpeakerClusters(this.activeSession.id),
+            wordCovenantApi.getCaptureProjection(),
+          ])
+          this.timeline = timeline
+          this.speakerClusters = speakerClusters
+          this.applyCaptureProjection(capture)
         }
       } finally {
         this.isLoading = false
@@ -119,6 +135,7 @@ export const useSessionStore = defineStore('session', {
       const session = await wordCovenantApi.startDevelopmentMockSession()
       this.activeSession = session
       this.timeline = []
+      this.speakerClusters = await wordCovenantApi.listSpeakerClusters(session.id)
       this.isDevelopmentMockActive = true
     },
 
@@ -147,16 +164,115 @@ export const useSessionStore = defineStore('session', {
     },
 
     mergeTimeline(spans: TranscriptSpan[]) {
-      const byId = new Map(this.timeline.map((span) => [span.id, span]))
+      const byId = new Map(this.timeline.map(span => [span.id, span]))
       for (const span of spans) {
         const current = byId.get(span.id)
         if (!current || span.revision >= current.revision) {
           byId.set(span.id, span)
         }
       }
-      this.timeline = [...byId.values()].sort((left, right) => (
-        left.captureStartNs - right.captureStartNs || left.revision - right.revision
-      ))
+      this.timeline = [...byId.values()].sort(
+        (left, right) => left.captureStartNs - right.captureStartNs || left.revision - right.revision
+      )
+      this.syncSpeakerSpanCounts()
+    },
+
+    syncSpeakerSpanCounts() {
+      const spansByCluster = new Map<string, number>()
+      for (const span of this.timeline) {
+        if (span.speakerClusterId) {
+          spansByCluster.set(span.speakerClusterId, (spansByCluster.get(span.speakerClusterId) ?? 0) + 1)
+        }
+      }
+      this.speakerClusters = this.speakerClusters.map(cluster => ({
+        ...cluster,
+        spanCount: spansByCluster.get(cluster.id) ?? 0,
+      }))
+    },
+
+    replaceTimelineForSession(sessionId: string, spans: TranscriptSpan[]) {
+      const otherSessions = this.timeline.filter(span => span.sessionId !== sessionId)
+      this.timeline = [...otherSessions, ...spans].sort(
+        (left, right) => left.captureStartNs - right.captureStartNs || left.revision - right.revision
+      )
+    },
+
+    async applySpeakerOperationResult(sessionId: string, result: SpeakerOperationResult) {
+      if (result.updatedSpans.length > 0) {
+        const timeline = await wordCovenantApi.listTimeline(sessionId)
+        this.replaceTimelineForSession(sessionId, timeline)
+      }
+      this.speakerClusters = result.clusters
+    },
+
+    async refreshSpeakerProjections(sessionId: string) {
+      const [timeline, speakerClusters] = await Promise.all([
+        wordCovenantApi.listTimeline(sessionId),
+        wordCovenantApi.listSpeakerClusters(sessionId),
+      ])
+      this.replaceTimelineForSession(sessionId, timeline)
+      this.speakerClusters = speakerClusters
+    },
+
+    async runSpeakerOperation(
+      sessionId: string,
+      operation: () => Promise<SpeakerOperationResult>
+    ): Promise<SpeakerOperationResult | null> {
+      if (this.isSpeakerOperationPending) return null
+
+      this.isSpeakerOperationPending = true
+      this.speakerError = null
+      let operationCommitted = false
+      try {
+        const result = await operation()
+        operationCommitted = true
+        await this.applySpeakerOperationResult(sessionId, result)
+        return result
+      } catch (error) {
+        if (!operationCommitted) {
+          try {
+            await this.refreshSpeakerProjections(sessionId)
+          } catch {
+            // Keep the original operation error: a failed refresh cannot make a rejected request succeed.
+          }
+          this.speakerError = operationErrorMessage(error)
+        } else {
+          this.speakerError = '说话人归类已保存，但本地记录刷新失败，请重新打开后核对'
+        }
+        return null
+      } finally {
+        this.isSpeakerOperationPending = false
+      }
+    },
+
+    async createSpeakerCluster(sessionId: string) {
+      return this.runSpeakerOperation(sessionId, () =>
+        wordCovenantApi.createSpeakerCluster({
+          sessionId,
+        })
+      )
+    },
+
+    async renameSpeakerCluster(input: {
+      sessionId: string
+      clusterId: string
+      expectedLabelRevision: number
+      label: string
+    }) {
+      return this.runSpeakerOperation(input.sessionId, () => wordCovenantApi.renameSpeakerCluster(input))
+    },
+
+    async reassignTranscriptSpeaker(input: {
+      sessionId: string
+      logicalSpanId: string
+      expectedRevision: number
+      targetClusterId: string | null
+    }) {
+      return this.runSpeakerOperation(input.sessionId, () => wordCovenantApi.reassignTranscriptSpeaker(input))
+    },
+
+    clearSpeakerError() {
+      this.speakerError = null
     },
 
     async proposeLocalSpeech() {

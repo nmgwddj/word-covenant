@@ -1,12 +1,12 @@
-# WordCovenant Product Roadmap and Execution Plan
+# WordCovenant 产品路线图与执行计划
 
 > **For Codex:** Execute this plan in small, tested changes. Do not add an outbound client, cloud model, auto-download, arbitrary hook, or arbitrary shell execution outside the explicit milestone that permits it.
 
-**Goal:** Deliver a macOS-first, local-first conversation record application whose audio, transcript, speaker data, and Agent context remain on-device unless the user visibly enables a narrowly scoped outbound action.
+**目标：** 交付一款 macOS 优先、本地优先的对话记录应用。除非用户在可见界面中主动启用受限出网动作，否则音频、转写、说话人数据和 Agent 上下文均留在设备上。
 
-**Architecture:** WordCovenant is a modular Tauri desktop application. The Rust process is the sole owner of microphone access, capture time, storage, policy decisions, credentials, model execution, and tool execution. The Vue WebView only renders projections and sends typed intents. Every Agent, skill, hook, model, transcript, and external response may create an action proposal but cannot cause a side effect without the Rust policy and approval path.
+**架构：** WordCovenant 是模块化的 Tauri 桌面应用。Rust 进程是麦克风访问、采集时间、存储、策略决策、凭据、模型执行和工具执行的唯一所有者。Vue WebView 只渲染投影并发送强类型意图。任何 Agent、技能、钩子、模型、转写和外部响应都只能提出动作建议；未经 Rust 策略与批准路径，不能产生副作用。
 
-**Tech Stack:** Tauri 2, Rust, Vue 3, TypeScript, Pinia, SQLite/FTS5, macOS Keychain, CoreAudio/CPAL, Metal-accelerated local ASR, ONNX Runtime, JSON Schema, `tracing`, and native macOS signing/notarization tooling.
+**技术栈：** Tauri 2、Rust、Vue 3、TypeScript、Pinia、SQLite/FTS5、macOS Keychain、CoreAudio/CPAL、Metal 加速的本地 ASR、ONNX Runtime、JSON Schema、`tracing` 以及原生 macOS 签名/公证工具。这里列出的本地 ASR、ONNX Runtime 和说话人模型是目标技术栈，不代表已经完成集成或验证。
 
 ---
 
@@ -23,12 +23,12 @@
 4. Turning off the visible switch instantly blocks all future egress. Revoking a profile does the same. Neither one deletes local records.
 5. WebView CSP/capabilities do not grant network or shell access. A future Rust HTTP client is created only after a successful policy decision.
 6. Agent output is typed `PlanV1` data, never executable text. Arbitrary shell commands, arbitrary URLs, native sidecars, and generic MCP tools are not MVP capabilities.
-7. Diarization initially assigns anonymous clusters. A display name or voiceprint profile is explicit user data, not an identity claim inferred from ambient audio.
+7. 当前 M3.0 仅由用户手动创建和改派会话内匿名簇；自动说话人分离尚未提供。未来若引入显示名称或声纹档案，均必须是明确的用户数据，且绝不能由环境音频推断成身份声明。
 8. The current SHA-256 audit chain binds local records and detects modifications that do not recompute the chain. A Keychain-backed seal is required before claiming resistance to an attacker who can rewrite or truncate SQLite; it also does not prove legal enforceability or non-repudiation.
 
 ### MVP definition
 
-The first usable release is a visible local recorder that lets a macOS user start/stop capture, see final Chinese transcript spans with capture-time timestamps and anonymous speaker clusters, search/correct those spans, and manually trigger a local Agent action. It works offline after the user imports local models. It shows all recording, model, egress, approval, gap, and action decisions in local history.
+第一版可用版本是可见的本地录音器：macOS 用户能够开始/停止采集、查看带采集时间戳的最终中文转写片段、手动创建/修正会话内匿名说话人簇、搜索/修正这些片段，并手动触发本地 Agent 动作。用户导入本地模型后可离线运行。它会在本地历史中显示录音、模型、出网、批准、间隙和动作决策。
 
 Not MVP: automatic human identification from a voiceprint, ambient/background recording, overlap separation guarantees, cloud transcription, automatic model downloads, unattended external actions, generic plugins, legal-contract claims, or a cross-device sync service.
 
@@ -45,6 +45,7 @@ Not MVP: automatic human identification from a voiceprint, ambient/background re
 | Awaiting manual acceptance | M1 native input adapter | CoreAudio/CPAL input and microphone lifecycle code exist; the real-device exit gate remains the M1 manual acceptance run. The native source is not yet an ASR ingress. |
 | In progress | M2.1 pure Rust/local mock speech pipeline contract | Deterministic local mock PCM exercises the bounded pipeline and final transcript persistence. It does not consume the real CPAL ingress and does not claim a real VAD or `whisper.cpp` adapter. |
 | 代码已实现，待真实 macOS 人工验收 | M2.2 native capture-to-inference bridge | 单一 dispatcher、`Starting -> Recording` 两阶段启动、16/48 kHz 预检、有界 ASR job/result 队列、显式 inference gap、drain 与 generation fence 均已实现；下一出口是同一构建的 M2.2 人工验收。它不代表真实 VAD、`whisper.cpp`/Metal 或模型质量已完成。 |
+| 代码已实现，完整离线验收就绪 | M3.0 手动匿名说话人修正 | 可在单个会话中创建匿名簇、修订显示名称，并将当前最终转写片段改派或改回未归类。簇、标签和改派均为 SQLite 仅追加记录并绑定审计链；过期、部分、跨会话、无效或已别名目标会被拒绝。它不是自动说话人分离，不含嵌入、声纹/语音档案、置信度、重叠判定或身份声明；合并/拆分的端到端操作也尚未提供。 |
 
 ## Target Architecture
 
@@ -189,19 +190,37 @@ SHA-256、模型卡/许可证确认、输入格式、大小和版本；partial �
 来源以及中文 CER/WER、p95 partial/final 延迟、实时因子、内存、热/能耗和导入时间，
 仍须由已同意、已授权的 fixture 与实际模型基准分别证明。
 
-### M3: Speaker Workflow
+### M3.0：手动匿名说话人修正（代码已实现，完整离线验收就绪）
 
-**Outcome:** The timeline groups sufficiently clear non-overlapping speech into anonymous, correctable clusters.
+**结果：** 时间线中的当前最终转写片段可由用户手动归入会话内匿名簇，或改回未归类。系统不从音频自动推断说话人，也不宣称任何簇对应真实的人。
 
-**Tasks:**
+**已实现范围：**
 
-1. Add local speaker embedding adapter and online cosine-similarity clustering with a calibrated ambiguity threshold.
-2. Persist an embedding reference/hash separately from transcript projection; encrypt or delete it with the cluster.
-3. Show `Speaker 1/2/...`, confidence, overlap/uncertain labels, and manual rename/merge/split controls.
-4. Require an explicit consent flow for mapping an anonymous cluster to a profile. Support deletion, re-enrolment, and all related audit events.
-5. Benchmark diarization error rate and wrong-assignment rate on consented, licensed fixtures; test ambiguity paths.
+1. 每个簇都使用会话内、不含身份信息的本地不透明 ID 和匿名序号；初始标签以及之后的用户输入标签都是显示元数据，不是身份声明。
+2. 簇、标签修订和可用的别名基础记录均使用本地 SQLite 的仅追加表和修订链保存，并绑定 SHA-256 审计事件。历史转写和名称不会被原地覆盖。
+3. 前端以扁平的管理面板显示目录。用户可创建匿名簇、重命名当前簇，并把一个当前最终版转写片段改派给活动匿名簇或改回未归类。
+4. 改派会创建一条 `UserEdited` 最终转写修订和一个专用审计事件，同时保留文本、采集时间、墙上时钟时间和模型来源。请求必须携带当前修订；过期、部分、未知、跨会话、无效或已别名目标都会在写入前被拒绝。
+5. 原始 PCM 不会跨 Tauri IPC 进入 WebView，也不会写入 SQLite、审计记录或日志。M3.0 没有 PCM 查看、导出或调试接口。
 
-**Acceptance targets:** no automatic personal-name assertion; overlapping/uncertain speech remains visibly uncertain; edits are revisioned and reversible.
+**M3.0 明确不提供：** 自动说话人分离或自动聚类、嵌入向量、声纹/语音档案、声纹匹配、跨会话关联、置信度、重叠/不确定性判定、真实身份确认或声明。用户输入的名称不改变这一边界。合并和拆分的端到端用户命令与界面也不属于当前实现，虽有仅追加别名数据模型基础，但不能据此宣称此功能可用。
+
+**出网与模型边界：** M3.0 未新增 HTTP 客户端、模型下载或出网请求。应用启动和重启后仍默认拒绝出网；即使用户日后主动打开本次会话的可见出网总开关，也仍需要匹配的具名工具、HTTPS 源站和数据范围审批。说话人修正本身不会因开关状态而请求网络。
+
+**离线验收门槛：** 以下矩阵必须在不下载模型、不创建网络客户端、不暴露 PCM 且不改变默认出网拒绝行为的前提下通过，才能将 M3.0 标记为已验收：
+
+```sh
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo test --manifest-path src-tauri/Cargo.toml --offline
+cargo check --manifest-path src-tauri/Cargo.toml --release --offline
+pnpm test --run
+pnpm type-check
+pnpm build
+git diff --check
+```
+
+### M3 后续：本地说话人分离的独立研究与验收（未开始）
+
+未来的本地说话人分离必须另行设计和批准，不能把 M3.0 的人工修正当作自动归因能力。前置条件包括：明确的生物特征数据威胁模型、用户同意与删除/重新登记流程、完全本地的嵌入适配器、经许可且获同意的测试样本、歧义阈值以及说话人分离错误率和误归类率基准。通过后仍只能分配匿名簇，不能自动声明真实个人身份。
 
 ### M4: Agent Actions and Controlled Tools
 
@@ -252,14 +271,14 @@ SHA-256、模型卡/许可证确认、输入格式、大小和版本；partial �
 ```text
 M0.1 egress gate -------------------------------------------> M4 HTTP profiles
 M1 native input ---------------------------------------------+
-M2.1 pure Rust/mock contract --------------------------------+--> M2.2 dispatcher + queues --> native VAD/ASR --> M3 clustering
+M2.1 pure Rust/mock contract --------------------------------+--> M2.2 dispatcher + queues --> native VAD/ASR --> future automatic diarization
 M2 model registry -------------------------------------------+
-M2 final transcript events --------------------------------------> M4 Agent context --> M5 declarative skills
+M2 final transcript events --------------------------------------> M3.0 manual catalog/corrections --> M4 Agent context --> M5 declarative skills
 M0 audit core ---------------------------------------------------> M4 / M5 / M6
 M1 permission/release work -------------------------------------> M6 notarization
 ```
 
-The safe parallel units are UI-only policy projections, pure Rust policy tests, M2.1 fixture/benchmark tooling, and documentation. M2.1 may remain independent of the real CPAL consumer while its deterministic contract is tested. The following must stay sequenced: M2.2's single dispatcher before any native ASR consumer; two-phase startup and bounded job/result queues before M2.2 hardware acceptance; real VAD/ASR bindings and model benchmarks after the bridge; actual HTTP client after M0.1+M4 policy/approval paths; voiceprint naming after anonymous clustering; executable hooks after declarative skills; encryption migration after a threat-model decision.
+可安全并行的单元包括仅 UI 的策略投影、纯 Rust 策略测试、M2.1 fixture/基准工具、M3.0 手动目录/修正和文档。M2.1 在确定性契约被测试期间可以保持独立于真实 CPAL 消费者。必须保持顺序的工作包括：M2.2 的单一 dispatcher 必须先于任何原生 ASR 消费者；两阶段启动与有界 job/result 队列必须先于 M2.2 硬件验收；真实 VAD/ASR 绑定和模型基准必须在桥接后进行；自动说话人分离、嵌入或任何声纹档案必须在独立隐私设计、同意流程和基准之后进行；实际 HTTP 客户端必须在 M0.1+M4 策略/批准路径后引入；可执行钩子必须在声明式技能之后引入；加密迁移必须在威胁模型决策后进行。
 
 ## Non-Functional Gates
 

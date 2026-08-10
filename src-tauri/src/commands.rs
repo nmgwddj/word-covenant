@@ -1,9 +1,9 @@
-use crate::domain::{DataCategory, TranscriptSpan};
+use crate::domain::{DataCategory, SpeakerCluster, TranscriptSpan};
 use crate::inference::model_registry::{
     LicenseAcknowledgement, LocalModelKind, ModelImportRequest, RegisteredModel,
 };
 use crate::policy::{EgressApproval, PolicyDecision};
-use crate::state::{AgentAction, AppState, PrivacyStatus};
+use crate::state::{AgentAction, AppState, PrivacyStatus, SpeakerOperationResult};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -46,6 +46,30 @@ pub struct ImportLocalModelInput {
     pub model_card_id: String,
     pub license_id: String,
     pub license_acknowledged: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSpeakerClusterInput {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSpeakerClusterInput {
+    pub session_id: Uuid,
+    pub cluster_id: String,
+    pub expected_label_revision: u32,
+    pub label: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReassignTranscriptSpeakerInput {
+    pub session_id: Uuid,
+    pub logical_span_id: Uuid,
+    pub expected_revision: u32,
+    pub target_cluster_id: Option<String>,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -118,6 +142,48 @@ pub fn list_timeline(
     session_id: Option<Uuid>,
 ) -> Result<Vec<TranscriptSpan>, String> {
     state.list_timeline(session_id)
+}
+
+#[tauri::command]
+pub fn list_speaker_clusters(
+    state: State<'_, AppState>,
+    session_id: Option<Uuid>,
+) -> Result<Vec<SpeakerCluster>, String> {
+    state.list_speaker_clusters(session_id)
+}
+
+#[tauri::command]
+pub fn create_speaker_cluster(
+    state: State<'_, AppState>,
+    input: CreateSpeakerClusterInput,
+) -> Result<SpeakerOperationResult, String> {
+    state.create_speaker_cluster(input.session_id)
+}
+
+#[tauri::command]
+pub fn rename_speaker_cluster(
+    state: State<'_, AppState>,
+    input: RenameSpeakerClusterInput,
+) -> Result<SpeakerOperationResult, String> {
+    state.rename_speaker_cluster(
+        input.session_id,
+        input.cluster_id,
+        input.expected_label_revision,
+        input.label,
+    )
+}
+
+#[tauri::command]
+pub fn reassign_transcript_speaker(
+    state: State<'_, AppState>,
+    input: ReassignTranscriptSpeakerInput,
+) -> Result<SpeakerOperationResult, String> {
+    state.reassign_transcript_speaker(
+        input.session_id,
+        input.logical_span_id,
+        input.expected_revision,
+        input.target_cluster_id,
+    )
 }
 
 #[tauri::command]
@@ -226,8 +292,13 @@ pub fn attempt_http_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::selected_local_model_path;
+    use super::{
+        selected_local_model_path, CreateSpeakerClusterInput, ReassignTranscriptSpeakerInput,
+        RenameSpeakerClusterInput,
+    };
+    use serde_json::json;
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[test]
     fn local_model_file_selection_returns_none_when_the_picker_is_cancelled() {
@@ -244,5 +315,44 @@ mod tests {
             selected_local_model_path(Some(PathBuf::from("model.gguf"))).unwrap_err(),
             "selected model file must use an absolute local path"
         );
+    }
+
+    #[test]
+    fn speaker_command_inputs_use_the_camel_case_bridge_contract() {
+        let session_id = Uuid::new_v4();
+        let logical_span_id = Uuid::new_v4();
+
+        let create: CreateSpeakerClusterInput = serde_json::from_value(json!({
+            "sessionId": session_id,
+        }))
+        .unwrap();
+        assert_eq!(create.session_id, session_id);
+
+        let rename: RenameSpeakerClusterInput = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "clusterId": "speaker-01234567-89ab-cdef-0123-456789abcdef",
+            "expectedLabelRevision": 4,
+            "label": "会议主持人",
+        }))
+        .unwrap();
+        assert_eq!(rename.session_id, session_id);
+        assert_eq!(
+            rename.cluster_id,
+            "speaker-01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(rename.expected_label_revision, 4);
+        assert_eq!(rename.label, "会议主持人");
+
+        let reassign: ReassignTranscriptSpeakerInput = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "logicalSpanId": logical_span_id,
+            "expectedRevision": 7,
+            "targetClusterId": null,
+        }))
+        .unwrap();
+        assert_eq!(reassign.session_id, session_id);
+        assert_eq!(reassign.logical_span_id, logical_span_id);
+        assert_eq!(reassign.expected_revision, 7);
+        assert_eq!(reassign.target_cluster_id, None);
     }
 }

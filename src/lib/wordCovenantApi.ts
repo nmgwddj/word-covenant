@@ -8,6 +8,8 @@ import type {
   LocalModelImportInput,
   PrivacyStatus,
   RegisteredModel,
+  SpeakerCluster,
+  SpeakerOperationResult,
   TranscriptSpan,
 } from '@/types'
 
@@ -18,6 +20,7 @@ const developmentMockTotalNs = 12_000_000_000
 let demoSession: CaptureSession | null = null
 let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
+const browserSpeakerClustersBySession = new Map<string, SpeakerCluster[]>()
 
 const browserCaptureProjection: CaptureProjection = {
   revision: 0,
@@ -75,6 +78,33 @@ const demoTimeline: TranscriptSpan[] = [
     source: 'synthetic',
   },
 ]
+
+const demoSpeakerClusters: SpeakerCluster[] = [
+  {
+    id: 'speaker-1',
+    sessionId: demoSessionId,
+    label: '说话人 1',
+    isUserNamed: false,
+    labelRevision: 1,
+    aliasRevision: 0,
+    mergedIntoClusterId: null,
+    canonicalClusterId: 'speaker-1',
+    spanCount: 2,
+  },
+  {
+    id: 'speaker-2',
+    sessionId: demoSessionId,
+    label: '说话人 2',
+    isUserNamed: false,
+    labelRevision: 1,
+    aliasRevision: 0,
+    mergedIntoClusterId: null,
+    canonicalClusterId: 'speaker-2',
+    spanCount: 1,
+  },
+]
+
+browserSpeakerClustersBySession.set(demoSessionId, demoSpeakerClusters)
 
 const developmentMockCues = [
   {
@@ -136,6 +166,96 @@ function browserMockProgress(newSpans: TranscriptSpan[] = []): DevelopmentMockPr
   }
 }
 
+function browserTimelineForSession(sessionId: string): TranscriptSpan[] | null {
+  if (browserDevelopmentMock?.session.id === sessionId) {
+    return browserDevelopmentMock.timeline
+  }
+
+  if (sessionId === demoSessionId) {
+    return demoTimeline
+  }
+
+  return null
+}
+
+function cloneSpeakerCatalog(sessionId: string): SpeakerCluster[] {
+  return demoSpeakerClusters.map(cluster => ({
+    ...cluster,
+    sessionId,
+  }))
+}
+
+function browserSpeakerCatalog(sessionId: string): SpeakerCluster[] | null {
+  return browserSpeakerClustersBySession.get(sessionId) ?? null
+}
+
+function speakerClustersWithCounts(sessionId: string): SpeakerCluster[] {
+  const catalog = browserSpeakerCatalog(sessionId)
+  const timeline = browserTimelineForSession(sessionId)
+  if (!catalog || !timeline) return []
+
+  const spanCounts = new Map<string, number>()
+  for (const span of timeline) {
+    if (span.speakerClusterId) {
+      spanCounts.set(span.speakerClusterId, (spanCounts.get(span.speakerClusterId) ?? 0) + 1)
+    }
+  }
+
+  return catalog.map(cluster => ({
+    ...cluster,
+    spanCount: spanCounts.get(cluster.id) ?? 0,
+  }))
+}
+
+function browserSpeakerOperationResult(
+  sessionId: string,
+  updatedSpans: SpeakerOperationResult['updatedSpans'] = []
+): SpeakerOperationResult {
+  return {
+    clusters: speakerClustersWithCounts(sessionId),
+    updatedSpans,
+  }
+}
+
+function resolveBrowserSpeakerSessionId(sessionId?: string): string {
+  return sessionId ?? browserDevelopmentMock?.session.id ?? demoSessionId
+}
+
+function nextBrowserSpeakerId(clusters: SpeakerCluster[]): string {
+  let ordinal = clusters.length + 1
+  while (clusters.some(cluster => cluster.id === `speaker-${ordinal}`)) {
+    ordinal += 1
+  }
+  return `speaker-${ordinal}`
+}
+
+function updateBrowserTimelineSpan(
+  sessionId: string,
+  logicalSpanId: string,
+  update: (span: TranscriptSpan) => TranscriptSpan
+): TranscriptSpan {
+  const timeline = browserTimelineForSession(sessionId)
+  if (!timeline) {
+    throw new Error('本地会话不存在')
+  }
+
+  const index = timeline.findIndex(span => span.id === logicalSpanId)
+  if (index < 0) {
+    throw new Error('记录片段不存在')
+  }
+
+  const updated = update(timeline[index]!)
+  if (browserDevelopmentMock?.session.id === sessionId) {
+    browserDevelopmentMock = {
+      ...browserDevelopmentMock,
+      timeline: timeline.map((span, spanIndex) => (spanIndex === index ? updated : span)),
+    }
+  } else {
+    demoTimeline[index] = updated
+  }
+  return updated
+}
+
 function getDemoPrivacyStatus(): PrivacyStatus {
   return {
     // Browser preview models the policy state only; it never sends HTTP requests.
@@ -190,7 +310,7 @@ export const wordCovenantApi = {
 
   async onCaptureProjection(listener: (projection: CaptureProjection) => void): Promise<UnlistenFn> {
     if (isTauriRuntime()) {
-      return listen<CaptureProjection>('capture-projection', (event) => listener(event.payload))
+      return listen<CaptureProjection>('capture-projection', event => listener(event.payload))
     }
 
     return () => {}
@@ -219,14 +339,112 @@ export const wordCovenantApi = {
       return invoke<TranscriptSpan[]>('list_timeline', { sessionId })
     }
 
-    if (
-      browserDevelopmentMock
-      && (!sessionId || sessionId === browserDevelopmentMock.session.id)
-    ) {
+    if (browserDevelopmentMock && (!sessionId || sessionId === browserDevelopmentMock.session.id)) {
       return browserDevelopmentMock.timeline
     }
 
     return sessionId && sessionId !== demoSessionId ? [] : demoTimeline
+  },
+
+  async listSpeakerClusters(sessionId?: string): Promise<SpeakerCluster[]> {
+    if (isTauriRuntime()) {
+      return invoke<SpeakerCluster[]>('list_speaker_clusters', { sessionId })
+    }
+
+    return speakerClustersWithCounts(resolveBrowserSpeakerSessionId(sessionId))
+  },
+
+  async createSpeakerCluster(input: { sessionId: string }): Promise<SpeakerOperationResult> {
+    if (isTauriRuntime()) {
+      return invoke<SpeakerOperationResult>('create_speaker_cluster', { input })
+    }
+
+    const catalog = browserSpeakerCatalog(input.sessionId)
+    if (!catalog || !browserTimelineForSession(input.sessionId)) {
+      throw new Error('本地会话不存在')
+    }
+
+    const id = nextBrowserSpeakerId(catalog)
+    catalog.push({
+      id,
+      sessionId: input.sessionId,
+      label: `说话人 ${id.replace('speaker-', '')}`,
+      isUserNamed: false,
+      labelRevision: 1,
+      aliasRevision: 0,
+      mergedIntoClusterId: null,
+      canonicalClusterId: id,
+      spanCount: 0,
+    })
+    return browserSpeakerOperationResult(input.sessionId)
+  },
+
+  async renameSpeakerCluster(input: {
+    sessionId: string
+    clusterId: string
+    expectedLabelRevision: number
+    label: string
+  }): Promise<SpeakerOperationResult> {
+    if (isTauriRuntime()) {
+      return invoke<SpeakerOperationResult>('rename_speaker_cluster', { input })
+    }
+
+    const catalog = browserSpeakerCatalog(input.sessionId)
+    const cluster = catalog?.find(item => item.id === input.clusterId)
+    if (!cluster) {
+      throw new Error('说话人归类不存在')
+    }
+    if (cluster.labelRevision !== input.expectedLabelRevision) {
+      throw new Error('名称已被更新，请刷新后重试')
+    }
+    const label = input.label.trim()
+    if (!label) {
+      throw new Error('名称不能为空')
+    }
+
+    Object.assign(cluster, {
+      label,
+      isUserNamed: true,
+      labelRevision: cluster.labelRevision + 1,
+    })
+    return browserSpeakerOperationResult(input.sessionId)
+  },
+
+  async reassignTranscriptSpeaker(input: {
+    sessionId: string
+    logicalSpanId: string
+    expectedRevision: number
+    targetClusterId: string | null
+  }): Promise<SpeakerOperationResult> {
+    if (isTauriRuntime()) {
+      return invoke<SpeakerOperationResult>('reassign_transcript_speaker', { input })
+    }
+
+    if (
+      input.targetClusterId &&
+      !browserSpeakerCatalog(input.sessionId)?.some(
+        cluster => cluster.id === input.targetClusterId && cluster.mergedIntoClusterId === null
+      )
+    ) {
+      throw new Error('目标说话人归类不存在')
+    }
+
+    const updated = updateBrowserTimelineSpan(input.sessionId, input.logicalSpanId, span => {
+      if (span.revision !== input.expectedRevision) {
+        throw new Error('记录已被更新，请刷新后重试')
+      }
+      return {
+        ...span,
+        speakerClusterId: input.targetClusterId,
+        revision: span.revision + 1,
+      }
+    })
+    return browserSpeakerOperationResult(input.sessionId, [
+      {
+        id: updated.id,
+        revision: updated.revision,
+      },
+    ])
   },
 
   async listLocalModels(): Promise<RegisteredModel[]> {
@@ -271,6 +489,7 @@ export const wordCovenantApi = {
       session,
       timeline: [],
     }
+    browserSpeakerClustersBySession.set(session.id, cloneSpeakerCatalog(session.id))
     return session
   },
 
@@ -287,13 +506,12 @@ export const wordCovenantApi = {
 
     browserDevelopmentMock.elapsedNs = Math.min(
       developmentMockTotalNs,
-      browserDevelopmentMock.elapsedNs + developmentMockTickNs,
+      browserDevelopmentMock.elapsedNs + developmentMockTickNs
     )
     const newSpans: TranscriptSpan[] = []
     while (
-      browserDevelopmentMock.nextCueIndex < developmentMockCues.length
-      && developmentMockCues[browserDevelopmentMock.nextCueIndex]!.captureEndNs
-        <= browserDevelopmentMock.elapsedNs
+      browserDevelopmentMock.nextCueIndex < developmentMockCues.length &&
+      developmentMockCues[browserDevelopmentMock.nextCueIndex]!.captureEndNs <= browserDevelopmentMock.elapsedNs
     ) {
       const cue = developmentMockCues[browserDevelopmentMock.nextCueIndex]!
       const span: TranscriptSpan = {

@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AgentActionPanel from '@/components/AgentActionPanel.vue'
 import CaptureStatus from '@/components/CaptureStatus.vue'
 import DevelopmentCaptureControl from '@/components/DevelopmentCaptureControl.vue'
 import ModelRegistryPanel from '@/components/ModelRegistryPanel.vue'
 import PrivacyStatus from '@/components/PrivacyStatus.vue'
 import RecordingControl from '@/components/RecordingControl.vue'
+import SpeakerManager from '@/components/SpeakerManager.vue'
 import TimelinePanel from '@/components/TimelinePanel.vue'
 import { usePrivacyStore } from '@/stores/privacy'
 import { useModelStore } from '@/stores/models'
@@ -23,9 +24,14 @@ const recordingLabel = computed(() => {
 })
 let developmentMockTimer: number | undefined
 let unlistenCaptureProjection: (() => void) | undefined
+const selectedSpeakerSpanId = ref<string | null>(null)
+const speakerManagerTrigger = ref<HTMLElement | null>(null)
+const isSpeakerManagerOpen = computed(() =>
+  sessionStore.timeline.some(span => span.id === selectedSpeakerSpanId.value && span.isFinal)
+)
 
 onMounted(async () => {
-  unlistenCaptureProjection = await wordCovenantApi.onCaptureProjection((projection) => {
+  unlistenCaptureProjection = await wordCovenantApi.onCaptureProjection(projection => {
     sessionStore.applyCaptureProjection(projection)
   })
   await Promise.all([privacyStore.refresh(), sessionStore.initialize(), modelStore.initialize()])
@@ -42,9 +48,7 @@ async function setEgressEnabled(enabled: boolean) {
 }
 
 function toggleDevelopmentCaptureInput() {
-  sessionStore.setCaptureInput(
-    sessionStore.captureInput === 'development_mock' ? 'microphone' : 'development_mock',
-  )
+  sessionStore.setCaptureInput(sessionStore.captureInput === 'development_mock' ? 'microphone' : 'development_mock')
 }
 
 async function selectInputDevice(deviceUid: string) {
@@ -63,6 +67,46 @@ async function selectLocalModelFile() {
 
 function clearLocalModelImportError() {
   modelStore.clearImportError()
+}
+
+function openSpeakerManager(spanId: string) {
+  const selectedSpan = sessionStore.timeline.find(span => span.id === spanId)
+  if (!selectedSpan?.isFinal) return
+
+  speakerManagerTrigger.value =
+    typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null
+  selectedSpeakerSpanId.value = spanId
+  sessionStore.clearSpeakerError()
+}
+
+function closeSpeakerManager() {
+  const trigger = speakerManagerTrigger.value
+  selectedSpeakerSpanId.value = null
+  speakerManagerTrigger.value = null
+  sessionStore.clearSpeakerError()
+  void nextTick(() => trigger?.focus())
+}
+
+async function createSpeakerCluster(sessionId: string) {
+  await sessionStore.createSpeakerCluster(sessionId)
+}
+
+async function renameSpeakerCluster(input: {
+  sessionId: string
+  clusterId: string
+  expectedLabelRevision: number
+  label: string
+}) {
+  await sessionStore.renameSpeakerCluster(input)
+}
+
+async function reassignTranscriptSpeaker(input: {
+  sessionId: string
+  logicalSpanId: string
+  expectedRevision: number
+  targetClusterId: string | null
+}) {
+  await sessionStore.reassignTranscriptSpeaker(input)
 }
 
 function stopDevelopmentMockTimer() {
@@ -159,8 +203,10 @@ onBeforeUnmount(() => {
 
       <TimelinePanel
         :spans="sessionStore.timeline"
+        :speaker-clusters="sessionStore.speakerClusters"
         :session-start-ns="sessionStore.activeSession?.startedMonotonicNs ?? 0"
         :use-wall-clock="!sessionStore.activeSession"
+        @open-speaker-manager="openSpeakerManager"
       />
       <AgentActionPanel
         :actions="sessionStore.actions"
@@ -171,5 +217,21 @@ onBeforeUnmount(() => {
         @set-egress-enabled="setEgressEnabled"
       />
     </section>
+
+    <SpeakerManager
+      v-if="isSpeakerManagerOpen"
+      :clusters="sessionStore.speakerClusters"
+      :spans="sessionStore.timeline"
+      :selected-span-id="selectedSpeakerSpanId"
+      :session-start-ns="sessionStore.activeSession?.startedMonotonicNs ?? 0"
+      :use-wall-clock="!sessionStore.activeSession"
+      :pending="sessionStore.isSpeakerOperationPending"
+      :error="sessionStore.speakerError"
+      @close="closeSpeakerManager"
+      @create="createSpeakerCluster"
+      @rename="renameSpeakerCluster"
+      @reassign="reassignTranscriptSpeaker"
+      @clear-error="sessionStore.clearSpeakerError"
+    />
   </main>
 </template>

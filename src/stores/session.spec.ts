@@ -18,9 +18,11 @@ describe('session store', () => {
   })
 
   test('uses the development source and merges incremental synthetic spans by revision', async () => {
-    const startDevelopmentMockSession = vi.spyOn(wordCovenantApi, 'startDevelopmentMockSession')
+    const startDevelopmentMockSession = vi
+      .spyOn(wordCovenantApi, 'startDevelopmentMockSession')
       .mockResolvedValue(recordingSession)
-    const advanceDevelopmentMock = vi.spyOn(wordCovenantApi, 'advanceDevelopmentMock')
+    const advanceDevelopmentMock = vi
+      .spyOn(wordCovenantApi, 'advanceDevelopmentMock')
       .mockResolvedValueOnce({
         sessionId: recordingSession.id,
         packetsAdvanced: 10,
@@ -78,7 +80,7 @@ describe('session store', () => {
     expect(startDevelopmentMockSession).toHaveBeenCalledOnce()
     expect(advanceDevelopmentMock).toHaveBeenCalledTimes(2)
     expect(store.isDevelopmentMockActive).toBe(true)
-    expect(store.timeline.map((span) => span.id)).toEqual(['first', 'second'])
+    expect(store.timeline.map(span => span.id)).toEqual(['first', 'second'])
     expect(store.timeline[0]?.text).toBe('第一条模拟转写（修订）')
   })
 
@@ -198,5 +200,215 @@ describe('session store', () => {
     expect(store.capture.status).toBe('failed')
     expect(store.capture.lastIssue?.code).toBe('stream_start_failed')
     expect(store.isAwaitingPermission).toBe(false)
+  })
+
+  test('waits for a durable speaker result, then reloads the revised timeline', async () => {
+    const store = useSessionStore()
+    const original = {
+      id: 'span-1',
+      sessionId: 'session-one',
+      captureStartNs: 0,
+      captureEndNs: 1_000,
+      speakerClusterId: 'speaker-1',
+      text: '待校对记录',
+      isFinal: true,
+      revision: 1,
+      source: 'local_inference' as const,
+    }
+    const clusters = [
+      {
+        id: 'speaker-2',
+        sessionId: 'session-one',
+        label: '主持人',
+        isUserNamed: true,
+        labelRevision: 2,
+        aliasRevision: 0,
+        mergedIntoClusterId: null,
+        canonicalClusterId: 'speaker-2',
+        spanCount: 1,
+      },
+    ]
+    let completeOperation:
+      | ((value: { clusters: typeof clusters; updatedSpans: Array<{ id: string; revision: number }> }) => void)
+      | undefined
+    const operationResult = new Promise<{
+      clusters: typeof clusters
+      updatedSpans: Array<{ id: string; revision: number }>
+    }>(resolve => {
+      completeOperation = resolve
+    })
+    const revised = {
+      ...original,
+      speakerClusterId: 'speaker-2',
+      revision: 2,
+    }
+    store.timeline = [original]
+    store.speakerClusters = [
+      {
+        ...clusters[0],
+        id: 'speaker-1',
+        label: '说话人 1',
+        labelRevision: 1,
+      },
+    ]
+    vi.spyOn(wordCovenantApi, 'reassignTranscriptSpeaker').mockReturnValue(operationResult)
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue([revised])
+
+    const pending = store.reassignTranscriptSpeaker({
+      sessionId: 'session-one',
+      logicalSpanId: original.id,
+      expectedRevision: original.revision,
+      targetClusterId: 'speaker-2',
+    })
+
+    expect(store.isSpeakerOperationPending).toBe(true)
+    expect(store.timeline[0]).toEqual(original)
+    completeOperation?.({
+      clusters,
+      updatedSpans: [{ id: original.id, revision: revised.revision }],
+    })
+    await pending
+
+    expect(listTimeline).toHaveBeenCalledWith('session-one')
+    expect(store.speakerClusters).toEqual(clusters)
+    expect(store.timeline).toEqual([revised])
+    expect(store.isSpeakerOperationPending).toBe(false)
+  })
+
+  test('refreshes speaker projections before exposing a stale speaker correction error', async () => {
+    const store = useSessionStore()
+    const staleSpan = {
+      id: 'span-1',
+      sessionId: 'session-one',
+      captureStartNs: 0,
+      captureEndNs: 1_000,
+      speakerClusterId: 'speaker-1',
+      text: '待校对记录',
+      isFinal: true,
+      revision: 1,
+      source: 'local_inference' as const,
+    }
+    const refreshedTimeline = [
+      {
+        ...staleSpan,
+        speakerClusterId: 'speaker-2',
+        revision: 2,
+      },
+    ]
+    const staleClusters = [
+      {
+        id: 'speaker-1',
+        sessionId: 'session-one',
+        label: '说话人 1',
+        isUserNamed: false,
+        labelRevision: 1,
+        aliasRevision: 0,
+        mergedIntoClusterId: null,
+        canonicalClusterId: 'speaker-1',
+        spanCount: 1,
+      },
+    ]
+    const refreshedClusters = [
+      {
+        id: 'speaker-2',
+        sessionId: 'session-one',
+        label: '主持人',
+        isUserNamed: true,
+        labelRevision: 2,
+        aliasRevision: 0,
+        mergedIntoClusterId: null,
+        canonicalClusterId: 'speaker-2',
+        spanCount: 1,
+      },
+    ]
+    let resolveTimeline: (timeline: typeof refreshedTimeline) => void = () => {}
+    let resolveClusters: (clusters: typeof refreshedClusters) => void = () => {}
+    const timelineRefresh = new Promise<typeof refreshedTimeline>(resolve => {
+      resolveTimeline = resolve
+    })
+    const clusterRefresh = new Promise<typeof refreshedClusters>(resolve => {
+      resolveClusters = resolve
+    })
+
+    store.timeline = [staleSpan]
+    store.speakerClusters = staleClusters
+    vi.spyOn(wordCovenantApi, 'reassignTranscriptSpeaker').mockRejectedValue(new Error('记录版本已过期'))
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockReturnValue(timelineRefresh)
+    const listSpeakerClusters = vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockReturnValue(clusterRefresh)
+
+    const pending = store.reassignTranscriptSpeaker({
+      sessionId: 'session-one',
+      logicalSpanId: staleSpan.id,
+      expectedRevision: staleSpan.revision,
+      targetClusterId: 'speaker-2',
+    })
+
+    await vi.waitFor(() => {
+      expect(listTimeline).toHaveBeenCalledWith('session-one')
+      expect(listSpeakerClusters).toHaveBeenCalledWith('session-one')
+    })
+    expect(store.speakerError).toBeNull()
+    expect(store.isSpeakerOperationPending).toBe(true)
+
+    resolveTimeline(refreshedTimeline)
+    resolveClusters(refreshedClusters)
+    await expect(pending).resolves.toBeNull()
+
+    expect(store.timeline).toEqual(refreshedTimeline)
+    expect(store.speakerClusters).toEqual(refreshedClusters)
+    expect(store.speakerError).toBe('记录版本已过期')
+    expect(store.isSpeakerOperationPending).toBe(false)
+  })
+
+  test('retains the rejected operation error when its speaker projection refresh fails', async () => {
+    const store = useSessionStore()
+    const staleSpan = {
+      id: 'span-1',
+      sessionId: 'session-one',
+      captureStartNs: 0,
+      captureEndNs: 1_000,
+      speakerClusterId: 'speaker-1',
+      text: '待校对记录',
+      isFinal: true,
+      revision: 1,
+      source: 'local_inference' as const,
+    }
+    const staleClusters = [
+      {
+        id: 'speaker-1',
+        sessionId: 'session-one',
+        label: '说话人 1',
+        isUserNamed: false,
+        labelRevision: 1,
+        aliasRevision: 0,
+        mergedIntoClusterId: null,
+        canonicalClusterId: 'speaker-1',
+        spanCount: 1,
+      },
+    ]
+
+    store.timeline = [staleSpan]
+    store.speakerClusters = staleClusters
+    vi.spyOn(wordCovenantApi, 'reassignTranscriptSpeaker').mockRejectedValue(new Error('记录版本已过期'))
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockRejectedValue(new Error('时间线刷新失败'))
+    const listSpeakerClusters = vi
+      .spyOn(wordCovenantApi, 'listSpeakerClusters')
+      .mockRejectedValue(new Error('说话人目录刷新失败'))
+
+    await expect(
+      store.reassignTranscriptSpeaker({
+        sessionId: 'session-one',
+        logicalSpanId: staleSpan.id,
+        expectedRevision: staleSpan.revision,
+        targetClusterId: 'speaker-2',
+      })
+    ).resolves.toBeNull()
+
+    expect(listTimeline).toHaveBeenCalledWith('session-one')
+    expect(listSpeakerClusters).toHaveBeenCalledWith('session-one')
+    expect(store.timeline).toEqual([staleSpan])
+    expect(store.speakerClusters).toEqual(staleClusters)
+    expect(store.speakerError).toBe('记录版本已过期')
+    expect(store.isSpeakerOperationPending).toBe(false)
   })
 })

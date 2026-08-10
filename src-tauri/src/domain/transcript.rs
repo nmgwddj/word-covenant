@@ -12,14 +12,6 @@ pub enum TranscriptSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpeakerCluster {
-    pub id: String,
-    pub label: String,
-    pub is_user_named: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TranscriptSpan {
     pub id: Uuid,
     pub session_id: Uuid,

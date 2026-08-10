@@ -1,7 +1,9 @@
 use super::{AuditEvent, AuditKind, AuditTrail};
 use crate::audio::{CaptureGap, CapturePoint};
 use crate::domain::{
-    CaptureSegment, CaptureSession, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
+    CaptureSegment, CaptureSession, SpeakerCluster, SpeakerClusterAliasRevision,
+    SpeakerClusterCreatedAuditPayload, SpeakerClusterLabelRevision, SpeakerClusterRecord,
+    TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
 };
 use crate::inference::asr::logical_span_id_for_asr_utterance_digest;
 use crate::inference::model_registry::{LocalModelKind, RegisteredModel};
@@ -45,6 +47,10 @@ pub enum AuditStoreError {
     },
     InvalidModelKind(String),
     InvalidModelMetadata {
+        field: &'static str,
+        value: String,
+    },
+    InvalidSpeakerMetadata {
         field: &'static str,
         value: String,
     },
@@ -117,6 +123,12 @@ impl std::fmt::Display for AuditStoreError {
                 write!(
                     formatter,
                     "invalid local model metadata for {field}: {value}"
+                )
+            }
+            Self::InvalidSpeakerMetadata { field, value } => {
+                write!(
+                    formatter,
+                    "invalid speaker catalog metadata for {field}: {value}"
                 )
             }
             Self::Integrity => write!(formatter, "audit chain integrity check failed"),
@@ -349,6 +361,75 @@ impl AuditStore {
                 SELECT RAISE(ABORT, 'transcript revisions are immutable');
             END;
 
+            CREATE TABLE IF NOT EXISTS speaker_clusters (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+                audit_event_id TEXT NOT NULL UNIQUE
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS speaker_clusters_session_ordinal
+                ON speaker_clusters(session_id, ordinal);
+            CREATE INDEX IF NOT EXISTS speaker_clusters_session_sequence
+                ON speaker_clusters(session_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS speaker_clusters_are_immutable_update
+            BEFORE UPDATE ON speaker_clusters
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker clusters are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_clusters_are_immutable_delete
+            BEFORE DELETE ON speaker_clusters
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker clusters are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS speaker_cluster_label_revisions (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                speaker_cluster_id TEXT NOT NULL,
+                parent_revision_id TEXT,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                label TEXT NOT NULL,
+                is_user_named INTEGER NOT NULL CHECK (is_user_named IN (0, 1)),
+                audit_event_id TEXT NOT NULL UNIQUE,
+                UNIQUE(speaker_cluster_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS speaker_cluster_label_revisions_cluster_sequence
+                ON speaker_cluster_label_revisions(speaker_cluster_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS speaker_cluster_label_revisions_are_immutable_update
+            BEFORE UPDATE ON speaker_cluster_label_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker label revisions are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_cluster_label_revisions_are_immutable_delete
+            BEFORE DELETE ON speaker_cluster_label_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker label revisions are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS speaker_cluster_alias_revisions (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                speaker_cluster_id TEXT NOT NULL,
+                parent_revision_id TEXT,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                merged_into_cluster_id TEXT,
+                audit_event_id TEXT NOT NULL UNIQUE,
+                UNIQUE(speaker_cluster_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS speaker_cluster_alias_revisions_cluster_sequence
+                ON speaker_cluster_alias_revisions(speaker_cluster_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS speaker_cluster_alias_revisions_are_immutable_update
+            BEFORE UPDATE ON speaker_cluster_alias_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker alias revisions are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_cluster_alias_revisions_are_immutable_delete
+            BEFORE DELETE ON speaker_cluster_alias_revisions
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker alias revisions are immutable');
+            END;
+
             CREATE TABLE IF NOT EXISTS asr_final_idempotency (
                 session_id TEXT NOT NULL,
                 utterance_key_sha256 TEXT NOT NULL,
@@ -401,6 +482,129 @@ impl AuditStore {
 
     pub fn append(&self, event: &AuditEvent) -> Result<(), AuditStoreError> {
         insert_audit_event(&self.connection, event)
+    }
+
+    /// Atomically creates an anonymous speaker cluster and its generated
+    /// initial label. The single audit event hashes both immutable records.
+    pub fn append_speaker_cluster_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        cluster: &SpeakerClusterRecord,
+        initial_label: &SpeakerClusterLabelRevision,
+    ) -> Result<(), AuditStoreError> {
+        validate_speaker_cluster_created_audit_event(event, cluster, initial_label)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_speaker_cluster(&transaction, cluster, event.id)?;
+        insert_speaker_cluster_label_revision(&transaction, initial_label, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Appends one user-facing display-label correction without overwriting
+    /// the generated label or an earlier correction.
+    pub fn append_speaker_cluster_label_revision_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        revision: &SpeakerClusterLabelRevision,
+    ) -> Result<(), AuditStoreError> {
+        let cluster =
+            validate_speaker_cluster_label_revision_for_write(&self.connection, revision)?;
+        validate_speaker_cluster_label_revision_audit_event(event, &cluster, revision)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_speaker_cluster_label_revision(&transaction, revision, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Appends a reversible alias (or an explicit alias clearing) without
+    /// changing historical transcript assignments.
+    pub fn append_speaker_cluster_alias_revision_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        revision: &SpeakerClusterAliasRevision,
+    ) -> Result<(), AuditStoreError> {
+        let cluster =
+            validate_speaker_cluster_alias_revision_for_write(&self.connection, revision)?;
+        validate_speaker_cluster_alias_revision_audit_event(event, &cluster, revision)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_speaker_cluster_alias_revision(&transaction, revision, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Returns compact current catalog projections for one session. Old
+    /// transcript values such as `speaker-1` do not need catalog rows and are
+    /// intentionally excluded from this list.
+    pub fn list_speaker_clusters(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<SpeakerCluster>, AuditStoreError> {
+        let catalog = load_speaker_catalog(&self.connection)?;
+        let aliases = catalog.active_aliases();
+        let mut records = catalog
+            .clusters
+            .values()
+            .filter(|stored| stored.record.session_id == session_id)
+            .collect::<Vec<_>>();
+        records.sort_by_key(|stored| stored.record.ordinal);
+        records
+            .into_iter()
+            .map(|stored| {
+                let label = catalog.latest_label(&stored.record.id).ok_or_else(|| {
+                    speaker_error("speaker label", "cluster has no label revision")
+                })?;
+                let alias = catalog.latest_alias(&stored.record.id);
+                let canonical_cluster_id = resolve_speaker_cluster_canonical_id(
+                    &stored.record.id,
+                    &catalog.clusters,
+                    &aliases,
+                )?;
+                let span_count = current_speaker_cluster_span_count(
+                    &self.connection,
+                    session_id,
+                    &stored.record.id,
+                )?;
+                let span_count = span_count
+                    .try_into()
+                    .map_err(|_| speaker_error("speaker span count", span_count.to_string()))?;
+                SpeakerCluster::from_revisions(
+                    &stored.record,
+                    &label.revision,
+                    alias.map(|stored| &stored.revision),
+                    canonical_cluster_id,
+                    span_count,
+                )
+                .map_err(|value| speaker_error("speaker projection", value))
+            })
+            .collect()
+    }
+
+    /// Returns the immutable catalog record for a known opaque cluster ID.
+    /// This does not interpret legacy transcript strings as catalog records.
+    pub fn get_speaker_cluster_record(
+        &self,
+        cluster_id: &str,
+    ) -> Result<Option<SpeakerClusterRecord>, AuditStoreError> {
+        let catalog = load_speaker_catalog(&self.connection)?;
+        Ok(catalog
+            .clusters
+            .get(cluster_id)
+            .map(|stored| stored.record.clone()))
+    }
+
+    /// Returns the current immutable display-label revision needed to append
+    /// an optimistic-concurrency-safe user correction.
+    pub fn get_latest_speaker_cluster_label_revision(
+        &self,
+        cluster_id: &str,
+    ) -> Result<Option<SpeakerClusterLabelRevision>, AuditStoreError> {
+        let catalog = load_speaker_catalog(&self.connection)?;
+        Ok(catalog
+            .latest_label(cluster_id)
+            .map(|stored| stored.revision.clone()))
     }
 
     /// Atomically persist the three audit records that publish a new native
@@ -498,9 +702,18 @@ impl AuditStore {
         // after reopening the SQLite database.
         let transcript_events = events
             .iter()
-            .filter(|event| event.kind == AuditKind::TranscriptRevisionRecorded)
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    AuditKind::TranscriptRevisionRecorded | AuditKind::TranscriptSpeakerReassigned
+                )
+            })
             .collect::<Vec<_>>();
         let revisions = self.list_all_transcript_revisions()?;
+        let revisions_by_id = revisions
+            .iter()
+            .map(|revision| (revision.id, revision))
+            .collect::<BTreeMap<_, _>>();
         let Some(asr_bindings) = self.verified_asr_final_idempotency_bindings()? else {
             return Ok(false);
         };
@@ -510,7 +723,25 @@ impl AuditStore {
                     Some(binding) => {
                         validate_asr_final_audit_event(event, revision, binding).is_ok()
                     }
-                    None => validate_transcript_audit_event(event, revision).is_ok(),
+                    None if event.kind == AuditKind::TranscriptSpeakerReassigned => revision
+                        .parent_revision_id
+                        .and_then(|parent_id| revisions_by_id.get(&parent_id).copied())
+                        .is_some_and(|parent| {
+                            validate_transcript_speaker_reassignment_audit_event(
+                                &self.connection,
+                                event,
+                                revision,
+                                parent,
+                            )
+                            .is_ok()
+                        }),
+                    None => {
+                        let is_speaker_only = revision
+                            .parent_revision_id
+                            .and_then(|parent_id| revisions_by_id.get(&parent_id).copied())
+                            .is_some_and(|parent| is_speaker_only_reassignment(revision, parent));
+                        !is_speaker_only && validate_transcript_audit_event(event, revision).is_ok()
+                    }
                 };
                 transcript_events.iter().any(matches_event)
             })
@@ -552,6 +783,14 @@ impl AuditStore {
             {
                 return Ok(false);
             }
+        }
+
+        let catalog = match load_speaker_catalog(&self.connection) {
+            Ok(catalog) => catalog,
+            Err(_) => return Ok(false),
+        };
+        if !verify_speaker_catalog(&events, &catalog) {
+            return Ok(false);
         }
 
         Ok(true)
@@ -777,6 +1016,23 @@ impl AuditStore {
         revision: &TranscriptRevision,
     ) -> Result<(), AuditStoreError> {
         validate_transcript_audit_event(event, revision)?;
+        reject_speaker_reassignment_from_generic_path(&self.connection, revision)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_transcript_revision(&transaction, revision)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Appends a speaker-only correction as a dedicated audit action. Its
+    /// event is timestamped when the user makes the correction, while the
+    /// immutable transcript revision retains its original capture timing.
+    pub fn append_transcript_speaker_reassignment_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        revision: &TranscriptRevision,
+    ) -> Result<(), AuditStoreError> {
+        validate_transcript_speaker_reassignment_with_audit(&self.connection, event, revision)?;
         let transaction = self.connection.transaction()?;
         insert_audit_event(&transaction, event)?;
         insert_transcript_revision(&transaction, revision)?;
@@ -1095,6 +1351,84 @@ struct InferenceGapRow {
     audit_event_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct StoredSpeakerCluster {
+    record: SpeakerClusterRecord,
+    audit_event_id: Uuid,
+}
+
+#[derive(Clone, Debug)]
+struct StoredSpeakerClusterLabelRevision {
+    revision: SpeakerClusterLabelRevision,
+    audit_event_id: Uuid,
+}
+
+#[derive(Clone, Debug)]
+struct StoredSpeakerClusterAliasRevision {
+    revision: SpeakerClusterAliasRevision,
+    audit_event_id: Uuid,
+}
+
+struct SpeakerClusterRow {
+    id: String,
+    session_id: String,
+    ordinal: i64,
+    audit_event_id: String,
+}
+
+struct SpeakerClusterLabelRevisionRow {
+    id: String,
+    speaker_cluster_id: String,
+    parent_revision_id: Option<String>,
+    revision: i64,
+    label: String,
+    is_user_named: i64,
+    audit_event_id: String,
+}
+
+struct SpeakerClusterAliasRevisionRow {
+    id: String,
+    speaker_cluster_id: String,
+    parent_revision_id: Option<String>,
+    revision: i64,
+    merged_into_cluster_id: Option<String>,
+    audit_event_id: String,
+}
+
+struct SpeakerCatalog {
+    clusters: BTreeMap<String, StoredSpeakerCluster>,
+    labels: BTreeMap<String, Vec<StoredSpeakerClusterLabelRevision>>,
+    aliases: BTreeMap<String, Vec<StoredSpeakerClusterAliasRevision>>,
+}
+
+impl SpeakerCatalog {
+    fn latest_label(&self, cluster_id: &str) -> Option<&StoredSpeakerClusterLabelRevision> {
+        self.labels
+            .get(cluster_id)
+            .and_then(|revisions| revisions.last())
+    }
+
+    fn latest_alias(&self, cluster_id: &str) -> Option<&StoredSpeakerClusterAliasRevision> {
+        self.aliases
+            .get(cluster_id)
+            .and_then(|revisions| revisions.last())
+    }
+
+    fn active_aliases(&self) -> BTreeMap<String, Option<String>> {
+        self.aliases
+            .iter()
+            .filter_map(|(cluster_id, revisions)| {
+                revisions.last().map(|revision| {
+                    (
+                        cluster_id.clone(),
+                        revision.revision.merged_into_cluster_id.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
 fn local_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalModelRow> {
     Ok(LocalModelRow {
         id: row.get(0)?,
@@ -1125,6 +1459,42 @@ fn inference_gap_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InferenceGapRo
         stage: row.get(9)?,
         reason: row.get(10)?,
         audit_event_id: row.get(11)?,
+    })
+}
+
+fn speaker_cluster_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpeakerClusterRow> {
+    Ok(SpeakerClusterRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        ordinal: row.get(2)?,
+        audit_event_id: row.get(3)?,
+    })
+}
+
+fn speaker_cluster_label_revision_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SpeakerClusterLabelRevisionRow> {
+    Ok(SpeakerClusterLabelRevisionRow {
+        id: row.get(0)?,
+        speaker_cluster_id: row.get(1)?,
+        parent_revision_id: row.get(2)?,
+        revision: row.get(3)?,
+        label: row.get(4)?,
+        is_user_named: row.get(5)?,
+        audit_event_id: row.get(6)?,
+    })
+}
+
+fn speaker_cluster_alias_revision_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SpeakerClusterAliasRevisionRow> {
+    Ok(SpeakerClusterAliasRevisionRow {
+        id: row.get(0)?,
+        speaker_cluster_id: row.get(1)?,
+        parent_revision_id: row.get(2)?,
+        revision: row.get(3)?,
+        merged_into_cluster_id: row.get(4)?,
+        audit_event_id: row.get(5)?,
     })
 }
 
@@ -1197,6 +1567,27 @@ fn parse_transcript_revision(
     Ok(revision)
 }
 
+fn load_transcript_revision(
+    connection: &Connection,
+    revision_id: Uuid,
+) -> Result<Option<TranscriptRevision>, AuditStoreError> {
+    let stored = connection
+        .query_row(
+            "
+            SELECT id, logical_span_id, parent_revision_id, session_id,
+                   capture_start_ns, capture_end_ns, wall_clock_start, wall_clock_end,
+                   speaker_cluster_id, text, is_final, revision, source,
+                   model_provider, model_id, model_version, model_sha256, confidence
+            FROM transcript_revisions
+            WHERE id = ?1
+            ",
+            params![revision_id.to_string()],
+            transcript_revision_row,
+        )
+        .optional()?;
+    stored.map(parse_transcript_revision).transpose()
+}
+
 fn parse_registered_model(stored: LocalModelRow) -> Result<RegisteredModel, AuditStoreError> {
     let model = RegisteredModel {
         id: parse_uuid(&stored.id)?,
@@ -1260,6 +1651,222 @@ fn parse_inference_gap_record(
         })?;
     Ok(InferenceGapRecord {
         gap,
+        audit_event_id: parse_uuid(&stored.audit_event_id)?,
+    })
+}
+
+fn load_speaker_catalog(connection: &Connection) -> Result<SpeakerCatalog, AuditStoreError> {
+    let mut clusters = BTreeMap::new();
+    for stored in list_stored_speaker_clusters(connection)? {
+        if clusters.insert(stored.record.id.clone(), stored).is_some() {
+            return Err(speaker_error("speaker cluster", "duplicate cluster ID"));
+        }
+    }
+
+    let mut labels = BTreeMap::<String, Vec<StoredSpeakerClusterLabelRevision>>::new();
+    for stored in list_stored_speaker_cluster_label_revisions(connection)? {
+        let cluster = clusters
+            .get(&stored.revision.speaker_cluster_id)
+            .ok_or_else(|| {
+                speaker_error(
+                    "speaker label cluster",
+                    format!("missing {}", stored.revision.speaker_cluster_id),
+                )
+            })?;
+        stored
+            .revision
+            .validate_for_cluster(&cluster.record)
+            .map_err(|value| speaker_error("speaker label revision", value))?;
+        labels
+            .entry(stored.revision.speaker_cluster_id.clone())
+            .or_default()
+            .push(stored);
+    }
+
+    for cluster in clusters.values() {
+        let revisions = labels.get_mut(&cluster.record.id).ok_or_else(|| {
+            speaker_error("speaker label revision", "cluster has no initial label")
+        })?;
+        revisions.sort_by_key(|stored| stored.revision.revision);
+        let initial = revisions.first().ok_or_else(|| {
+            speaker_error("speaker label revision", "cluster has no initial label")
+        })?;
+        SpeakerClusterCreatedAuditPayload::new(cluster.record.clone(), initial.revision.clone())
+            .map_err(|value| speaker_error("initial speaker label", value))?;
+        if initial.audit_event_id != cluster.audit_event_id {
+            return Err(speaker_error(
+                "initial speaker label audit binding",
+                "does not match cluster creation event",
+            ));
+        }
+        for revisions in revisions.windows(2) {
+            revisions[1]
+                .revision
+                .validate_successor_of(&revisions[0].revision)
+                .map_err(|value| speaker_error("speaker label revision chain", value))?;
+        }
+    }
+
+    let mut aliases = BTreeMap::<String, Vec<StoredSpeakerClusterAliasRevision>>::new();
+    for stored in list_stored_speaker_cluster_alias_revisions(connection)? {
+        let cluster = clusters
+            .get(&stored.revision.speaker_cluster_id)
+            .ok_or_else(|| {
+                speaker_error(
+                    "speaker alias cluster",
+                    format!("missing {}", stored.revision.speaker_cluster_id),
+                )
+            })?;
+        stored
+            .revision
+            .validate_for_cluster(&cluster.record)
+            .map_err(|value| speaker_error("speaker alias revision", value))?;
+        if let Some(target_cluster_id) = &stored.revision.merged_into_cluster_id {
+            let target = clusters.get(target_cluster_id).ok_or_else(|| {
+                speaker_error(
+                    "speaker alias target",
+                    format!("missing {target_cluster_id}"),
+                )
+            })?;
+            if target.record.session_id != cluster.record.session_id {
+                return Err(speaker_error(
+                    "speaker alias session",
+                    format!("{} -> {target_cluster_id}", cluster.record.id),
+                ));
+            }
+        }
+        aliases
+            .entry(stored.revision.speaker_cluster_id.clone())
+            .or_default()
+            .push(stored);
+    }
+    for revisions in aliases.values_mut() {
+        revisions.sort_by_key(|stored| stored.revision.revision);
+        let initial = revisions.first().ok_or_else(|| {
+            speaker_error("speaker alias revision", "missing initial alias revision")
+        })?;
+        if initial.revision.revision != 1 || initial.revision.parent_revision_id.is_some() {
+            return Err(speaker_error(
+                "speaker alias revision chain",
+                "first alias revision must be revision one without a parent",
+            ));
+        }
+        for revisions in revisions.windows(2) {
+            revisions[1]
+                .revision
+                .validate_successor_of(&revisions[0].revision)
+                .map_err(|value| speaker_error("speaker alias revision chain", value))?;
+        }
+    }
+
+    let catalog = SpeakerCatalog {
+        clusters,
+        labels,
+        aliases,
+    };
+    validate_active_speaker_aliases(&catalog.clusters, &catalog.active_aliases())?;
+    Ok(catalog)
+}
+
+fn list_stored_speaker_clusters(
+    connection: &Connection,
+) -> Result<Vec<StoredSpeakerCluster>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, session_id, ordinal, audit_event_id
+        FROM speaker_clusters
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let rows = statement.query_map([], speaker_cluster_row)?;
+    rows.map(|row| parse_stored_speaker_cluster(row?)).collect()
+}
+
+fn list_stored_speaker_cluster_label_revisions(
+    connection: &Connection,
+) -> Result<Vec<StoredSpeakerClusterLabelRevision>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, speaker_cluster_id, parent_revision_id, revision, label, is_user_named,
+               audit_event_id
+        FROM speaker_cluster_label_revisions
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let rows = statement.query_map([], speaker_cluster_label_revision_row)?;
+    rows.map(|row| parse_stored_speaker_cluster_label_revision(row?))
+        .collect()
+}
+
+fn list_stored_speaker_cluster_alias_revisions(
+    connection: &Connection,
+) -> Result<Vec<StoredSpeakerClusterAliasRevision>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, speaker_cluster_id, parent_revision_id, revision, merged_into_cluster_id,
+               audit_event_id
+        FROM speaker_cluster_alias_revisions
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let rows = statement.query_map([], speaker_cluster_alias_revision_row)?;
+    rows.map(|row| parse_stored_speaker_cluster_alias_revision(row?))
+        .collect()
+}
+
+fn parse_stored_speaker_cluster(
+    stored: SpeakerClusterRow,
+) -> Result<StoredSpeakerCluster, AuditStoreError> {
+    let record = SpeakerClusterRecord {
+        id: stored.id,
+        session_id: parse_uuid(&stored.session_id)?,
+        ordinal: parse_speaker_u32("speaker cluster ordinal", stored.ordinal)?,
+    };
+    record
+        .validate()
+        .map_err(|value| speaker_error("speaker cluster", value))?;
+    Ok(StoredSpeakerCluster {
+        record,
+        audit_event_id: parse_uuid(&stored.audit_event_id)?,
+    })
+}
+
+fn parse_stored_speaker_cluster_label_revision(
+    stored: SpeakerClusterLabelRevisionRow,
+) -> Result<StoredSpeakerClusterLabelRevision, AuditStoreError> {
+    let is_user_named = parse_speaker_bool("speaker label user-named flag", stored.is_user_named)?;
+    let revision = SpeakerClusterLabelRevision {
+        id: parse_uuid(&stored.id)?,
+        speaker_cluster_id: stored.speaker_cluster_id,
+        parent_revision_id: parse_optional_uuid(stored.parent_revision_id)?,
+        revision: parse_speaker_u32("speaker label revision", stored.revision)?,
+        label: stored.label,
+        is_user_named,
+    };
+    revision
+        .validate()
+        .map_err(|value| speaker_error("speaker label revision", value))?;
+    Ok(StoredSpeakerClusterLabelRevision {
+        revision,
+        audit_event_id: parse_uuid(&stored.audit_event_id)?,
+    })
+}
+
+fn parse_stored_speaker_cluster_alias_revision(
+    stored: SpeakerClusterAliasRevisionRow,
+) -> Result<StoredSpeakerClusterAliasRevision, AuditStoreError> {
+    let revision = SpeakerClusterAliasRevision {
+        id: parse_uuid(&stored.id)?,
+        speaker_cluster_id: stored.speaker_cluster_id,
+        parent_revision_id: parse_optional_uuid(stored.parent_revision_id)?,
+        revision: parse_speaker_u32("speaker alias revision", stored.revision)?,
+        merged_into_cluster_id: stored.merged_into_cluster_id,
+    };
+    revision
+        .validate()
+        .map_err(|value| speaker_error("speaker alias revision", value))?;
+    Ok(StoredSpeakerClusterAliasRevision {
+        revision,
         audit_event_id: parse_uuid(&stored.audit_event_id)?,
     })
 }
@@ -1396,6 +2003,193 @@ fn validate_transcript_audit_event(
         });
     }
     Ok(())
+}
+
+fn reject_speaker_reassignment_from_generic_path(
+    connection: &Connection,
+    revision: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    let Some(parent_revision_id) = revision.parent_revision_id else {
+        return Ok(());
+    };
+    let Some(parent) = load_transcript_revision(connection, parent_revision_id)? else {
+        return Ok(());
+    };
+    if is_speaker_only_reassignment(revision, &parent) {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment audit binding",
+            value: "speaker-only corrections must use the dedicated audit write path".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_transcript_speaker_reassignment_with_audit(
+    connection: &Connection,
+    event: &AuditEvent,
+    revision: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    validate_transcript_revision(connection, revision)?;
+    let parent_revision_id =
+        revision
+            .parent_revision_id
+            .ok_or_else(|| AuditStoreError::InvalidTranscriptMetadata {
+                field: "speaker reassignment parent",
+                value: "speaker reassignment must append to a prior revision".to_owned(),
+            })?;
+    let parent = load_transcript_revision(connection, parent_revision_id)?
+        .ok_or_else(|| AuditStoreError::MissingTranscriptParent(parent_revision_id.to_string()))?;
+    validate_transcript_speaker_reassignment_audit_event(connection, event, revision, &parent)
+}
+
+fn validate_transcript_speaker_reassignment_audit_event(
+    connection: &Connection,
+    event: &AuditEvent,
+    revision: &TranscriptRevision,
+    parent: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    validate_transcript_speaker_reassignment_revision(revision, parent)?;
+    validate_transcript_speaker_reassignment_target(connection, revision)?;
+    if event.kind != AuditKind::TranscriptSpeakerReassigned {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment audit event kind",
+            value: serde_json::to_string(&event.kind).expect("audit kind serializes"),
+        });
+    }
+    if event.run_id != Some(revision.session_id) {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment audit event session linkage",
+            value: format!("run_id={:?}", event.run_id),
+        });
+    }
+    if event.causation_id != revision.parent_revision_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment audit event causation linkage",
+            value: format!("causation_id={:?}", event.causation_id),
+        });
+    }
+    if !event.matches_payload(revision).map_err(|error| {
+        AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment audit event payload",
+            value: error.to_string(),
+        }
+    })? {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment audit event payload",
+            value: "digest does not match transcript revision".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// A dedicated speaker reassignment may reference only an active catalog
+/// entry in the same session. Generic transcript revisions intentionally do
+/// not use this check so pre-M3 strings such as `speaker-1` remain readable.
+fn validate_transcript_speaker_reassignment_target(
+    connection: &Connection,
+    revision: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    let Some(target_cluster_id) = revision.speaker_cluster_id.as_deref() else {
+        return Ok(());
+    };
+    let catalog = load_speaker_catalog(connection)?;
+    let target = catalog.clusters.get(target_cluster_id).ok_or_else(|| {
+        AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment target",
+            value: "speaker cluster does not exist in the transcript session".to_owned(),
+        }
+    })?;
+    if target.record.session_id != revision.session_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment target",
+            value: "speaker cluster does not belong to the transcript session".to_owned(),
+        });
+    }
+
+    let canonical_cluster_id = resolve_speaker_cluster_canonical_id(
+        target_cluster_id,
+        &catalog.clusters,
+        &catalog.active_aliases(),
+    )?;
+    if canonical_cluster_id != target_cluster_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment target",
+            value: "speaker cluster is merged and cannot receive assignments".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_transcript_speaker_reassignment_revision(
+    revision: &TranscriptRevision,
+    parent: &TranscriptRevision,
+) -> Result<(), AuditStoreError> {
+    validate_transcript_revision_metadata(revision)?;
+    if revision.source != TranscriptSource::UserEdited {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment source",
+            value: format!("{:?}", revision.source),
+        });
+    }
+    if revision.parent_revision_id != Some(parent.id) {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment parent",
+            value: format!("parent_revision_id={:?}", revision.parent_revision_id),
+        });
+    }
+    if !speaker_reassignment_chain_matches(revision, parent) {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment revision chain",
+            value: "logical span, session, and revision number must follow the parent".to_owned(),
+        });
+    }
+    if !speaker_reassignment_facts_match(revision, parent) {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment immutable transcript facts",
+            value: "text, timing, finality, model, and confidence must match the parent".to_owned(),
+        });
+    }
+    if revision.speaker_cluster_id == parent.speaker_cluster_id {
+        return Err(AuditStoreError::InvalidTranscriptMetadata {
+            field: "speaker reassignment target",
+            value: "speaker cluster assignment must change".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn is_speaker_only_reassignment(
+    revision: &TranscriptRevision,
+    parent: &TranscriptRevision,
+) -> bool {
+    revision.source == TranscriptSource::UserEdited
+        && revision.parent_revision_id == Some(parent.id)
+        && speaker_reassignment_chain_matches(revision, parent)
+        && speaker_reassignment_facts_match(revision, parent)
+        && revision.speaker_cluster_id != parent.speaker_cluster_id
+}
+
+fn speaker_reassignment_chain_matches(
+    revision: &TranscriptRevision,
+    parent: &TranscriptRevision,
+) -> bool {
+    revision.logical_span_id == parent.logical_span_id
+        && revision.session_id == parent.session_id
+        && parent.revision.checked_add(1) == Some(revision.revision)
+}
+
+fn speaker_reassignment_facts_match(
+    revision: &TranscriptRevision,
+    parent: &TranscriptRevision,
+) -> bool {
+    revision.capture_start_ns == parent.capture_start_ns
+        && revision.capture_end_ns == parent.capture_end_ns
+        && revision.wall_clock_start == parent.wall_clock_start
+        && revision.wall_clock_end == parent.wall_clock_end
+        && revision.text == parent.text
+        && revision.is_final == parent.is_final
+        && revision.model == parent.model
+        && revision.confidence == parent.confidence
 }
 
 fn validate_asr_final_audit_event(
@@ -1631,6 +2425,340 @@ fn validate_inference_gap_audit_event(
     Ok(())
 }
 
+fn validate_speaker_cluster_created_audit_event(
+    event: &AuditEvent,
+    cluster: &SpeakerClusterRecord,
+    initial_label: &SpeakerClusterLabelRevision,
+) -> Result<(), AuditStoreError> {
+    let payload = SpeakerClusterCreatedAuditPayload::new(cluster.clone(), initial_label.clone())
+        .map_err(|value| speaker_error("speaker cluster creation", value))?;
+    validate_speaker_audit_event_metadata(
+        event,
+        AuditKind::SpeakerClusterCreated,
+        cluster.session_id,
+        None,
+        &payload,
+    )
+}
+
+fn validate_speaker_cluster_label_revision_for_write(
+    connection: &Connection,
+    revision: &SpeakerClusterLabelRevision,
+) -> Result<SpeakerClusterRecord, AuditStoreError> {
+    let catalog = load_speaker_catalog(connection)?;
+    let cluster = catalog
+        .clusters
+        .get(&revision.speaker_cluster_id)
+        .ok_or_else(|| {
+            speaker_error(
+                "speaker label cluster",
+                format!("missing {}", revision.speaker_cluster_id),
+            )
+        })?;
+    revision
+        .validate_for_cluster(&cluster.record)
+        .map_err(|value| speaker_error("speaker label revision", value))?;
+    let previous = catalog
+        .latest_label(&revision.speaker_cluster_id)
+        .ok_or_else(|| speaker_error("speaker label parent", "cluster has no initial label"))?;
+    revision
+        .validate_successor_of(&previous.revision)
+        .map_err(|value| speaker_error("speaker label parent", value))?;
+    Ok(cluster.record.clone())
+}
+
+fn validate_speaker_cluster_label_revision_audit_event(
+    event: &AuditEvent,
+    cluster: &SpeakerClusterRecord,
+    revision: &SpeakerClusterLabelRevision,
+) -> Result<(), AuditStoreError> {
+    validate_speaker_audit_event_metadata(
+        event,
+        AuditKind::SpeakerClusterLabelRevisionRecorded,
+        cluster.session_id,
+        revision.parent_revision_id,
+        revision,
+    )
+}
+
+fn validate_speaker_cluster_alias_revision_for_write(
+    connection: &Connection,
+    revision: &SpeakerClusterAliasRevision,
+) -> Result<SpeakerClusterRecord, AuditStoreError> {
+    let catalog = load_speaker_catalog(connection)?;
+    let cluster = catalog
+        .clusters
+        .get(&revision.speaker_cluster_id)
+        .ok_or_else(|| {
+            speaker_error(
+                "speaker alias cluster",
+                format!("missing {}", revision.speaker_cluster_id),
+            )
+        })?;
+    revision
+        .validate_for_cluster(&cluster.record)
+        .map_err(|value| speaker_error("speaker alias revision", value))?;
+
+    match catalog.latest_alias(&revision.speaker_cluster_id) {
+        Some(previous) => revision
+            .validate_successor_of(&previous.revision)
+            .map_err(|value| speaker_error("speaker alias parent", value))?,
+        None if revision.revision != 1 || revision.parent_revision_id.is_some() => {
+            return Err(speaker_error(
+                "speaker alias parent",
+                "first alias revision must be revision one without a parent",
+            ));
+        }
+        None => {}
+    }
+
+    let mut aliases = catalog.active_aliases();
+    aliases.insert(
+        revision.speaker_cluster_id.clone(),
+        revision.merged_into_cluster_id.clone(),
+    );
+    validate_active_speaker_aliases(&catalog.clusters, &aliases)?;
+    Ok(cluster.record.clone())
+}
+
+fn validate_speaker_cluster_alias_revision_audit_event(
+    event: &AuditEvent,
+    cluster: &SpeakerClusterRecord,
+    revision: &SpeakerClusterAliasRevision,
+) -> Result<(), AuditStoreError> {
+    validate_speaker_audit_event_metadata(
+        event,
+        AuditKind::SpeakerClusterAliasRevisionRecorded,
+        cluster.session_id,
+        revision.parent_revision_id,
+        revision,
+    )
+}
+
+fn validate_speaker_audit_event_metadata<T: Serialize>(
+    event: &AuditEvent,
+    kind: AuditKind,
+    session_id: Uuid,
+    causation_id: Option<Uuid>,
+    payload: &T,
+) -> Result<(), AuditStoreError> {
+    if event.kind != kind {
+        return Err(speaker_error(
+            "audit event kind",
+            serde_json::to_string(&event.kind).expect("audit kind serializes"),
+        ));
+    }
+    if event.run_id != Some(session_id) {
+        return Err(speaker_error(
+            "audit event session linkage",
+            format!("run_id={:?}", event.run_id),
+        ));
+    }
+    if event.causation_id != causation_id {
+        return Err(speaker_error(
+            "audit event causation linkage",
+            format!("causation_id={:?}", event.causation_id),
+        ));
+    }
+    if !event
+        .matches_payload(payload)
+        .map_err(|error| speaker_error("audit event payload", error.to_string()))?
+    {
+        return Err(speaker_error(
+            "audit event payload",
+            "digest does not match speaker catalog record",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_speaker_aliases(
+    clusters: &BTreeMap<String, StoredSpeakerCluster>,
+    aliases: &BTreeMap<String, Option<String>>,
+) -> Result<(), AuditStoreError> {
+    for (source_cluster_id, target_cluster_id) in aliases {
+        let source = clusters.get(source_cluster_id).ok_or_else(|| {
+            speaker_error(
+                "speaker alias source",
+                format!("missing {source_cluster_id}"),
+            )
+        })?;
+        if let Some(target_cluster_id) = target_cluster_id {
+            let target = clusters.get(target_cluster_id).ok_or_else(|| {
+                speaker_error(
+                    "speaker alias target",
+                    format!("missing {target_cluster_id}"),
+                )
+            })?;
+            if target.record.session_id != source.record.session_id {
+                return Err(speaker_error(
+                    "speaker alias session",
+                    format!("{source_cluster_id} -> {target_cluster_id}"),
+                ));
+            }
+        }
+    }
+    for cluster_id in aliases.keys() {
+        resolve_speaker_cluster_canonical_id(cluster_id, clusters, aliases)?;
+    }
+    Ok(())
+}
+
+fn resolve_speaker_cluster_canonical_id(
+    cluster_id: &str,
+    clusters: &BTreeMap<String, StoredSpeakerCluster>,
+    aliases: &BTreeMap<String, Option<String>>,
+) -> Result<String, AuditStoreError> {
+    if !clusters.contains_key(cluster_id) {
+        return Err(speaker_error(
+            "speaker cluster",
+            format!("missing {cluster_id}"),
+        ));
+    }
+
+    let mut current = cluster_id.to_owned();
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(speaker_error("speaker alias cycle", current));
+        }
+        match aliases.get(&current).and_then(|target| target.as_ref()) {
+            Some(target) => {
+                if !clusters.contains_key(target) {
+                    return Err(speaker_error(
+                        "speaker alias target",
+                        format!("missing {target}"),
+                    ));
+                }
+                current = target.clone();
+            }
+            None => return Ok(current),
+        }
+    }
+}
+
+fn current_speaker_cluster_span_count(
+    connection: &Connection,
+    session_id: Uuid,
+    cluster_id: &str,
+) -> Result<i64, AuditStoreError> {
+    connection
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM transcript_revisions AS revisions
+            WHERE revisions.session_id = ?1
+              AND revisions.speaker_cluster_id = ?2
+              AND revisions.is_final = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM transcript_revisions AS children
+                  WHERE children.parent_revision_id = revisions.id
+              )
+            ",
+            params![session_id.to_string(), cluster_id],
+            |row| row.get(0),
+        )
+        .map_err(AuditStoreError::from)
+}
+
+fn verify_speaker_catalog(events: &[AuditEvent], catalog: &SpeakerCatalog) -> bool {
+    let events_by_id = events
+        .iter()
+        .map(|event| (event.id, event))
+        .collect::<BTreeMap<_, _>>();
+    let creation_events = events
+        .iter()
+        .filter(|event| event.kind == AuditKind::SpeakerClusterCreated)
+        .count();
+    let label_events = events
+        .iter()
+        .filter(|event| event.kind == AuditKind::SpeakerClusterLabelRevisionRecorded)
+        .count();
+    let alias_events = events
+        .iter()
+        .filter(|event| event.kind == AuditKind::SpeakerClusterAliasRevisionRecorded)
+        .count();
+    let expected_label_events = catalog
+        .labels
+        .values()
+        .map(|revisions| revisions.len().saturating_sub(1))
+        .sum::<usize>();
+    let expected_alias_events = catalog.aliases.values().map(Vec::len).sum::<usize>();
+    if creation_events != catalog.clusters.len()
+        || label_events != expected_label_events
+        || alias_events != expected_alias_events
+    {
+        return false;
+    }
+
+    let mut bound_events = BTreeSet::new();
+    for cluster in catalog.clusters.values() {
+        let Some(initial_label) = catalog
+            .labels
+            .get(&cluster.record.id)
+            .and_then(|revisions| revisions.first())
+        else {
+            return false;
+        };
+        let Some(event) = events_by_id.get(&cluster.audit_event_id) else {
+            return false;
+        };
+        if !bound_events.insert(cluster.audit_event_id)
+            || validate_speaker_cluster_created_audit_event(
+                event,
+                &cluster.record,
+                &initial_label.revision,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        for revision in catalog
+            .labels
+            .get(&cluster.record.id)
+            .into_iter()
+            .flatten()
+            .skip(1)
+        {
+            let Some(event) = events_by_id.get(&revision.audit_event_id) else {
+                return false;
+            };
+            if !bound_events.insert(revision.audit_event_id)
+                || validate_speaker_cluster_label_revision_audit_event(
+                    event,
+                    &cluster.record,
+                    &revision.revision,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    for revisions in catalog.aliases.values() {
+        for revision in revisions {
+            let Some(cluster) = catalog.clusters.get(&revision.revision.speaker_cluster_id) else {
+                return false;
+            };
+            let Some(event) = events_by_id.get(&revision.audit_event_id) else {
+                return false;
+            };
+            if !bound_events.insert(revision.audit_event_id)
+                || validate_speaker_cluster_alias_revision_audit_event(
+                    event,
+                    &cluster.record,
+                    &revision.revision,
+                )
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn insert_audit_event(connection: &Connection, event: &AuditEvent) -> Result<(), AuditStoreError> {
     if !event.verifies() {
         return Err(AuditStoreError::Integrity);
@@ -1661,6 +2789,84 @@ fn insert_audit_event(connection: &Connection, event: &AuditEvent) -> Result<(),
             event.payload_hash,
             event.previous_hash,
             event.hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_speaker_cluster(
+    connection: &Connection,
+    cluster: &SpeakerClusterRecord,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    cluster
+        .validate()
+        .map_err(|value| speaker_error("speaker cluster", value))?;
+    connection.execute(
+        "
+        INSERT INTO speaker_clusters (id, session_id, ordinal, audit_event_id)
+        VALUES (?1, ?2, ?3, ?4)
+        ",
+        params![
+            &cluster.id,
+            cluster.session_id.to_string(),
+            i64::from(cluster.ordinal),
+            audit_event_id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_speaker_cluster_label_revision(
+    connection: &Connection,
+    revision: &SpeakerClusterLabelRevision,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    revision
+        .validate()
+        .map_err(|value| speaker_error("speaker label revision", value))?;
+    connection.execute(
+        "
+        INSERT INTO speaker_cluster_label_revisions (
+            id, speaker_cluster_id, parent_revision_id, revision, label, is_user_named,
+            audit_event_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+        params![
+            revision.id.to_string(),
+            &revision.speaker_cluster_id,
+            revision.parent_revision_id.map(|value| value.to_string()),
+            i64::from(revision.revision),
+            &revision.label,
+            if revision.is_user_named { 1_i64 } else { 0_i64 },
+            audit_event_id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_speaker_cluster_alias_revision(
+    connection: &Connection,
+    revision: &SpeakerClusterAliasRevision,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    revision
+        .validate()
+        .map_err(|value| speaker_error("speaker alias revision", value))?;
+    connection.execute(
+        "
+        INSERT INTO speaker_cluster_alias_revisions (
+            id, speaker_cluster_id, parent_revision_id, revision, merged_into_cluster_id,
+            audit_event_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ",
+        params![
+            revision.id.to_string(),
+            &revision.speaker_cluster_id,
+            revision.parent_revision_id.map(|value| value.to_string()),
+            i64::from(revision.revision),
+            revision.merged_into_cluster_id.as_deref(),
+            audit_event_id.to_string(),
         ],
     )?;
     Ok(())
@@ -2091,6 +3297,20 @@ where
         })
 }
 
+fn parse_speaker_u32(field: &'static str, value: i64) -> Result<u32, AuditStoreError> {
+    value
+        .try_into()
+        .map_err(|_| speaker_error(field, value.to_string()))
+}
+
+fn parse_speaker_bool(field: &'static str, value: i64) -> Result<bool, AuditStoreError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(speaker_error(field, value.to_string())),
+    }
+}
+
 fn parse_transcript_monotonic_ns(value: &str) -> Result<u64, AuditStoreError> {
     value
         .parse()
@@ -2121,6 +3341,13 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, AuditStoreError> {
     DateTime::parse_from_rfc3339(value)
         .map(|timestamp| timestamp.with_timezone(&Utc))
         .map_err(|_| AuditStoreError::InvalidTimestamp(value.to_owned()))
+}
+
+fn speaker_error(field: &'static str, value: impl Into<String>) -> AuditStoreError {
+    AuditStoreError::InvalidSpeakerMetadata {
+        field,
+        value: value.into(),
+    }
 }
 
 #[cfg(test)]
@@ -2731,6 +3958,75 @@ mod tests {
             AuditKind::TranscriptRevisionRecorded,
             revision.capture_end_ns,
             revision.wall_clock_end,
+            revision,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn speaker_creation(
+        cluster: &SpeakerClusterRecord,
+        initial_label: &SpeakerClusterLabelRevision,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        let payload =
+            SpeakerClusterCreatedAuditPayload::new(cluster.clone(), initial_label.clone()).unwrap();
+        AuditEvent::new(
+            Some(cluster.session_id),
+            None,
+            AuditKind::SpeakerClusterCreated,
+            1,
+            DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(1),
+            &payload,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn speaker_label_event(
+        cluster: &SpeakerClusterRecord,
+        revision: &SpeakerClusterLabelRevision,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        AuditEvent::new(
+            Some(cluster.session_id),
+            revision.parent_revision_id,
+            AuditKind::SpeakerClusterLabelRevisionRecorded,
+            2,
+            DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(2),
+            revision,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn speaker_alias_event(
+        cluster: &SpeakerClusterRecord,
+        revision: &SpeakerClusterAliasRevision,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        AuditEvent::new(
+            Some(cluster.session_id),
+            revision.parent_revision_id,
+            AuditKind::SpeakerClusterAliasRevisionRecorded,
+            3,
+            DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(3),
+            revision,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn speaker_reassignment_event(
+        revision: &TranscriptRevision,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        AuditEvent::new(
+            Some(revision.session_id),
+            revision.parent_revision_id,
+            AuditKind::TranscriptSpeakerReassigned,
+            revision.capture_end_ns + 1,
+            revision.wall_clock_end + Duration::seconds(1),
             revision,
             previous_hash,
         )
@@ -3400,5 +4696,491 @@ mod tests {
                 .unwrap(),
             vec![original, first]
         );
+    }
+
+    #[test]
+    fn persists_reopens_and_projects_audited_speaker_catalog_revisions() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-speaker-catalog-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let session_id = Uuid::new_v4();
+        let first = SpeakerClusterRecord::new(session_id, 1).unwrap();
+        let first_initial = SpeakerClusterLabelRevision::initial_generated(&first).unwrap();
+        let first_event = speaker_creation(&first, &first_initial, None);
+        let second = SpeakerClusterRecord::new(session_id, 2).unwrap();
+        let second_initial = SpeakerClusterLabelRevision::initial_generated(&second).unwrap();
+        let second_event =
+            speaker_creation(&second, &second_initial, Some(first_event.hash.clone()));
+        let renamed = SpeakerClusterLabelRevision::revision_of(&first_initial, "主持人").unwrap();
+        let rename_event = speaker_label_event(&first, &renamed, Some(second_event.hash.clone()));
+        let alias =
+            SpeakerClusterAliasRevision::aliased_to(first.id.clone(), second.id.clone()).unwrap();
+        let alias_event = speaker_alias_event(&first, &alias, Some(rename_event.hash.clone()));
+        let mut transcript = transcript_fixture(session_id);
+        transcript.speaker_cluster_id = Some(first.id.clone());
+        let transcript_event = transcript_event(&transcript, Some(alias_event.hash.clone()));
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            store
+                .append_speaker_cluster_with_audit(&first_event, &first, &first_initial)
+                .unwrap();
+            store
+                .append_speaker_cluster_with_audit(&second_event, &second, &second_initial)
+                .unwrap();
+            store
+                .append_speaker_cluster_label_revision_with_audit(&rename_event, &renamed)
+                .unwrap();
+            store
+                .append_speaker_cluster_alias_revision_with_audit(&alias_event, &alias)
+                .unwrap();
+            store
+                .append_transcript_revision_with_audit(&transcript_event, &transcript)
+                .unwrap();
+
+            let clusters = store.list_speaker_clusters(session_id).unwrap();
+            let projected = clusters
+                .iter()
+                .find(|cluster| cluster.id == first.id)
+                .unwrap();
+            assert_eq!(projected.label, "主持人");
+            assert!(projected.is_user_named);
+            assert_eq!(projected.label_revision, 2);
+            assert_eq!(projected.alias_revision, 1);
+            assert_eq!(projected.merged_into_cluster_id, Some(second.id.clone()));
+            assert_eq!(projected.canonical_cluster_id, second.id);
+            assert_eq!(projected.span_count, 1);
+            assert_eq!(
+                store
+                    .get_latest_speaker_cluster_label_revision(&first.id)
+                    .unwrap(),
+                Some(renamed.clone())
+            );
+            assert_eq!(
+                store.get_speaker_cluster_record(&first.id).unwrap(),
+                Some(first.clone())
+            );
+            assert!(store.verify().unwrap());
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert_eq!(reopened.list_speaker_clusters(session_id).unwrap().len(), 2);
+        assert!(reopened.verify().unwrap());
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_speaker_audit_bindings_and_label_parent_gaps() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let session_id = Uuid::new_v4();
+        let cluster = SpeakerClusterRecord::new(session_id, 1).unwrap();
+        let initial = SpeakerClusterLabelRevision::initial_generated(&cluster).unwrap();
+        let created = speaker_creation(&cluster, &initial, None);
+        store
+            .append_speaker_cluster_with_audit(&created, &cluster, &initial)
+            .unwrap();
+        let renamed = SpeakerClusterLabelRevision::revision_of(&initial, "发言人").unwrap();
+
+        let wrong_kind = AuditEvent::new(
+            Some(session_id),
+            Some(initial.id),
+            AuditKind::SpeakerClusterAliasRevisionRecorded,
+            2,
+            Utc::now(),
+            &renamed,
+            Some(created.hash.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.append_speaker_cluster_label_revision_with_audit(&wrong_kind, &renamed),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "audit event kind",
+                ..
+            })
+        ));
+
+        let wrong_run = AuditEvent::new(
+            Some(Uuid::new_v4()),
+            Some(initial.id),
+            AuditKind::SpeakerClusterLabelRevisionRecorded,
+            2,
+            Utc::now(),
+            &renamed,
+            Some(created.hash.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.append_speaker_cluster_label_revision_with_audit(&wrong_run, &renamed),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "audit event session linkage",
+                ..
+            })
+        ));
+
+        let wrong_causation = AuditEvent::new(
+            Some(session_id),
+            None,
+            AuditKind::SpeakerClusterLabelRevisionRecorded,
+            2,
+            Utc::now(),
+            &renamed,
+            Some(created.hash.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.append_speaker_cluster_label_revision_with_audit(&wrong_causation, &renamed),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "audit event causation linkage",
+                ..
+            })
+        ));
+
+        let wrong_payload = AuditEvent::new(
+            Some(session_id),
+            Some(initial.id),
+            AuditKind::SpeakerClusterLabelRevisionRecorded,
+            2,
+            Utc::now(),
+            &serde_json::json!({ "revision": "wrong" }),
+            Some(created.hash.clone()),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.append_speaker_cluster_label_revision_with_audit(&wrong_payload, &renamed),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "audit event payload",
+                ..
+            })
+        ));
+
+        let skipped = SpeakerClusterLabelRevision::new_with_id(
+            Uuid::new_v4(),
+            cluster.id.clone(),
+            Some(initial.id),
+            3,
+            "跳过",
+            true,
+        )
+        .unwrap();
+        let skipped_event = speaker_label_event(&cluster, &skipped, Some(created.hash.clone()));
+        assert!(matches!(
+            store.append_speaker_cluster_label_revision_with_audit(&skipped_event, &skipped),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "speaker label parent",
+                ..
+            })
+        ));
+        assert_eq!(store.list().unwrap(), vec![created]);
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn rejects_cross_session_and_cyclic_speaker_aliases() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let session_id = Uuid::new_v4();
+        let first = SpeakerClusterRecord::new(session_id, 1).unwrap();
+        let first_initial = SpeakerClusterLabelRevision::initial_generated(&first).unwrap();
+        let first_event = speaker_creation(&first, &first_initial, None);
+        let second = SpeakerClusterRecord::new(session_id, 2).unwrap();
+        let second_initial = SpeakerClusterLabelRevision::initial_generated(&second).unwrap();
+        let second_event =
+            speaker_creation(&second, &second_initial, Some(first_event.hash.clone()));
+        let foreign = SpeakerClusterRecord::new(Uuid::new_v4(), 1).unwrap();
+        let foreign_initial = SpeakerClusterLabelRevision::initial_generated(&foreign).unwrap();
+        let foreign_event =
+            speaker_creation(&foreign, &foreign_initial, Some(second_event.hash.clone()));
+        store
+            .append_speaker_cluster_with_audit(&first_event, &first, &first_initial)
+            .unwrap();
+        store
+            .append_speaker_cluster_with_audit(&second_event, &second, &second_initial)
+            .unwrap();
+        store
+            .append_speaker_cluster_with_audit(&foreign_event, &foreign, &foreign_initial)
+            .unwrap();
+
+        let alias =
+            SpeakerClusterAliasRevision::aliased_to(first.id.clone(), second.id.clone()).unwrap();
+        let alias_event = speaker_alias_event(&first, &alias, Some(foreign_event.hash.clone()));
+        store
+            .append_speaker_cluster_alias_revision_with_audit(&alias_event, &alias)
+            .unwrap();
+
+        let cycle =
+            SpeakerClusterAliasRevision::aliased_to(second.id.clone(), first.id.clone()).unwrap();
+        let cycle_event = speaker_alias_event(&second, &cycle, Some(alias_event.hash.clone()));
+        assert!(matches!(
+            store.append_speaker_cluster_alias_revision_with_audit(&cycle_event, &cycle),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "speaker alias cycle",
+                ..
+            })
+        ));
+
+        let cross_session =
+            SpeakerClusterAliasRevision::revision_of(&alias, Some(foreign.id.clone())).unwrap();
+        let cross_session_event =
+            speaker_alias_event(&first, &cross_session, Some(alias_event.hash.clone()));
+        assert!(matches!(
+            store.append_speaker_cluster_alias_revision_with_audit(
+                &cross_session_event,
+                &cross_session,
+            ),
+            Err(AuditStoreError::InvalidSpeakerMetadata {
+                field: "speaker alias session",
+                ..
+            })
+        ));
+        assert!(
+            SpeakerClusterAliasRevision::aliased_to(first.id.clone(), first.id.clone()).is_err()
+        );
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn enforces_speaker_immutability_duplicate_bindings_and_verification() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let cluster = SpeakerClusterRecord::new(Uuid::new_v4(), 1).unwrap();
+        let initial = SpeakerClusterLabelRevision::initial_generated(&cluster).unwrap();
+        let event = speaker_creation(&cluster, &initial, None);
+        store
+            .append_speaker_cluster_with_audit(&event, &cluster, &initial)
+            .unwrap();
+        assert!(store
+            .connection
+            .execute(
+                "UPDATE speaker_cluster_label_revisions SET label = ?1 WHERE id = ?2",
+                params!["rewritten", initial.id.to_string()],
+            )
+            .is_err());
+        assert!(store
+            .connection
+            .execute(
+                "
+                INSERT INTO speaker_cluster_label_revisions (
+                    id, speaker_cluster_id, parent_revision_id, revision, label, is_user_named,
+                    audit_event_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    Uuid::new_v4().to_string(),
+                    &cluster.id,
+                    initial.id.to_string(),
+                    2_i64,
+                    "duplicate binding",
+                    1_i64,
+                    event.id.to_string(),
+                ],
+            )
+            .is_err());
+        store
+            .connection
+            .execute_batch("DROP TRIGGER speaker_cluster_label_revisions_are_immutable_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE speaker_cluster_label_revisions SET label = ?1 WHERE id = ?2",
+                params!["rewritten", initial.id.to_string()],
+            )
+            .unwrap();
+        assert!(!store.verify().unwrap());
+
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let cluster = SpeakerClusterRecord::new(Uuid::new_v4(), 1).unwrap();
+        let initial = SpeakerClusterLabelRevision::initial_generated(&cluster).unwrap();
+        let event = speaker_creation(&cluster, &initial, None);
+        store
+            .append_speaker_cluster_with_audit(&event, &cluster, &initial)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE audit_events SET hash = ?1 WHERE id = ?2",
+                params!["tampered audit hash", event.id.to_string()],
+            )
+            .unwrap();
+        assert!(!store.verify().unwrap());
+    }
+
+    #[test]
+    fn keeps_legacy_speaker_strings_and_binds_edit_time_speaker_reassignments() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let original = transcript_fixture(Uuid::new_v4());
+        let original_event = transcript_event(&original, None);
+        store
+            .append_transcript_revision_with_audit(&original_event, &original)
+            .unwrap();
+        assert!(store
+            .list_speaker_clusters(original.session_id)
+            .unwrap()
+            .is_empty());
+        assert!(store.verify().unwrap());
+
+        let reassigned = TranscriptRevision::revision_of(
+            &original,
+            original.timing(),
+            None,
+            original.text.clone(),
+            true,
+            TranscriptSource::UserEdited,
+            original.model.clone(),
+            original.confidence,
+        )
+        .unwrap();
+        let generic_event = transcript_event(&reassigned, Some(original_event.hash.clone()));
+        assert!(matches!(
+            store.append_transcript_revision_with_audit(&generic_event, &reassigned),
+            Err(AuditStoreError::InvalidTranscriptMetadata {
+                field: "speaker reassignment audit binding",
+                ..
+            })
+        ));
+        let reassignment_event = AuditEvent::new(
+            Some(original.session_id),
+            Some(original.id),
+            AuditKind::TranscriptSpeakerReassigned,
+            original.capture_end_ns + 1_000,
+            original.wall_clock_end + Duration::seconds(1),
+            &reassigned,
+            Some(original_event.hash.clone()),
+        )
+        .unwrap();
+        store
+            .append_transcript_speaker_reassignment_with_audit(&reassignment_event, &reassigned)
+            .unwrap();
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn rejects_unknown_cross_session_and_merged_reassignment_targets_in_the_store() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let session_id = Uuid::new_v4();
+        let original = transcript_fixture(session_id);
+        let original_event = transcript_event(&original, None);
+        store
+            .append_transcript_revision_with_audit(&original_event, &original)
+            .unwrap();
+
+        let active = SpeakerClusterRecord::new(session_id, 1).unwrap();
+        let active_initial = SpeakerClusterLabelRevision::initial_generated(&active).unwrap();
+        let active_event =
+            speaker_creation(&active, &active_initial, Some(original_event.hash.clone()));
+        store
+            .append_speaker_cluster_with_audit(&active_event, &active, &active_initial)
+            .unwrap();
+
+        let merged = SpeakerClusterRecord::new(session_id, 2).unwrap();
+        let merged_initial = SpeakerClusterLabelRevision::initial_generated(&merged).unwrap();
+        let merged_event =
+            speaker_creation(&merged, &merged_initial, Some(active_event.hash.clone()));
+        store
+            .append_speaker_cluster_with_audit(&merged_event, &merged, &merged_initial)
+            .unwrap();
+
+        let foreign = SpeakerClusterRecord::new(Uuid::new_v4(), 1).unwrap();
+        let foreign_initial = SpeakerClusterLabelRevision::initial_generated(&foreign).unwrap();
+        let foreign_event =
+            speaker_creation(&foreign, &foreign_initial, Some(merged_event.hash.clone()));
+        store
+            .append_speaker_cluster_with_audit(&foreign_event, &foreign, &foreign_initial)
+            .unwrap();
+
+        let alias =
+            SpeakerClusterAliasRevision::aliased_to(merged.id.clone(), active.id.clone()).unwrap();
+        let alias_event = speaker_alias_event(&merged, &alias, Some(foreign_event.hash.clone()));
+        store
+            .append_speaker_cluster_alias_revision_with_audit(&alias_event, &alias)
+            .unwrap();
+
+        let unknown = SpeakerClusterRecord::new(session_id, 3).unwrap();
+        for target_cluster_id in [unknown.id, foreign.id.clone(), merged.id.clone()] {
+            let reassigned = TranscriptRevision::revision_of(
+                &original,
+                original.timing(),
+                Some(target_cluster_id),
+                original.text.clone(),
+                true,
+                TranscriptSource::UserEdited,
+                original.model.clone(),
+                original.confidence,
+            )
+            .unwrap();
+            let event = speaker_reassignment_event(&reassigned, Some(alias_event.hash.clone()));
+            assert!(matches!(
+                store.append_transcript_speaker_reassignment_with_audit(&event, &reassigned),
+                Err(AuditStoreError::InvalidTranscriptMetadata {
+                    field: "speaker reassignment target",
+                    ..
+                })
+            ));
+        }
+
+        let reassigned = TranscriptRevision::revision_of(
+            &original,
+            original.timing(),
+            Some(active.id.clone()),
+            original.text.clone(),
+            true,
+            TranscriptSource::UserEdited,
+            original.model.clone(),
+            original.confidence,
+        )
+        .unwrap();
+        let event = speaker_reassignment_event(&reassigned, Some(alias_event.hash));
+        store
+            .append_transcript_speaker_reassignment_with_audit(&event, &reassigned)
+            .unwrap();
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn rejects_a_forged_unknown_dedicated_reassignment_after_reopen() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-speaker-reassignment-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let session_id = Uuid::new_v4();
+        let original = transcript_fixture(session_id);
+        let original_event = transcript_event(&original, None);
+        let active = SpeakerClusterRecord::new(session_id, 1).unwrap();
+        let initial = SpeakerClusterLabelRevision::initial_generated(&active).unwrap();
+        let active_event = speaker_creation(&active, &initial, Some(original_event.hash.clone()));
+        let unknown = SpeakerClusterRecord::new(session_id, 2).unwrap();
+        let forged = TranscriptRevision::revision_of(
+            &original,
+            original.timing(),
+            Some(unknown.id),
+            original.text.clone(),
+            true,
+            TranscriptSource::UserEdited,
+            original.model.clone(),
+            original.confidence,
+        )
+        .unwrap();
+        let forged_event = speaker_reassignment_event(&forged, Some(active_event.hash.clone()));
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            store
+                .append_transcript_revision_with_audit(&original_event, &original)
+                .unwrap();
+            store
+                .append_speaker_cluster_with_audit(&active_event, &active, &initial)
+                .unwrap();
+
+            // Simulate an on-disk attacker that forges a fully chained event
+            // and matching row, bypassing the checked Store entrypoint.
+            insert_audit_event(&store.connection, &forged_event).unwrap();
+            insert_transcript_revision(&store.connection, &forged).unwrap();
+            assert!(!store.verify().unwrap());
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert!(!reopened.verify().unwrap());
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
     }
 }
