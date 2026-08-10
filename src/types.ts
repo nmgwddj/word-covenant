@@ -139,6 +139,16 @@ export interface TranscriptSpan {
 }
 
 /**
+ * A native final transcript is available locally. The event deliberately
+ * carries only an opaque session reference and sequence number; the client
+ * reloads the timeline through its existing command to access transcript text.
+ */
+export interface FinalTranscriptProjection {
+  sessionId: string
+  revision: number
+}
+
+/**
  * A local, session-scoped speaking-part catalog entry with durable labels and
  * revision metadata.
  */

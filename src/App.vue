@@ -24,6 +24,7 @@ const recordingLabel = computed(() => {
 })
 let developmentMockTimer: number | undefined
 let unlistenCaptureProjection: (() => void) | undefined
+let unlistenFinalTranscriptProjection: (() => void) | undefined
 const selectedSpeakerSpanId = ref<string | null>(null)
 const speakerManagerTrigger = ref<HTMLElement | null>(null)
 const isSpeakerManagerOpen = computed(() =>
@@ -33,6 +34,9 @@ const isSpeakerManagerOpen = computed(() =>
 onMounted(async () => {
   unlistenCaptureProjection = await wordCovenantApi.onCaptureProjection(projection => {
     sessionStore.applyCaptureProjection(projection)
+  })
+  unlistenFinalTranscriptProjection = await wordCovenantApi.onFinalTranscriptProjection(projection => {
+    void sessionStore.applyFinalTranscriptProjection(projection)
   })
   await Promise.all([privacyStore.refresh(), sessionStore.initialize(), modelStore.initialize()])
 })
@@ -142,6 +146,7 @@ watch(() => sessionStore.isDevelopmentMockActive, synchronizeDevelopmentMockTime
 onBeforeUnmount(() => {
   stopDevelopmentMockTimer()
   unlistenCaptureProjection?.()
+  unlistenFinalTranscriptProjection?.()
 })
 </script>
 

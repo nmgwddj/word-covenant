@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(),
+}))
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn(),
 }))
 
 async function loadBrowserApi() {
@@ -49,11 +54,13 @@ describe('wordCovenantApi browser development mock', () => {
 
     const projection = await wordCovenantApi.getCaptureProjection()
     const unlisten = await wordCovenantApi.onCaptureProjection(vi.fn())
+    const unlistenFinalTranscript = await wordCovenantApi.onFinalTranscriptProjection(vi.fn())
 
     expect(projection.status).toBe('idle')
     expect(projection.devices).toEqual([])
     expect(projection.bridge).toBeNull()
     expect(unlisten()).toBeUndefined()
+    expect(unlistenFinalTranscript()).toBeUndefined()
     await expect(wordCovenantApi.startSession()).rejects.toThrow('浏览器预览不提供真实麦克风输入')
     await expect(wordCovenantApi.selectInputDevice('coreaudio:demo')).rejects.toThrow('浏览器预览')
     expect((await wordCovenantApi.getPrivacyStatus()).recordingSessionId).toBeNull()
@@ -72,6 +79,17 @@ describe('wordCovenantApi browser development mock', () => {
       })
     ).rejects.toThrow('浏览器预览不能导入本地模型文件')
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  test('subscribes to the compact native final transcript projection event', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {})
+    const nativeUnlisten = vi.fn()
+    vi.mocked(listen).mockResolvedValue(nativeUnlisten)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await expect(wordCovenantApi.onFinalTranscriptProjection(vi.fn())).resolves.toBe(nativeUnlisten)
+
+    expect(listen).toHaveBeenCalledWith('final-transcript-projection', expect.any(Function))
   })
 
   test('uses the typed native command for local model selection and preserves cancellation', async () => {

@@ -5,6 +5,7 @@ import type {
   CaptureProjection,
   CaptureSession,
   DevelopmentMockProgress,
+  FinalTranscriptProjection,
   LocalModelImportInput,
   PrivacyStatus,
   RegisteredModel,
@@ -311,6 +312,16 @@ export const wordCovenantApi = {
   async onCaptureProjection(listener: (projection: CaptureProjection) => void): Promise<UnlistenFn> {
     if (isTauriRuntime()) {
       return listen<CaptureProjection>('capture-projection', event => listener(event.payload))
+    }
+
+    return () => {}
+  },
+
+  async onFinalTranscriptProjection(
+    listener: (projection: FinalTranscriptProjection) => void
+  ): Promise<UnlistenFn> {
+    if (isTauriRuntime()) {
+      return listen<FinalTranscriptProjection>('final-transcript-projection', event => listener(event.payload))
     }
 
     return () => {}

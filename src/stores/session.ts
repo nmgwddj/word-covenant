@@ -5,6 +5,7 @@ import type {
   CaptureInputKind,
   CaptureProjection,
   CaptureSession,
+  FinalTranscriptProjection,
   SpeakerCluster,
   SpeakerOperationResult,
   TranscriptSpan,
@@ -36,6 +37,7 @@ export const useSessionStore = defineStore('session', {
     isAdvancingDevelopmentMock: false,
     isSpeakerOperationPending: false,
     speakerError: null as string | null,
+    finalTranscriptProjectionRevisions: {} as Record<string, number>,
     isLoading: false,
   }),
 
@@ -64,8 +66,12 @@ export const useSessionStore = defineStore('session', {
       this.isLoading = true
       try {
         if (this.isRecording) {
-          this.activeSession = await wordCovenantApi.stopSession()
+          const stoppedSession = await wordCovenantApi.stopSession()
+          this.activeSession = stoppedSession
           this.isDevelopmentMockActive = false
+          if (this.captureInput === 'microphone' && stoppedSession) {
+            await this.refreshTimelineForCurrentSession(stoppedSession.id)
+          }
         } else if (this.captureInput === 'development_mock') {
           await this.startDevelopmentMockSession()
         } else {
@@ -195,6 +201,34 @@ export const useSessionStore = defineStore('session', {
       this.timeline = [...otherSessions, ...spans].sort(
         (left, right) => left.captureStartNs - right.captureStartNs || left.revision - right.revision
       )
+    },
+
+    async applyFinalTranscriptProjection(projection: FinalTranscriptProjection) {
+      const previousRevision = this.finalTranscriptProjectionRevisions[projection.sessionId] ?? -1
+      if (projection.revision <= previousRevision) {
+        return
+      }
+      this.finalTranscriptProjectionRevisions[projection.sessionId] = projection.revision
+
+      if (this.activeSession?.id !== projection.sessionId) {
+        return
+      }
+
+      const timeline = await wordCovenantApi.listTimeline(projection.sessionId)
+      if (
+        this.activeSession?.id !== projection.sessionId ||
+        this.finalTranscriptProjectionRevisions[projection.sessionId] !== projection.revision
+      ) {
+        return
+      }
+      this.replaceTimelineForSession(projection.sessionId, timeline)
+    },
+
+    async refreshTimelineForCurrentSession(sessionId: string) {
+      const timeline = await wordCovenantApi.listTimeline(sessionId)
+      if (this.activeSession?.id === sessionId) {
+        this.replaceTimelineForSession(sessionId, timeline)
+      }
     },
 
     async applySpeakerOperationResult(sessionId: string, result: SpeakerOperationResult) {

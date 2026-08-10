@@ -62,14 +62,23 @@ pub fn run() {
                     .name("word-covenant-capture-projection".to_owned())
                     .spawn(move || {
                         let mut emitted_revision = None;
+                        let mut emitted_final_transcript_revision = None;
                         loop {
-                            let projection =
-                                app_handle.state::<state::AppState>().capture_projection();
+                            let state = app_handle.state::<state::AppState>();
+                            let projection = state.capture_projection();
                             if let Ok(projection) = projection {
                                 let revision = projection.revision;
                                 if emitted_revision != Some(revision) {
                                     let _ = app_handle.emit("capture-projection", &projection);
                                     emitted_revision = Some(revision);
+                                }
+                            }
+                            if let Some(projection) = state.final_transcript_projection() {
+                                let revision = projection.revision;
+                                if emitted_final_transcript_revision != Some(revision) {
+                                    let _ =
+                                        app_handle.emit("final-transcript-projection", &projection);
+                                    emitted_final_transcript_revision = Some(revision);
                                 }
                             }
                             std::thread::sleep(std::time::Duration::from_millis(100));

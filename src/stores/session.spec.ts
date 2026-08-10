@@ -202,6 +202,119 @@ describe('session store', () => {
     expect(store.isAwaitingPermission).toBe(false)
   })
 
+  test('reloads the active timeline once for each newer native final transcript projection', async () => {
+    const store = useSessionStore()
+    const refreshedTimeline = [
+      {
+        id: 'native-span-1',
+        sessionId: recordingSession.id,
+        captureStartNs: 1_000,
+        captureEndNs: 2_000,
+        speakerClusterId: null,
+        text: '已持久化的本地转写',
+        isFinal: true,
+        revision: 1,
+        source: 'local_inference' as const,
+      },
+    ]
+    store.activeSession = recordingSession
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue(refreshedTimeline)
+
+    await store.applyFinalTranscriptProjection({ sessionId: recordingSession.id, revision: 2 })
+    await store.applyFinalTranscriptProjection({ sessionId: recordingSession.id, revision: 2 })
+    await store.applyFinalTranscriptProjection({ sessionId: recordingSession.id, revision: 1 })
+    await store.applyFinalTranscriptProjection({ sessionId: 'other-session', revision: 3 })
+
+    expect(listTimeline).toHaveBeenCalledTimes(1)
+    expect(listTimeline).toHaveBeenCalledWith(recordingSession.id)
+    expect(store.timeline).toEqual(refreshedTimeline)
+    expect(store.finalTranscriptProjectionRevisions).toEqual({
+      [recordingSession.id]: 2,
+      'other-session': 3,
+    })
+  })
+
+  test('does not let a slower older final transcript refresh overwrite a newer one', async () => {
+    const store = useSessionStore()
+    const olderTimeline = [
+      {
+        id: 'native-span-1',
+        sessionId: recordingSession.id,
+        captureStartNs: 1_000,
+        captureEndNs: 2_000,
+        speakerClusterId: null,
+        text: '较早快照',
+        isFinal: true,
+        revision: 1,
+        source: 'local_inference' as const,
+      },
+    ]
+    const newerTimeline = [{ ...olderTimeline[0], text: '较新快照', revision: 2 }]
+    let resolveOlderTimeline: (timeline: typeof olderTimeline) => void = () => {}
+    const olderTimelineRequest = new Promise<typeof olderTimeline>(resolve => {
+      resolveOlderTimeline = resolve
+    })
+    store.activeSession = recordingSession
+    vi.spyOn(wordCovenantApi, 'listTimeline')
+      .mockReturnValueOnce(olderTimelineRequest)
+      .mockResolvedValueOnce(newerTimeline)
+
+    const olderRefresh = store.applyFinalTranscriptProjection({
+      sessionId: recordingSession.id,
+      revision: 4,
+    })
+    const newerRefresh = store.applyFinalTranscriptProjection({
+      sessionId: recordingSession.id,
+      revision: 5,
+    })
+    await newerRefresh
+    resolveOlderTimeline(olderTimeline)
+    await olderRefresh
+
+    expect(store.timeline).toEqual(newerTimeline)
+  })
+
+  test('forces a final timeline refresh after stopping real microphone capture', async () => {
+    const store = useSessionStore()
+    const stoppedSession = {
+      ...recordingSession,
+      state: 'stopped' as const,
+      stoppedAt: '2026-08-08T00:00:12.000Z',
+    }
+    const finalTimeline = [
+      {
+        id: 'native-final-span',
+        sessionId: recordingSession.id,
+        captureStartNs: 1_000,
+        captureEndNs: 2_000,
+        speakerClusterId: null,
+        text: '停止前的最终结果',
+        isFinal: true,
+        revision: 1,
+        source: 'local_inference' as const,
+      },
+    ]
+    store.activeSession = recordingSession
+    store.applyCaptureProjection({
+      revision: 1,
+      status: 'recording',
+      permission: 'granted',
+      selectedDevice: { uid: 'coreaudio:built-in', name: 'MacBook 麦克风' },
+      devices: [{ uid: 'coreaudio:built-in', name: 'MacBook 麦克风' }],
+      meter: null,
+      lastIssue: null,
+    })
+    const stopSession = vi.spyOn(wordCovenantApi, 'stopSession').mockResolvedValue(stoppedSession)
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue(finalTimeline)
+
+    await store.toggleRecording()
+
+    expect(stopSession).toHaveBeenCalledOnce()
+    expect(listTimeline).toHaveBeenCalledWith(recordingSession.id)
+    expect(store.activeSession).toEqual(stoppedSession)
+    expect(store.timeline).toEqual(finalTimeline)
+  })
+
   test('waits for a durable speaker result, then reloads the revised timeline', async () => {
     const store = useSessionStore()
     const original = {

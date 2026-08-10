@@ -76,6 +76,23 @@ pub struct SpeakerOperationResult {
     pub updated_spans: Vec<SpeakerSpanRef>,
 }
 
+/// A compact notification that a native final transcript was durably added to
+/// a session timeline. The WebView must reload the timeline to obtain the
+/// transcript itself; this notification intentionally contains no content or
+/// capture payload.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FinalTranscriptProjection {
+    pub session_id: Uuid,
+    pub revision: u64,
+}
+
+#[derive(Default)]
+struct FinalTranscriptProjectionState {
+    revision: u64,
+    latest: Option<FinalTranscriptProjection>,
+}
+
 /// The application-owned lifecycle fence for one native dispatcher generation.
 ///
 /// A capture service can only expose one live native runtime, but this fence
@@ -113,6 +130,7 @@ pub struct AppState {
     audit_store: Mutex<AuditStore>,
     model_registry: Mutex<ModelRegistry>,
     inference_mapper: Mutex<TranscriptEmissionMapper>,
+    final_transcript_projection: Mutex<FinalTranscriptProjectionState>,
     native_runtime: Mutex<Option<NativeRuntimeFence>>,
     model_root: Option<PathBuf>,
     #[cfg(target_os = "macos")]
@@ -179,6 +197,7 @@ impl AppState {
             audit_store: Mutex::new(audit_store),
             model_registry: Mutex::new(model_registry),
             inference_mapper: Mutex::new(TranscriptEmissionMapper::default()),
+            final_transcript_projection: Mutex::new(FinalTranscriptProjectionState::default()),
             native_runtime: Mutex::new(None),
             model_root,
             #[cfg(target_os = "macos")]
@@ -1294,11 +1313,17 @@ impl AppState {
             AsrOutcome::Response { job, response } => {
                 validate_native_asr_job(runtime, job)?;
                 match validate_native_asr_response(job, response) {
-                    Ok(true) => self.append_local_asr_response_with_capture_anchor(
-                        &session,
-                        response.clone(),
-                        &runtime.capture_anchor,
-                    ),
+                    Ok(true) => {
+                        let projections = self.append_local_asr_response_with_capture_anchor(
+                            &session,
+                            response.clone(),
+                            &runtime.capture_anchor,
+                        )?;
+                        if !projections.is_empty() {
+                            self.publish_native_final_transcript_projection(session.id);
+                        }
+                        Ok(projections)
+                    }
                     // A completed worker result that contains no final, or
                     // whose emissions violate the local contract, has no
                     // recoverable transcript. Account for the captured range
@@ -2102,6 +2127,32 @@ impl AppState {
             .map_err(|_| "inference mapper lock poisoned".to_owned())?
             .clear_session(session_id)
             .map_err(|error| format!("could not finish local ASR session: {error}"))
+    }
+
+    /// Returns the newest in-process native final-transcript notification.
+    /// It is intentionally not reconstructed from stored transcript content:
+    /// a new WebView performs its normal initial timeline load instead.
+    pub fn final_transcript_projection(&self) -> Option<FinalTranscriptProjection> {
+        self.final_transcript_projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest
+            .clone()
+    }
+
+    fn publish_native_final_transcript_projection(&self, session_id: Uuid) {
+        let mut state = self
+            .final_transcript_projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.revision = state
+            .revision
+            .checked_add(1)
+            .expect("final transcript projection revision overflowed");
+        state.latest = Some(FinalTranscriptProjection {
+            session_id,
+            revision: state.revision,
+        });
     }
 
     pub fn list_local_models(&self) -> Result<Vec<RegisteredModel>, String> {
@@ -3036,6 +3087,20 @@ mod tests {
             Some(runtime.capture_anchor.wall_clock + Duration::nanoseconds(200_000))
         );
         assert_eq!(state.list_timeline(Some(session.id)).unwrap(), projections);
+        let final_projection = state
+            .final_transcript_projection()
+            .expect("the native final publishes a timeline refresh reference");
+        assert_eq!(
+            final_projection,
+            FinalTranscriptProjection {
+                session_id: session.id,
+                revision: 1,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(final_projection).unwrap(),
+            serde_json::json!({ "sessionId": session.id.to_string(), "revision": 1 })
+        );
         assert!(state.audit_is_valid().unwrap());
     }
 
@@ -3066,6 +3131,7 @@ mod tests {
 
         assert!(projections.is_empty());
         assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        assert_eq!(state.final_transcript_projection(), None);
         let store = state.audit_store.lock().unwrap();
         let gaps = store.list_inference_gaps(session.id).unwrap();
         assert_eq!(gaps.len(), 1);
@@ -3228,10 +3294,18 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("audit store lock poisoned"));
         assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        assert_eq!(state.final_transcript_projection(), None);
 
         state.audit_store.clear_poison();
         let persisted = state.persist_native_outcome(&runtime, &outcome).unwrap();
         assert_eq!(persisted.len(), 1);
+        assert_eq!(
+            state.final_transcript_projection(),
+            Some(FinalTranscriptProjection {
+                session_id: session.id,
+                revision: 1,
+            })
+        );
         assert!(state.audit_is_valid().unwrap());
     }
 
