@@ -52,6 +52,7 @@ describe('wordCovenantApi browser development mock', () => {
 
     expect(projection.status).toBe('idle')
     expect(projection.devices).toEqual([])
+    expect(projection.bridge).toBeNull()
     expect(unlisten()).toBeUndefined()
     await expect(wordCovenantApi.startSession()).rejects.toThrow('浏览器预览不提供真实麦克风输入')
     await expect(wordCovenantApi.selectInputDevice('coreaudio:demo')).rejects.toThrow('浏览器预览')

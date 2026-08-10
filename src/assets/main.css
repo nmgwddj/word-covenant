@@ -134,12 +134,15 @@ button:focus-visible {
 
 .capture-status {
   display: grid;
-  grid-template-columns: 7px minmax(112px, 176px) 56px auto;
+  grid-template-columns: 7px minmax(88px, 1fr) 48px minmax(74px, 104px);
+  grid-template-rows: 24px 13px;
   align-items: center;
   gap: 7px;
+  flex: 0 1 292px;
+  inline-size: 292px;
   min-width: 0;
-  min-height: 32px;
-  padding: 0 8px;
+  min-height: 45px;
+  padding: 4px 8px;
   color: var(--ink-muted);
   background: var(--surface-subtle);
   font-size: 10px;
@@ -171,7 +174,7 @@ button:focus-visible {
 
 .capture-status__meter {
   display: block;
-  width: 56px;
+  width: 48px;
   height: 3px;
   overflow: hidden;
   background: var(--surface-muted);
@@ -192,6 +195,61 @@ button:focus-visible {
   white-space: nowrap;
 }
 
+.capture-status__bridge {
+  display: flex;
+  grid-column: 2 / -1;
+  grid-row: 2;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.capture-status__bridge-state {
+  flex: 0 0 49px;
+}
+
+.capture-status__bridge-metrics {
+  display: flex;
+  flex: 1 1 auto;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-soft);
+}
+
+.capture-status__bridge-metric {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: auto 4ch;
+  gap: 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.capture-status__bridge-metric b {
+  min-inline-size: 4ch;
+  color: inherit;
+  font: inherit;
+  font-weight: 700;
+  text-align: end;
+}
+
+.capture-status__bridge-metric--active {
+  color: var(--ink);
+}
+
+.capture-status__bridge--closing {
+  color: var(--ink-soft);
+}
+
+.capture-status__bridge--drained {
+  color: var(--ink-muted);
+}
+
 .capture-status--recording {
   color: var(--recording);
   background: var(--recording-soft);
@@ -207,6 +265,12 @@ button:focus-visible {
 }
 
 .capture-status--awaiting_permission .capture-status__signal {
+  background: var(--ink-soft);
+  animation: recording-pulse 1.5s ease-in-out infinite;
+}
+
+.capture-status--bridge-parked .capture-status__signal,
+.capture-status--bridge-closing .capture-status__signal {
   background: var(--ink-soft);
   animation: recording-pulse 1.5s ease-in-out infinite;
 }

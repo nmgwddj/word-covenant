@@ -26,6 +26,7 @@ const browserCaptureProjection: CaptureProjection = {
   selectedDevice: null,
   devices: [],
   meter: null,
+  bridge: null,
   lastIssue: null,
 }
 

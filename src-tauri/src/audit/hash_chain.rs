@@ -12,6 +12,7 @@ pub enum AuditKind {
     CaptureInputStopped,
     CaptureSegmentRecorded,
     CaptureGapRecorded,
+    InferenceGapRecorded,
     TranscriptRecorded,
     TranscriptRevisionRecorded,
     LocalModelImported,

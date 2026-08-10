@@ -1,10 +1,11 @@
-export type SessionState = 'recording' | 'stopped'
+export type SessionState = 'starting' | 'recording' | 'stopped'
 export type TranscriptSource = 'synthetic' | 'local_inference' | 'user_edited'
 export type ActionStatus = 'ready' | 'blocked' | 'completed'
 export type CaptureInputKind = 'microphone' | 'development_mock'
 export type LocalModelKind = 'speech_recognition' | 'voice_activity_detection' | 'speaker_embedding'
 export type CaptureStatus = 'idle' | 'awaiting_permission' | 'recording' | 'interrupted' | 'failed'
 export type MicrophonePermission = 'not_determined' | 'granted' | 'denied' | 'restricted'
+export type CaptureBridgeStatus = 'parked' | 'armed' | 'closing' | 'drained'
 export type CaptureIssueCode =
   | 'permission_denied'
   | 'permission_restricted'
@@ -46,6 +47,41 @@ export interface CaptureIssue {
   deviceName: string | null
 }
 
+/**
+ * Bounded native inference bridge telemetry. It deliberately excludes PCM,
+ * transcript text, model identifiers, and durable outcome payloads.
+ */
+export interface CaptureBridgeMetrics {
+  ingressPacketsConsumed: number
+  ingressDiscontinuities: number
+  segmenterFailures: number
+  jobsAdmitted: number
+  jobsCompleted: number
+  jobQueueSaturated: number
+  resultQueueSaturated: number
+  unavailableEngineOutcomes: number
+  engineFailureOutcomes: number
+  shutdownOutcomes: number
+  outcomeClaimsAborted: number
+  jobQueueHighWatermark: number
+  resultQueueHighWatermark: number
+  pendingEventHighWatermark: number
+  jobQueueDepth: number
+  resultQueueDepth: number
+  pendingEventDepth: number
+  workerHoldsOutcome: boolean
+  ownedOutcomeLeaseActive: boolean
+  closing: boolean
+}
+
+export interface CaptureBridgeProjection {
+  status: CaptureBridgeStatus
+  armed: boolean
+  shutdownRequested: boolean
+  workerFinished: boolean
+  metrics: CaptureBridgeMetrics
+}
+
 export interface CaptureProjection {
   revision: number
   status: CaptureStatus
@@ -53,6 +89,8 @@ export interface CaptureProjection {
   selectedDevice: CaptureInputDevice | null
   devices: CaptureInputDevice[]
   meter: CaptureMeter | null
+  // Optional while older native clients are upgraded; current backends return null when absent.
+  bridge?: CaptureBridgeProjection | null
   lastIssue: CaptureIssue | null
 }
 

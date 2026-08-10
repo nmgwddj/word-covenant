@@ -44,7 +44,7 @@ Not MVP: automatic human identification from a voiceprint, ambient/background re
 | Done | M1 lifecycle foundation | Typed permission/recording/interruption state machine behind the macOS callback boundary |
 | Awaiting manual acceptance | M1 native input adapter | CoreAudio/CPAL input and microphone lifecycle code exist; the real-device exit gate remains the M1 manual acceptance run. The native source is not yet an ASR ingress. |
 | In progress | M2.1 pure Rust/local mock speech pipeline contract | Deterministic local mock PCM exercises the bounded pipeline and final transcript persistence. It does not consume the real CPAL ingress and does not claim a real VAD or `whisper.cpp` adapter. |
-| Pending | M2.2 native capture-to-inference bridge | Replace the current single-consumer meter path with one dispatcher, use two-phase startup and bounded ASR job/result queues, define backpressure/inference-gap behavior, then complete a real macOS manual run. |
+| 代码已实现，待真实 macOS 人工验收 | M2.2 native capture-to-inference bridge | 单一 dispatcher、`Starting -> Recording` 两阶段启动、16/48 kHz 预检、有界 ASR job/result 队列、显式 inference gap、drain 与 generation fence 均已实现；下一出口是同一构建的 M2.2 人工验收。它不代表真实 VAD、`whisper.cpp`/Metal 或模型质量已完成。 |
 
 ## Target Architecture
 
@@ -148,28 +148,36 @@ VAD，也不是 `whisper.cpp`/Metal 绑定。M2.1 不会给真实 CPAL ingress �
 持久化及 final 的审计写入。通过这些测试不等于真实 macOS 采集、真实 VAD、真实
 ASR 或质量指标已通过。
 
-#### M2.2：真实采集到推理的桥接（待实现）
+#### M2.2：真实采集到推理的桥接（代码已实现；真实 macOS 人工验收待执行）
 
-**目标：** 把 M2.1 的本地管线接到真实原生采集，但不让实时回调、WebView 或任意
-未授权的网络路径拥有推理或外发能力。M2.2 是 ingress、生命周期和背压的工作，
-不是对真实模型质量的声明。
+**目标：** 将 M2.1 的本地管线接入真实原生采集，同时保持实时回调、WebView 和未授权
+网络路径都不拥有推理或外发能力。M2.2 证明 ingress、生命周期、背压和审计语义的代码
+实现；它不声明真实模型质量。
 
-**必做项：**
+**已实现范围：**
 
-1. 用一个原生 dispatcher 取代当前 `CaptureIngress` 的单一电平消费者。该 dispatcher
-   是唯一读取 PCM 的位置，并向紧凑电平投影和 ASR job 路径分发；不得通过第二个
-   `try_consume` 循环竞争同一队列。
-2. 实现两阶段启动：先创建会话、dispatcher 与所有有界工作资源且不公布 `Recording`；
-   仅在这些资源就绪后启动/交接 CPAL 流，并在交接成功后才公布录音状态。任一阶段
-   失败都必须回收已创建资源，保留非录音的可见状态，且不伪造时间线。
-3. 为 ASR job 和 result 各建立有界队列，定义容量、停止语义和可观察计数。job 或
-   result 满时的行为必须是显式的背压和带采集范围的 inference/transcript gap（或
-   等价的可审计终态），不能无声丢弃，也不能让回调阻塞或让内存无界增长。
-4. 保持 PCM 不跨 Tauri IPC；回调仍只做有限归一化和入队，推理、持久化、UI 更新都
-   在回调之外执行。停止、设备丢失和重启期间，未完成范围要么按已定义顺序完成，
-   要么被明确标记为未推理/缺口。
-5. 完成 [M1 macOS 真实采集人工验收清单](2026-08-08-m1-macos-real-capture-manual-acceptance.md)
-   中新增的 M2.2 追加场景；没有同一构建的真实硬件记录，不得把桥接路径标记为完成。
+1. 每个活跃原生运行时只有一个 `CaptureDispatcher` 读取 `CaptureIngress`。它同时投影
+   紧凑电平并向有界 ASR job 队列分发，PCM 不跨 Tauri IPC、日志、SQLite 或 WebView。
+2. 启动使用 `Starting -> Recording` 两阶段：先构造 parked dispatcher 与有界资源并交接
+   CPAL，再持久化启动审计束；只有 `arm_after_commit` 成功后才公布 `Recording`。`Starting`
+   不会被隐私状态或前端当作正在录音，提交前积压的 PCM 会丢弃；任何阶段失败都会回收
+   资源，不伪造会话或时间线。
+3. 原生输入目前只预检并支持 16 kHz 与 48 kHz；44.1 kHz 等其他配置明确拒绝，等待独立
+   验证的重采样工作，不以静默降级冒充支持。
+4. ASR job 与 result 都使用固定容量队列和可观察计数。job/result 饱和分别生成带采集
+   范围的 `job_queue_saturated`/`result_queue_saturated` inference gap；缺少可执行本地
+   引擎生成 `local_engine_unavailable` gap，不会制造 fixture 文本。gap 与审计事件原子
+   绑定，重复持久化可按同一 gap ID 幂等重放。
+5. 停止先关闭 CPAL，再 drain ingress、job、worker-held 和 result outcome；每个已接纳
+   范围在 `SessionStopped` 前成为 final 或 gap。停止事件使用同一连续采集时钟点，runtime
+   generation/segment fence 会拒绝迟到结果进入重启后的会话。
+6. 本里程碑没有新增 HTTP 客户端、模型下载或连接开启路径。可见的“允许出网”开关仍是
+   任何未来出网的必要条件，匹配审批仍是额外条件；M2.2 本身在开关关闭或开启时都不应
+   发起出网。
+
+**待执行出口：** 完成 [M1 macOS 真实采集人工验收清单](2026-08-08-m1-macos-real-capture-manual-acceptance.md)
+中的 M2.2-0 至 M2.2-7，并保留同一构建的设备、时钟、队列/gap、generation 和零出网
+证据。代码已实现不等于真实硬件验收完成。
 
 **后续本地模型适配：** 真实 VAD 与 `whisper.cpp`/Metal 仍是 M2 的独立工作，必须
 在选定模型、显式导入和本地基准完成后才可宣称可用。模型注册表继续记录文件路径、

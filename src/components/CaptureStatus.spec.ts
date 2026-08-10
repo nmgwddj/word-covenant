@@ -1,5 +1,6 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, test } from 'vitest'
+import type { CaptureBridgeProjection } from '@/types'
 import CaptureStatus from './CaptureStatus.vue'
 
 const capture = {
@@ -13,6 +14,35 @@ const capture = {
   ],
   meter: null,
   lastIssue: null,
+}
+
+const bridge: CaptureBridgeProjection = {
+  status: 'armed',
+  armed: true,
+  shutdownRequested: false,
+  workerFinished: false,
+  metrics: {
+    ingressPacketsConsumed: 18,
+    ingressDiscontinuities: 0,
+    segmenterFailures: 0,
+    jobsAdmitted: 5,
+    jobsCompleted: 4,
+    jobQueueSaturated: 0,
+    resultQueueSaturated: 0,
+    unavailableEngineOutcomes: 4,
+    engineFailureOutcomes: 0,
+    shutdownOutcomes: 0,
+    outcomeClaimsAborted: 0,
+    jobQueueHighWatermark: 2,
+    resultQueueHighWatermark: 1,
+    pendingEventHighWatermark: 1,
+    jobQueueDepth: 2,
+    resultQueueDepth: 1,
+    pendingEventDepth: 0,
+    workerHoldsOutcome: false,
+    ownedOutcomeLeaseActive: false,
+    closing: false,
+  },
 }
 
 describe('CaptureStatus', () => {
@@ -54,5 +84,95 @@ describe('CaptureStatus', () => {
     })
 
     expect(wrapper.text()).toContain('麦克风权限被拒绝')
+  })
+
+  test('renders bounded bridge state and queue counts without transcript content', () => {
+    const wrapper = mount(CaptureStatus, {
+      props: {
+        capture: {
+          ...capture,
+          bridge,
+        },
+      },
+    })
+
+    const summary = wrapper.get('[role="status"]')
+    expect(summary.text()).toContain('桥接 运行')
+    expect(summary.text()).toContain('任务2')
+    expect(summary.text()).toContain('结果1')
+    expect(summary.text()).toContain('待存0')
+    expect(summary.text()).toContain('异常4')
+    expect(summary.attributes('aria-label')).toContain('任务队列 2')
+    expect(summary.attributes('aria-label')).toContain('结果队列 1')
+    expect(summary.attributes('aria-label')).toContain('待持久化事件 0')
+    expect(summary.attributes('aria-label')).toContain('没有结果等待持久化')
+    expect(summary.attributes('aria-label')).toContain('本地引擎不可用 4')
+  })
+
+  test('distinguishes the bridge startup and drain phases from active recording', () => {
+    const starting = mount(CaptureStatus, {
+      props: {
+        capture: {
+          ...capture,
+          status: 'awaiting_permission',
+          bridge: { ...bridge, status: 'parked', armed: false },
+        },
+      },
+    })
+
+    expect(starting.text()).toContain('正在启动本地记录')
+    expect(starting.get('[role="status"]').text()).toContain('桥接 启动中')
+    expect(starting.get('select').attributes('disabled')).toBeDefined()
+
+    const closing = mount(CaptureStatus, {
+      props: {
+        capture: {
+          ...capture,
+          status: 'recording',
+          bridge: {
+            ...bridge,
+            status: 'closing',
+            shutdownRequested: true,
+            metrics: {
+              ...bridge.metrics,
+              pendingEventDepth: 3,
+              segmenterFailures: 1,
+              engineFailureOutcomes: 2,
+              shutdownOutcomes: 1,
+            },
+          },
+        },
+      },
+    })
+
+    const summary = closing.get('[role="status"]')
+    expect(closing.text()).toContain('正在完成本地记录')
+    expect(summary.text()).toContain('桥接 收尾中')
+    expect(summary.text()).toContain('待存3')
+    expect(summary.text()).toContain('异常8')
+    expect(summary.attributes('aria-label')).toContain('分段失败 1')
+    expect(summary.attributes('aria-label')).toContain('本地引擎失败 2')
+    expect(summary.attributes('aria-label')).toContain('收尾缺口 1')
+  })
+
+  test('caps visual counters while preserving their exact accessible values', () => {
+    const wrapper = mount(CaptureStatus, {
+      props: {
+        capture: {
+          ...capture,
+          bridge: {
+            ...bridge,
+            metrics: {
+              ...bridge.metrics,
+              jobQueueDepth: 12_000,
+            },
+          },
+        },
+      },
+    })
+
+    const summary = wrapper.get('[role="status"]')
+    expect(summary.text()).toContain('任务999+')
+    expect(summary.attributes('aria-label')).toContain('任务队列 12000')
   })
 })

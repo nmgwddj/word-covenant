@@ -5,6 +5,7 @@
 //! not serialize a PCM window across the WebView boundary.
 
 pub mod asr;
+pub mod gap;
 pub mod mock;
 pub mod model_registry;
 pub mod pipeline;
@@ -15,6 +16,7 @@ pub use asr::{
     MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionKind, TranscriptEmissionMapper,
     TranscriptWordTiming, TransientTranscriptEmission,
 };
+pub use gap::{InferenceGap, InferenceGapReason, InferenceGapStage};
 pub use mock::{FixtureAsr, FixtureAsrCue, FixtureVad, FixtureVadCue};
 pub use vad::{VadEngine, VadRequest, VadResponse, VoiceActivitySegment};
 

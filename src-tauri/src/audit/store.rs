@@ -1,15 +1,17 @@
 use super::{AuditEvent, AuditKind, AuditTrail};
 use crate::audio::{CaptureGap, CapturePoint};
 use crate::domain::{
-    CaptureSegment, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
+    CaptureSegment, CaptureSession, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
 };
 use crate::inference::asr::logical_span_id_for_asr_utterance_digest;
 use crate::inference::model_registry::{LocalModelKind, RegisteredModel};
-use crate::inference::AsrFinalIdempotencyKey;
+use crate::inference::{
+    AsrFinalIdempotencyKey, InferenceGap, InferenceGapReason, InferenceGapStage,
+};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 use uuid::Uuid;
 
@@ -25,6 +27,10 @@ pub enum AuditStoreError {
         value: String,
     },
     InvalidCaptureGapRange,
+    InvalidInferenceGapMetadata {
+        field: &'static str,
+        value: String,
+    },
     InvalidTranscriptMetadata {
         field: &'static str,
         value: String,
@@ -67,6 +73,12 @@ impl std::fmt::Display for AuditStoreError {
             }
             Self::InvalidCaptureGapRange => {
                 formatter.write_str("capture gap end must not precede its start")
+            }
+            Self::InvalidInferenceGapMetadata { field, value } => {
+                write!(
+                    formatter,
+                    "invalid inference gap metadata for {field}: {value}"
+                )
             }
             Self::InvalidTranscriptMetadata { field, value } => {
                 write!(
@@ -131,6 +143,15 @@ pub struct AuditStore {
 pub struct AsrFinalIdempotencyRecord {
     pub revision_id: Uuid,
     pub emission_payload_sha256: String,
+}
+
+/// One immutable inference-gap record together with the exact audit event
+/// that commits it. Callers use this to make a lost post-commit acknowledgement
+/// replayable without extending the hash chain a second time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InferenceGapAuditRecord {
+    pub gap: InferenceGap,
+    pub audit_event: AuditEvent,
 }
 
 /// The immutable facts that bind a native ASR final emission to its durable
@@ -259,6 +280,36 @@ impl AuditStore {
             CREATE INDEX IF NOT EXISTS capture_gaps_session_sequence
                 ON capture_gaps(session_id, sequence);
 
+            CREATE TABLE IF NOT EXISTS inference_gaps (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                capture_segment_id TEXT NOT NULL,
+                job_id TEXT,
+                started_monotonic_ns TEXT NOT NULL,
+                started_wall_clock TEXT NOT NULL,
+                ended_monotonic_ns TEXT NOT NULL,
+                ended_wall_clock TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                audit_event_id TEXT NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS inference_gaps_session_sequence
+                ON inference_gaps(session_id, sequence);
+            CREATE INDEX IF NOT EXISTS inference_gaps_runtime_sequence
+                ON inference_gaps(runtime_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS inference_gaps_are_immutable_update
+            BEFORE UPDATE ON inference_gaps
+            BEGIN
+                SELECT RAISE(ABORT, 'inference gaps are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS inference_gaps_are_immutable_delete
+            BEFORE DELETE ON inference_gaps
+            BEGIN
+                SELECT RAISE(ABORT, 'inference gaps are immutable');
+            END;
+
             CREATE TABLE IF NOT EXISTS transcript_revisions (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 id TEXT NOT NULL UNIQUE,
@@ -350,6 +401,38 @@ impl AuditStore {
 
     pub fn append(&self, event: &AuditEvent) -> Result<(), AuditStoreError> {
         insert_audit_event(&self.connection, event)
+    }
+
+    /// Atomically persist the three audit records that publish a new native
+    /// capture session. The caller updates its in-memory session projection
+    /// only after this bundle commits, so a staged microphone failure cannot
+    /// leave a standalone `SessionStarted` record behind.
+    pub fn append_capture_start_bundle_with_audit<T: Serialize>(
+        &mut self,
+        session: &CaptureSession,
+        segment: &CaptureSegment,
+        session_started: &AuditEvent,
+        segment_recorded: &AuditEvent,
+        input_started: &AuditEvent,
+        input_started_payload: &T,
+    ) -> Result<(), AuditStoreError> {
+        validate_capture_start_bundle(
+            &self.connection,
+            session,
+            segment,
+            session_started,
+            segment_recorded,
+            input_started,
+            input_started_payload,
+        )?;
+
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, session_started)?;
+        insert_audit_event(&transaction, segment_recorded)?;
+        insert_capture_segment(&transaction, segment)?;
+        insert_audit_event(&transaction, input_started)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<AuditEvent>, AuditStoreError> {
@@ -448,6 +531,27 @@ impl AuditStore {
             })
         {
             return Ok(false);
+        }
+
+        let inference_events = events
+            .iter()
+            .filter(|event| event.kind == AuditKind::InferenceGapRecorded)
+            .map(|event| (event.id, event))
+            .collect::<BTreeMap<_, _>>();
+        let inference_gaps = self.list_all_inference_gap_records()?;
+        if inference_events.len() != inference_gaps.len() {
+            return Ok(false);
+        }
+        let mut bound_events = BTreeSet::new();
+        for record in inference_gaps {
+            let Some(event) = inference_events.get(&record.audit_event_id) else {
+                return Ok(false);
+            };
+            if !bound_events.insert(record.audit_event_id)
+                || validate_inference_gap_audit_event(event, &record.gap).is_err()
+            {
+                return Ok(false);
+            }
         }
 
         Ok(true)
@@ -596,6 +700,72 @@ impl AuditStore {
             })
         })
         .collect()
+    }
+
+    /// Write an inference terminal outcome and its audit event atomically.
+    /// The record is intentionally separate from capture gaps because the
+    /// audio range was captured but did not yield a final transcript.
+    pub fn append_inference_gap_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        gap: &InferenceGap,
+    ) -> Result<(), AuditStoreError> {
+        validate_inference_gap_audit_event(event, gap)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_inference_gap(&transaction, gap, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_inference_gaps(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<InferenceGap>, AuditStoreError> {
+        self.list_inference_gap_records(Some(session_id))
+            .map(|records| records.into_iter().map(|record| record.gap).collect())
+    }
+
+    /// Returns the durable inference gap and the audit event bound to it.
+    ///
+    /// The relationship is revalidated on read because this API is used to
+    /// decide whether a worker outcome can be acknowledged after a retry.
+    pub fn lookup_inference_gap_with_audit(
+        &self,
+        gap_id: Uuid,
+    ) -> Result<Option<InferenceGapAuditRecord>, AuditStoreError> {
+        let stored = self
+            .connection
+            .query_row(
+                "
+                SELECT id, session_id, runtime_id, capture_segment_id, job_id,
+                       started_monotonic_ns, started_wall_clock,
+                       ended_monotonic_ns, ended_wall_clock, stage, reason, audit_event_id
+                FROM inference_gaps
+                WHERE id = ?1
+                ",
+                params![gap_id.to_string()],
+                inference_gap_row,
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let record = parse_inference_gap_record(stored)?;
+        let event = self
+            .list()?
+            .into_iter()
+            .find(|event| event.id == record.audit_event_id)
+            .ok_or(AuditStoreError::Integrity)?;
+        if !event.verifies() {
+            return Err(AuditStoreError::Integrity);
+        }
+        validate_inference_gap_audit_event(&event, &record.gap)?;
+
+        Ok(Some(InferenceGapAuditRecord {
+            gap: record.gap,
+            audit_event: event,
+        }))
     }
 
     /// Append a transcript revision and its audit event in one SQLite
@@ -770,6 +940,29 @@ impl AuditStore {
         rows.map(|row| parse_transcript_revision(row?)).collect()
     }
 
+    fn list_all_inference_gap_records(&self) -> Result<Vec<InferenceGapRecord>, AuditStoreError> {
+        self.list_inference_gap_records(None)
+    }
+
+    fn list_inference_gap_records(
+        &self,
+        session_id: Option<Uuid>,
+    ) -> Result<Vec<InferenceGapRecord>, AuditStoreError> {
+        let mut statement = self.connection.prepare(
+            "
+            SELECT id, session_id, runtime_id, capture_segment_id, job_id,
+                   started_monotonic_ns, started_wall_clock,
+                   ended_monotonic_ns, ended_wall_clock, stage, reason, audit_event_id
+            FROM inference_gaps
+            WHERE (?1 IS NULL OR session_id = ?1)
+            ORDER BY sequence ASC
+            ",
+        )?;
+        let stored_session_id = session_id.map(|value| value.to_string());
+        let rows = statement.query_map(params![stored_session_id], inference_gap_row)?;
+        rows.map(|row| parse_inference_gap_record(row?)).collect()
+    }
+
     fn verified_asr_final_idempotency_bindings(
         &self,
     ) -> Result<Option<BTreeMap<Uuid, AsrFinalIdempotencyBinding>>, AuditStoreError> {
@@ -882,6 +1075,26 @@ struct LocalModelRow {
     imported_at: String,
 }
 
+struct InferenceGapRecord {
+    gap: InferenceGap,
+    audit_event_id: Uuid,
+}
+
+struct InferenceGapRow {
+    id: String,
+    session_id: String,
+    runtime_id: String,
+    capture_segment_id: String,
+    job_id: Option<String>,
+    started_monotonic_ns: String,
+    started_wall_clock: String,
+    ended_monotonic_ns: String,
+    ended_wall_clock: String,
+    stage: String,
+    reason: String,
+    audit_event_id: String,
+}
+
 fn local_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalModelRow> {
     Ok(LocalModelRow {
         id: row.get(0)?,
@@ -895,6 +1108,23 @@ fn local_model_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalModelRow> {
         license_id: row.get(8)?,
         license_confirmed_at: row.get(9)?,
         imported_at: row.get(10)?,
+    })
+}
+
+fn inference_gap_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InferenceGapRow> {
+    Ok(InferenceGapRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        runtime_id: row.get(2)?,
+        capture_segment_id: row.get(3)?,
+        job_id: row.get(4)?,
+        started_monotonic_ns: row.get(5)?,
+        started_wall_clock: row.get(6)?,
+        ended_monotonic_ns: row.get(7)?,
+        ended_wall_clock: row.get(8)?,
+        stage: row.get(9)?,
+        reason: row.get(10)?,
+        audit_event_id: row.get(11)?,
     })
 }
 
@@ -989,6 +1219,49 @@ fn parse_registered_model(stored: LocalModelRow) -> Result<RegisteredModel, Audi
     };
     validate_registered_model(&model)?;
     Ok(model)
+}
+
+fn parse_inference_gap_record(
+    stored: InferenceGapRow,
+) -> Result<InferenceGapRecord, AuditStoreError> {
+    let stage = serde_json::from_str::<InferenceGapStage>(&stored.stage).map_err(|_| {
+        AuditStoreError::InvalidInferenceGapMetadata {
+            field: "stage",
+            value: stored.stage,
+        }
+    })?;
+    let reason = serde_json::from_str::<InferenceGapReason>(&stored.reason).map_err(|_| {
+        AuditStoreError::InvalidInferenceGapMetadata {
+            field: "reason",
+            value: stored.reason,
+        }
+    })?;
+    let gap = InferenceGap {
+        id: parse_uuid(&stored.id)?,
+        session_id: parse_uuid(&stored.session_id)?,
+        runtime_id: parse_uuid(&stored.runtime_id)?,
+        capture_segment_id: parse_uuid(&stored.capture_segment_id)?,
+        job_id: parse_optional_uuid(stored.job_id)?,
+        started_at: CapturePoint {
+            monotonic_ns: parse_inference_gap_monotonic_ns(&stored.started_monotonic_ns)?,
+            wall_clock: parse_timestamp(&stored.started_wall_clock)?,
+        },
+        ended_at: CapturePoint {
+            monotonic_ns: parse_inference_gap_monotonic_ns(&stored.ended_monotonic_ns)?,
+            wall_clock: parse_timestamp(&stored.ended_wall_clock)?,
+        },
+        stage,
+        reason,
+    };
+    gap.validate()
+        .map_err(|value| AuditStoreError::InvalidInferenceGapMetadata {
+            field: "gap",
+            value,
+        })?;
+    Ok(InferenceGapRecord {
+        gap,
+        audit_event_id: parse_uuid(&stored.audit_event_id)?,
+    })
 }
 
 fn parse_transcript_model_provenance(
@@ -1301,6 +1574,63 @@ fn validate_local_model_audit_event(
     Ok(())
 }
 
+fn validate_inference_gap(gap: &InferenceGap) -> Result<(), AuditStoreError> {
+    gap.validate()
+        .map_err(|value| AuditStoreError::InvalidInferenceGapMetadata {
+            field: "gap",
+            value,
+        })
+}
+
+fn validate_inference_gap_audit_event(
+    event: &AuditEvent,
+    gap: &InferenceGap,
+) -> Result<(), AuditStoreError> {
+    validate_inference_gap(gap)?;
+    if event.kind != AuditKind::InferenceGapRecorded {
+        return Err(AuditStoreError::InvalidInferenceGapMetadata {
+            field: "audit event kind",
+            value: serde_json::to_string(&event.kind).expect("audit kind serializes"),
+        });
+    }
+    if event.run_id != Some(gap.session_id) {
+        return Err(AuditStoreError::InvalidInferenceGapMetadata {
+            field: "audit event session linkage",
+            value: format!("run_id={:?}", event.run_id),
+        });
+    }
+    if event.causation_id != gap.job_id {
+        return Err(AuditStoreError::InvalidInferenceGapMetadata {
+            field: "audit event causation linkage",
+            value: format!("causation_id={:?}", event.causation_id),
+        });
+    }
+    if event.monotonic_ns != gap.ended_at.monotonic_ns
+        || event.wall_clock != gap.ended_at.wall_clock
+    {
+        return Err(AuditStoreError::InvalidInferenceGapMetadata {
+            field: "audit event capture endpoint",
+            value: format!(
+                "monotonic_ns={}, wall_clock={}",
+                event.monotonic_ns,
+                event.wall_clock.to_rfc3339()
+            ),
+        });
+    }
+    if !event.matches_payload(gap).map_err(|error| {
+        AuditStoreError::InvalidInferenceGapMetadata {
+            field: "audit event payload",
+            value: error.to_string(),
+        }
+    })? {
+        return Err(AuditStoreError::InvalidInferenceGapMetadata {
+            field: "audit event payload",
+            value: "digest does not match inference gap".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn insert_audit_event(connection: &Connection, event: &AuditEvent) -> Result<(), AuditStoreError> {
     if !event.verifies() {
         return Err(AuditStoreError::Integrity);
@@ -1560,6 +1890,38 @@ fn insert_capture_gap(
     Ok(())
 }
 
+fn insert_inference_gap(
+    connection: &Connection,
+    gap: &InferenceGap,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    validate_inference_gap(gap)?;
+    connection.execute(
+        "
+        INSERT INTO inference_gaps (
+            id, session_id, runtime_id, capture_segment_id, job_id,
+            started_monotonic_ns, started_wall_clock,
+            ended_monotonic_ns, ended_wall_clock, stage, reason, audit_event_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ",
+        params![
+            gap.id.to_string(),
+            gap.session_id.to_string(),
+            gap.runtime_id.to_string(),
+            gap.capture_segment_id.to_string(),
+            gap.job_id.map(|value| value.to_string()),
+            gap.started_at.monotonic_ns.to_string(),
+            gap.started_at.wall_clock.to_rfc3339(),
+            gap.ended_at.monotonic_ns.to_string(),
+            gap.ended_at.wall_clock.to_rfc3339(),
+            serde_json::to_string(&gap.stage).expect("inference gap stage serializes"),
+            serde_json::to_string(&gap.reason).expect("inference gap reason serializes"),
+            audit_event_id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
 fn validate_capture_segment(segment: &CaptureSegment) -> Result<(), AuditStoreError> {
     if segment.device_uid.trim().is_empty() {
         return Err(AuditStoreError::InvalidCaptureMetadata {
@@ -1588,10 +1950,130 @@ fn validate_capture_segment(segment: &CaptureSegment) -> Result<(), AuditStoreEr
     Ok(())
 }
 
+fn validate_capture_start_bundle<T: Serialize>(
+    connection: &Connection,
+    session: &CaptureSession,
+    segment: &CaptureSegment,
+    session_started: &AuditEvent,
+    segment_recorded: &AuditEvent,
+    input_started: &AuditEvent,
+    input_started_payload: &T,
+) -> Result<(), AuditStoreError> {
+    if segment.session_id != session.id {
+        return Err(AuditStoreError::InvalidCaptureMetadata {
+            field: "capture segment session ID",
+            value: segment.session_id.to_string(),
+        });
+    }
+    validate_capture_segment(segment)?;
+
+    let previous_hash = connection
+        .query_row(
+            "SELECT hash FROM audit_events ORDER BY sequence DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    validate_capture_start_bundle_event(
+        session_started,
+        AuditKind::SessionStarted,
+        session.id,
+        None,
+        session.started_monotonic_ns,
+        session.started_at,
+        session,
+        previous_hash.as_deref(),
+        "session start",
+    )?;
+    validate_capture_start_bundle_event(
+        segment_recorded,
+        AuditKind::CaptureSegmentRecorded,
+        session.id,
+        None,
+        segment.anchor_monotonic_ns,
+        segment.anchor_wall_clock,
+        segment,
+        Some(session_started.hash.as_str()),
+        "capture segment",
+    )?;
+    validate_capture_start_bundle_event(
+        input_started,
+        AuditKind::CaptureInputStarted,
+        session.id,
+        None,
+        segment.anchor_monotonic_ns,
+        segment.anchor_wall_clock,
+        input_started_payload,
+        Some(segment_recorded.hash.as_str()),
+        "capture input start",
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_capture_start_bundle_event<T: Serialize>(
+    event: &AuditEvent,
+    kind: AuditKind,
+    session_id: Uuid,
+    causation_id: Option<Uuid>,
+    monotonic_ns: u64,
+    wall_clock: DateTime<Utc>,
+    payload: &T,
+    previous_hash: Option<&str>,
+    label: &'static str,
+) -> Result<(), AuditStoreError> {
+    if event.kind != kind {
+        return Err(AuditStoreError::InvalidCaptureMetadata {
+            field: "capture start audit kind",
+            value: format!("{label}: {:?}", event.kind),
+        });
+    }
+    if event.run_id != Some(session_id) || event.causation_id != causation_id {
+        return Err(AuditStoreError::InvalidCaptureMetadata {
+            field: "capture start audit linkage",
+            value: format!(
+                "{label}: run_id={:?}, causation_id={:?}",
+                event.run_id, event.causation_id
+            ),
+        });
+    }
+    if event.monotonic_ns != monotonic_ns || event.wall_clock != wall_clock {
+        return Err(AuditStoreError::InvalidCaptureMetadata {
+            field: "capture start audit timestamp",
+            value: format!("{label}: {} at {}", event.monotonic_ns, event.wall_clock),
+        });
+    }
+    if event.previous_hash.as_deref() != previous_hash || !event.verifies() {
+        return Err(AuditStoreError::Integrity);
+    }
+    let payload_matches = event.matches_payload(payload).map_err(|error| {
+        AuditStoreError::InvalidCaptureMetadata {
+            field: "capture start audit payload",
+            value: format!("{label}: {error}"),
+        }
+    })?;
+    if !payload_matches {
+        return Err(AuditStoreError::InvalidCaptureMetadata {
+            field: "capture start audit payload",
+            value: format!("{label}: digest does not match"),
+        });
+    }
+    Ok(())
+}
+
 fn parse_capture_monotonic_ns(value: &str) -> Result<u64, AuditStoreError> {
     value
         .parse()
         .map_err(|_| AuditStoreError::InvalidCaptureMetadata {
+            field: "monotonic nanoseconds",
+            value: value.to_owned(),
+        })
+}
+
+fn parse_inference_gap_monotonic_ns(value: &str) -> Result<u64, AuditStoreError> {
+    value
+        .parse()
+        .map_err(|_| AuditStoreError::InvalidInferenceGapMetadata {
             field: "monotonic nanoseconds",
             value: value.to_owned(),
         })
@@ -1646,7 +2128,366 @@ mod tests {
     use super::*;
     use crate::audio::CaptureGapReason;
     use crate::audit::AuditKind;
+    use crate::inference::{InferenceGap, InferenceGapReason, InferenceGapStage};
     use chrono::Duration;
+
+    fn inference_gap_fixture(session_id: Uuid) -> InferenceGap {
+        InferenceGap::new(
+            Uuid::new_v4(),
+            session_id,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            CapturePoint {
+                monotonic_ns: 5_000_000_000,
+                wall_clock: DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(5),
+            },
+            CapturePoint {
+                monotonic_ns: 6_000_000_000,
+                wall_clock: DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(6),
+            },
+            InferenceGapStage::JobQueue,
+            InferenceGapReason::JobQueueSaturated,
+        )
+        .unwrap()
+    }
+
+    fn inference_gap_event(gap: &InferenceGap, previous_hash: Option<String>) -> AuditEvent {
+        AuditEvent::new(
+            Some(gap.session_id),
+            gap.job_id,
+            AuditKind::InferenceGapRecorded,
+            gap.ended_at.monotonic_ns,
+            gap.ended_at.wall_clock,
+            gap,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn persists_reopens_and_verifies_audited_inference_gaps() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-inference-gap-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let session_id = Uuid::new_v4();
+        let gap = inference_gap_fixture(session_id);
+        let event = inference_gap_event(&gap, None);
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            store.append_inference_gap_with_audit(&event, &gap).unwrap();
+            assert_eq!(
+                store.list_inference_gaps(session_id).unwrap(),
+                vec![gap.clone()]
+            );
+            assert!(store.verify().unwrap());
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert_eq!(reopened.list_inference_gaps(session_id).unwrap(), vec![gap]);
+        assert!(reopened.verify().unwrap());
+
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn looks_up_an_inference_gap_with_its_immutable_audit_binding() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+        let event = inference_gap_event(&gap, None);
+
+        store.append_inference_gap_with_audit(&event, &gap).unwrap();
+
+        assert_eq!(
+            store.lookup_inference_gap_with_audit(gap.id).unwrap(),
+            Some(InferenceGapAuditRecord {
+                gap: gap.clone(),
+                audit_event: event,
+            })
+        );
+        assert_eq!(
+            store
+                .lookup_inference_gap_with_audit(Uuid::new_v4())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_rejects_an_inference_gap_bound_to_a_tampered_audit_event() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+        let event = inference_gap_event(&gap, None);
+        store.append_inference_gap_with_audit(&event, &gap).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE audit_events SET hash = ?1 WHERE id = ?2",
+                params!["tampered audit hash", event.id.to_string()],
+            )
+            .unwrap();
+        assert!(store.list().unwrap()[0].matches_payload(&gap).unwrap());
+        assert!(matches!(
+            store.lookup_inference_gap_with_audit(gap.id),
+            Err(AuditStoreError::Integrity)
+        ));
+
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+        let event = inference_gap_event(&gap, None);
+        store.append_inference_gap_with_audit(&event, &gap).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE audit_events SET previous_hash = ?1 WHERE id = ?2",
+                params!["tampered previous hash", event.id.to_string()],
+            )
+            .unwrap();
+        assert!(store.list().unwrap()[0].matches_payload(&gap).unwrap());
+        assert!(matches!(
+            store.lookup_inference_gap_with_audit(gap.id),
+            Err(AuditStoreError::Integrity)
+        ));
+    }
+
+    #[test]
+    fn atomically_persists_and_reopens_a_capture_start_bundle() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-capture-start-bundle-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let session = CaptureSession::begin_with_id(
+            Uuid::new_v4(),
+            2_000_000,
+            DateTime::<Utc>::UNIX_EPOCH + Duration::milliseconds(2),
+        )
+        .unwrap();
+        let segment = CaptureSegment::new_with_id(
+            Uuid::new_v4(),
+            session.id,
+            "built-in-mic",
+            "Built-in Microphone",
+            48_000,
+            2,
+            session.started_monotonic_ns,
+            session.started_at,
+        )
+        .unwrap();
+        let input_payload = serde_json::json!({
+            "sessionId": session.id,
+            "deviceUid": segment.device_uid.clone(),
+            "deviceName": segment.device_name.clone(),
+            "sampleRate": segment.sample_rate,
+            "channels": segment.channels,
+            "anchor": {
+                "monotonicNs": segment.anchor_monotonic_ns,
+                "wallClock": segment.anchor_wall_clock,
+            },
+        });
+        let session_event = AuditEvent::new(
+            Some(session.id),
+            None,
+            AuditKind::SessionStarted,
+            session.started_monotonic_ns,
+            session.started_at,
+            &session,
+            None,
+        )
+        .unwrap();
+        let segment_event = AuditEvent::new(
+            Some(session.id),
+            None,
+            AuditKind::CaptureSegmentRecorded,
+            segment.anchor_monotonic_ns,
+            segment.anchor_wall_clock,
+            &segment,
+            Some(session_event.hash.clone()),
+        )
+        .unwrap();
+        let input_event = AuditEvent::new(
+            Some(session.id),
+            None,
+            AuditKind::CaptureInputStarted,
+            segment.anchor_monotonic_ns,
+            segment.anchor_wall_clock,
+            &input_payload,
+            Some(segment_event.hash.clone()),
+        )
+        .unwrap();
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            store
+                .append_capture_start_bundle_with_audit(
+                    &session,
+                    &segment,
+                    &session_event,
+                    &segment_event,
+                    &input_event,
+                    &input_payload,
+                )
+                .unwrap();
+            assert_eq!(
+                store.list_capture_segments(session.id).unwrap(),
+                vec![segment.clone()]
+            );
+            assert_eq!(
+                store
+                    .list()
+                    .unwrap()
+                    .into_iter()
+                    .map(|event| event.kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    AuditKind::SessionStarted,
+                    AuditKind::CaptureSegmentRecorded,
+                    AuditKind::CaptureInputStarted,
+                ]
+            );
+            assert!(store.verify().unwrap());
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert_eq!(
+            reopened.list_capture_segments(session.id).unwrap(),
+            vec![segment]
+        );
+        assert!(reopened.verify().unwrap());
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn rejects_inference_gaps_without_their_matching_audit_event() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+
+        let wrong_kind = AuditEvent::new(
+            Some(gap.session_id),
+            gap.job_id,
+            AuditKind::CaptureGapRecorded,
+            gap.ended_at.monotonic_ns,
+            gap.ended_at.wall_clock,
+            &gap,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.append_inference_gap_with_audit(&wrong_kind, &gap),
+            Err(AuditStoreError::InvalidInferenceGapMetadata {
+                field: "audit event kind",
+                ..
+            })
+        ));
+
+        let wrong_payload = AuditEvent::new(
+            Some(gap.session_id),
+            gap.job_id,
+            AuditKind::InferenceGapRecorded,
+            gap.ended_at.monotonic_ns,
+            gap.ended_at.wall_clock,
+            &serde_json::json!({ "gap": "different" }),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.append_inference_gap_with_audit(&wrong_payload, &gap),
+            Err(AuditStoreError::InvalidInferenceGapMetadata {
+                field: "audit event payload",
+                ..
+            })
+        ));
+
+        assert!(store.list().unwrap().is_empty());
+        assert!(store
+            .list_inference_gaps(gap.session_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn verification_rejects_tampered_or_missing_inference_gap_bindings() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+        let event = inference_gap_event(&gap, None);
+        store.append_inference_gap_with_audit(&event, &gap).unwrap();
+        assert!(store.verify().unwrap());
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER inference_gaps_are_immutable_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE inference_gaps SET reason = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&InferenceGapReason::EngineFailed).unwrap(),
+                    gap.id.to_string(),
+                ],
+            )
+            .unwrap();
+        assert!(!store.verify().unwrap());
+
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+        let event = inference_gap_event(&gap, None);
+        store.append_inference_gap_with_audit(&event, &gap).unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER inference_gaps_are_immutable_delete;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM inference_gaps WHERE id = ?1",
+                params![gap.id.to_string()],
+            )
+            .unwrap();
+        assert!(!store.verify().unwrap());
+    }
+
+    #[test]
+    fn prevents_duplicate_inference_gap_audit_bindings() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let gap = inference_gap_fixture(Uuid::new_v4());
+        let event = inference_gap_event(&gap, None);
+        store.append_inference_gap_with_audit(&event, &gap).unwrap();
+
+        let duplicate = InferenceGap {
+            id: Uuid::new_v4(),
+            ..gap.clone()
+        };
+        assert!(store
+            .connection
+            .execute(
+                "
+                INSERT INTO inference_gaps (
+                    id, session_id, runtime_id, capture_segment_id, job_id,
+                    started_monotonic_ns, started_wall_clock,
+                    ended_monotonic_ns, ended_wall_clock, stage, reason, audit_event_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ",
+                params![
+                    duplicate.id.to_string(),
+                    duplicate.session_id.to_string(),
+                    duplicate.runtime_id.to_string(),
+                    duplicate.capture_segment_id.to_string(),
+                    duplicate.job_id.map(|value| value.to_string()),
+                    duplicate.started_at.monotonic_ns.to_string(),
+                    duplicate.started_at.wall_clock.to_rfc3339(),
+                    duplicate.ended_at.monotonic_ns.to_string(),
+                    duplicate.ended_at.wall_clock.to_rfc3339(),
+                    serde_json::to_string(&duplicate.stage).unwrap(),
+                    serde_json::to_string(&duplicate.reason).unwrap(),
+                    event.id.to_string(),
+                ],
+            )
+            .is_err());
+        assert!(store.verify().unwrap());
+    }
 
     #[test]
     fn persists_a_verifiable_audit_chain() {

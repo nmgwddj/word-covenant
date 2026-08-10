@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU8, Ordering};
 use tauri::{Emitter, Manager};
 
 pub mod audio;
@@ -7,6 +8,42 @@ pub mod domain;
 pub mod inference;
 pub mod policy;
 pub mod state;
+
+const EXIT_DRAIN_IDLE: u8 = 0;
+const EXIT_DRAINING: u8 = 1;
+const EXIT_READY_TO_EXIT: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExitRequestAction {
+    StartDrain,
+    KeepOpen,
+    AllowExit,
+}
+
+/// Claim an exit request without allowing a later request to bypass an
+/// in-progress durable capture drain.
+fn exit_request_action(exit_state: &AtomicU8) -> ExitRequestAction {
+    loop {
+        match exit_state.load(Ordering::Acquire) {
+            EXIT_DRAIN_IDLE => {
+                if exit_state
+                    .compare_exchange(
+                        EXIT_DRAIN_IDLE,
+                        EXIT_DRAINING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return ExitRequestAction::StartDrain;
+                }
+            }
+            EXIT_DRAINING => return ExitRequestAction::KeepOpen,
+            EXIT_READY_TO_EXIT => return ExitRequestAction::AllowExit,
+            _ => exit_state.store(EXIT_DRAIN_IDLE, Ordering::Release),
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -91,7 +128,58 @@ pub fn run() {
         commands::attempt_http_profile,
     ]);
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    // A normal application exit must use the same drain path as an explicit
+    // Stop command. Otherwise the immutable SessionStarted bundle could be
+    // left without terminal capture/inference evidence.
+    let exit_state = AtomicU8::new(EXIT_DRAIN_IDLE);
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building Tauri application");
+    app.run(move |app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+            match exit_request_action(&exit_state) {
+                ExitRequestAction::StartDrain => {
+                    api.prevent_exit();
+                    match app_handle.state::<state::AppState>().stop_session() {
+                        Ok(_) => {
+                            exit_state.store(EXIT_READY_TO_EXIT, Ordering::Release);
+                            app_handle.exit(code.unwrap_or_default());
+                        }
+                        Err(error) => {
+                            exit_state.store(EXIT_DRAIN_IDLE, Ordering::Release);
+                            eprintln!("could not durably stop native capture before exit: {error}");
+                        }
+                    }
+                }
+                ExitRequestAction::KeepOpen => api.prevent_exit(),
+                ExitRequestAction::AllowExit => {}
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_repeated_exit_requests_while_capture_drain_is_running() {
+        let state = AtomicU8::new(EXIT_DRAIN_IDLE);
+
+        assert_eq!(exit_request_action(&state), ExitRequestAction::StartDrain);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::KeepOpen);
+
+        state.store(EXIT_READY_TO_EXIT, Ordering::Release);
+        assert_eq!(exit_request_action(&state), ExitRequestAction::AllowExit);
+    }
+
+    #[test]
+    fn failed_capture_drain_returns_exit_state_to_idle() {
+        let state = AtomicU8::new(EXIT_DRAIN_IDLE);
+
+        assert_eq!(exit_request_action(&state), ExitRequestAction::StartDrain);
+        state.store(EXIT_DRAIN_IDLE, Ordering::Release);
+
+        assert_eq!(exit_request_action(&state), ExitRequestAction::StartDrain);
+    }
 }

@@ -1,17 +1,20 @@
 //! Application-owned microphone capture lifecycle.
 //!
 //! `CaptureService` owns the native stream and only exposes compact metadata.
-//! Raw PCM stays inside the pre-allocated ingress and its meter worker.
+//! Raw PCM stays inside the pre-allocated ingress and its native dispatcher.
 
 use super::{
-    capture_point_now, CaptureFailureCode, CaptureGap, CaptureGapReason, CaptureLifecycle,
-    CapturePoint, CaptureStatus, CpalInput, CpalInputFailure, MacOsCaptureEvent, MacOsInputDevice,
-    MicrophonePermission,
+    capture_point_now, AsrQueueMetrics, CaptureClock, CaptureFailureCode, CaptureGap,
+    CaptureGapReason, CaptureLifecycle, CapturePoint, CaptureStatus, CpalInput, CpalInputFailure,
+    DispatcherRuntime, MacOsCaptureEvent, MacOsInputDevice, MicrophonePermission,
+    NativeCaptureRuntime, NativeCaptureRuntimeConfig, NativeCaptureRuntimeSnapshot,
+    NativeCaptureRuntimeStatus, OwnedOutcomeLease,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 const MAX_PENDING_GAPS: usize = 16;
+const SUPPORTED_CAPTURE_SAMPLE_RATES: [u32; 2] = [16_000, 48_000];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +44,45 @@ pub struct CaptureMeter {
     pub dropped_packets: u64,
 }
 
+/// A serializable lifecycle view of the native bridge. It contains bounded
+/// queue state only; PCM and transcript text remain native-only.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureBridgeStatus {
+    Parked,
+    Armed,
+    Closing,
+    Drained,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureBridgeProjection {
+    pub status: CaptureBridgeStatus,
+    pub armed: bool,
+    pub shutdown_requested: bool,
+    pub worker_finished: bool,
+    pub metrics: AsrQueueMetrics,
+}
+
+impl CaptureBridgeProjection {
+    fn from_snapshot(snapshot: &NativeCaptureRuntimeSnapshot) -> Self {
+        let status = match snapshot.status {
+            NativeCaptureRuntimeStatus::Parked => CaptureBridgeStatus::Parked,
+            NativeCaptureRuntimeStatus::Armed => CaptureBridgeStatus::Armed,
+            NativeCaptureRuntimeStatus::Closing => CaptureBridgeStatus::Closing,
+            NativeCaptureRuntimeStatus::Drained => CaptureBridgeStatus::Drained,
+        };
+        Self {
+            status,
+            armed: snapshot.armed,
+            shutdown_requested: snapshot.shutdown_requested,
+            worker_finished: snapshot.worker_finished,
+            metrics: snapshot.metrics.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureProjection {
@@ -50,15 +92,45 @@ pub struct CaptureProjection {
     pub selected_device: Option<MacOsInputDevice>,
     pub devices: Vec<MacOsInputDevice>,
     pub meter: Option<CaptureMeter>,
+    pub bridge: Option<CaptureBridgeProjection>,
     pub last_issue: Option<CaptureIssue>,
 }
 
+#[derive(Clone, Debug)]
+pub struct CapturePreparation {
+    pub anchor: CapturePoint,
+    pub device: MacOsInputDevice,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
+/// Metadata for a CPAL stream that has been played but is not published as
+/// recording until [`CaptureService::arm_after_commit`] succeeds.
 #[derive(Clone, Debug)]
 pub struct CaptureStart {
     pub anchor: CapturePoint,
     pub device: MacOsInputDevice,
     pub sample_rate: u32,
     pub channels: u16,
+    pub runtime: DispatcherRuntime,
+}
+
+/// A retryable claim over the oldest capture discontinuity awaiting durable
+/// storage. The gap stays queued until its token is committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CaptureGapLease {
+    token: u64,
+    gap: CaptureGap,
+}
+
+impl CaptureGapLease {
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+
+    pub fn gap(&self) -> &CaptureGap {
+        &self.gap
+    }
 }
 
 pub struct CaptureService {
@@ -67,12 +139,20 @@ pub struct CaptureService {
     devices: Vec<MacOsInputDevice>,
     selected_device_uid: Option<String>,
     meter: Option<CaptureMeter>,
+    bridge: Option<CaptureBridgeProjection>,
     last_issue: Option<CaptureIssue>,
     revision: u64,
     observed_dropped_packets: u64,
     pending_gaps: VecDeque<CaptureGap>,
+    active_gap_lease: Option<CaptureGapLease>,
+    next_gap_lease_token: u64,
     active_queue_overrun_gap: Option<CaptureGap>,
     input: Option<CpalInput>,
+    prepared_capture: Option<CapturePreparation>,
+    runtime: Option<NativeCaptureRuntime>,
+    // A pre-arm worker that was explicitly shut down after startup failed.
+    // It must be moved out and joined after the service mutex is released.
+    prearm_runtimes_for_join: VecDeque<NativeCaptureRuntime>,
 }
 
 impl Default for CaptureService {
@@ -89,12 +169,18 @@ impl CaptureService {
             devices: Vec::new(),
             selected_device_uid: None,
             meter: None,
+            bridge: None,
             last_issue: None,
             revision: 0,
             observed_dropped_packets: 0,
             pending_gaps: VecDeque::with_capacity(MAX_PENDING_GAPS),
+            active_gap_lease: None,
+            next_gap_lease_token: 1,
             active_queue_overrun_gap: None,
             input: None,
+            prepared_capture: None,
+            runtime: None,
+            prearm_runtimes_for_join: VecDeque::new(),
         }
     }
 
@@ -107,20 +193,134 @@ impl CaptureService {
             selected_device: self.lifecycle.selected_device().cloned(),
             devices: self.devices.clone(),
             meter: self.meter.clone(),
+            bridge: self.bridge.clone(),
             last_issue: self.last_issue.clone(),
         }
     }
 
-    /// Return and clear bounded capture discontinuities for durable storage.
-    ///
-    /// Gap metadata is deliberately compact and never contains PCM samples.
+    /// Backward-compatible destructive delivery for callers that do not claim
+    /// a gap lease. New durable callers must use the begin/commit/abort API so
+    /// a failed SQLite write can retry the same discontinuity.
     pub fn take_pending_gaps(&mut self) -> Vec<CaptureGap> {
+        if self.active_gap_lease.is_some() {
+            return Vec::new();
+        }
         self.pending_gaps.drain(..).collect()
+    }
+
+    /// Claim the oldest physical capture gap without removing it. The caller
+    /// must commit after durable storage or abort to retry the same gap.
+    pub fn begin_pending_gap(&mut self) -> Result<Option<CaptureGapLease>, String> {
+        if self.active_gap_lease.is_some() {
+            return Err("a capture gap delivery is already active".to_owned());
+        }
+        let Some(gap) = self.pending_gaps.front().cloned() else {
+            return Ok(None);
+        };
+        let token = self.next_gap_lease_token;
+        self.next_gap_lease_token = self.next_gap_lease_token.checked_add(1).unwrap_or(1);
+        let lease = CaptureGapLease { token, gap };
+        self.active_gap_lease = Some(lease.clone());
+        Ok(Some(lease))
+    }
+
+    pub fn commit_pending_gap(&mut self, token: u64) -> Result<(), String> {
+        let lease = self.require_active_gap_lease(token)?;
+        if self.pending_gaps.front() != Some(&lease.gap) {
+            return Err("the active capture gap no longer matches the pending head".to_owned());
+        }
+        self.pending_gaps.pop_front();
+        self.active_gap_lease = None;
+        Ok(())
+    }
+
+    pub fn abort_pending_gap(&mut self, token: u64) -> Result<(), String> {
+        self.require_active_gap_lease(token)?;
+        self.active_gap_lease = None;
+        Ok(())
+    }
+
+    /// Claim one native inference outcome while retaining the service lock
+    /// only for the short dispatcher operation. Persistence must happen after
+    /// the caller releases that lock.
+    pub fn begin_native_outcome(&self) -> Result<Option<OwnedOutcomeLease>, String> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(None);
+        };
+        runtime
+            .begin_owned_outcome()
+            .map_err(|error| format!("could not claim native inference outcome: {error}"))
+    }
+
+    pub fn commit_native_outcome(&self, token: u64) -> Result<(), String> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "no native capture runtime is active".to_owned())?;
+        runtime
+            .commit_owned_outcome(token)
+            .map_err(|error| format!("could not commit native inference outcome: {error}"))
+    }
+
+    pub fn abort_native_outcome(&self, token: u64) -> Result<(), String> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "no native capture runtime is active".to_owned())?;
+        runtime
+            .abort_owned_outcome(token)
+            .map_err(|error| format!("could not abort native inference outcome: {error}"))
+    }
+
+    pub fn runtime_context(&self) -> Result<Option<DispatcherRuntime>, String> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .runtime()
+                    .map_err(|error| format!("could not inspect native capture runtime: {error}"))
+            })
+            .transpose()
+    }
+
+    /// Remove a runtime only after every owned outcome has been durably
+    /// handled. The caller must join it after releasing the service mutex.
+    pub fn take_drained_native_runtime(&mut self) -> Result<Option<NativeCaptureRuntime>, String> {
+        let Some(runtime) = self.runtime.as_ref() else {
+            return Ok(None);
+        };
+        if !runtime
+            .is_drained()
+            .map_err(|error| format!("could not inspect native capture runtime: {error}"))?
+        {
+            return Ok(None);
+        }
+        self.bridge = None;
+        self.touch();
+        Ok(self.runtime.take())
+    }
+
+    /// Move one explicitly aborted pre-arm runtime to the caller.
+    ///
+    /// The caller must release the `CaptureService` mutex, then invoke
+    /// [`NativeCaptureRuntime::join_after_abort`] before starting another
+    /// capture. This is intentionally separate from
+    /// [`Self::take_drained_native_runtime`], whose runtimes may still have
+    /// durable inference outcomes to flush.
+    pub fn take_prearm_runtime_for_join(&mut self) -> Option<NativeCaptureRuntime> {
+        let runtime = self.prearm_runtimes_for_join.pop_front();
+        if runtime.is_some() {
+            self.touch();
+        }
+        runtime
     }
 
     pub fn select_input_device(&mut self, device_uid: String) -> Result<CaptureProjection, String> {
         self.refresh();
-        if self.lifecycle.status() == CaptureStatus::Recording {
+        if self.input.is_some()
+            || self.runtime.is_some()
+            || !self.prearm_runtimes_for_join.is_empty()
+        {
             return Err("stop recording before selecting a different microphone".to_owned());
         }
         if !self.devices.iter().any(|device| device.uid() == device_uid) {
@@ -133,8 +333,23 @@ impl CaptureService {
         Ok(self.projection())
     }
 
-    pub fn start(&mut self) -> Result<CaptureStart, String> {
+    /// Prepare permission, device, config, and a paused CPAL stream. This
+    /// does not begin ingesting audio or publish a Recording lifecycle state.
+    pub fn prepare(&mut self) -> Result<CapturePreparation, String> {
         self.refresh();
+        self.flush_queue_overrun_gap();
+        if self.input.is_some()
+            || self.prepared_capture.is_some()
+            || self.runtime.is_some()
+            || !self.prearm_runtimes_for_join.is_empty()
+        {
+            return Err("microphone capture is already preparing or active".to_owned());
+        }
+        if self.active_gap_lease.is_some() || !self.pending_gaps.is_empty() {
+            return Err(
+                "pending capture gaps must be durably handled before recording restarts".to_owned(),
+            );
+        }
         if self.lifecycle.status() == CaptureStatus::Recording {
             return Err("microphone capture is already active".to_owned());
         }
@@ -145,10 +360,8 @@ impl CaptureService {
             .map_err(|error| error.to_string())?;
         self.last_issue = None;
         self.meter = None;
+        self.bridge = None;
         self.observed_dropped_packets = 0;
-        // Gaps belong to the stream that produced them and must never leak
-        // into a later session after an interrupted stream is restarted.
-        self.pending_gaps.clear();
         self.active_queue_overrun_gap = None;
         self.touch();
 
@@ -186,8 +399,8 @@ impl CaptureService {
         }
 
         let selected_device_uid = self.selected_device_uid.as_deref();
-        let (input, anchor) = match CpalInput::start(selected_device_uid) {
-            Ok(started) => started,
+        let (mut input, anchor) = match CpalInput::prepare(selected_device_uid) {
+            Ok(prepared) => prepared,
             Err(error) => {
                 let code = if error.contains("permission") {
                     CaptureFailureCode::PermissionDenied
@@ -215,46 +428,337 @@ impl CaptureService {
         let device = input.device().clone();
         let sample_rate = input.sample_rate();
         let channels = input.channels();
-        self.permission = MicrophonePermission::Granted;
-        self.lifecycle
-            .apply(MacOsCaptureEvent::CaptureStarted {
-                device: device.clone(),
-                at: anchor.clone(),
-            })
-            .map_err(|error| error.to_string())?;
-        self.input = Some(input);
-        self.touch();
+        if let Err(error) = preflight_input_sample_rate(sample_rate) {
+            input.stop();
+            self.fail(
+                requested_at,
+                CaptureFailureCode::StreamStartFailed,
+                CaptureIssueCode::StreamStartFailed,
+                Some(device.name().to_owned()),
+                "unsupported microphone input sample rate",
+            );
+            return Err(error);
+        }
 
-        Ok(CaptureStart {
+        let prepared = CapturePreparation {
             anchor,
             device,
             sample_rate,
             channels,
+        };
+        self.permission = MicrophonePermission::Granted;
+        self.input = Some(input);
+        self.prepared_capture = Some(prepared.clone());
+        self.touch();
+
+        Ok(prepared)
+    }
+
+    /// Construct a parked dispatcher, then hand off the already prepared CPAL
+    /// stream. The caller must durably record the session/capture start before
+    /// calling [`Self::arm_after_commit`].
+    pub fn activate_with_runtime(
+        &mut self,
+        dispatcher_runtime: DispatcherRuntime,
+    ) -> Result<CaptureStart, String> {
+        let prepared = self
+            .prepared_capture
+            .clone()
+            .ok_or_else(|| "microphone capture has not been prepared".to_owned())?;
+        if self.runtime.is_some() {
+            return Err("native capture runtime is already active".to_owned());
+        }
+        if dispatcher_runtime.capture_anchor != prepared.anchor {
+            self.release_prepared_input();
+            self.fail(
+                capture_point_now(),
+                CaptureFailureCode::StreamStartFailed,
+                CaptureIssueCode::StreamStartFailed,
+                Some(prepared.device.name().to_owned()),
+                "dispatcher runtime capture anchor does not match prepared input",
+            );
+            return Err(
+                "dispatcher runtime capture anchor does not match prepared input".to_owned(),
+            );
+        }
+
+        let clock = match CaptureClock::new(prepared.anchor.clone(), prepared.sample_rate) {
+            Ok(clock) => clock,
+            Err(error) => {
+                self.release_prepared_input();
+                self.fail(
+                    capture_point_now(),
+                    CaptureFailureCode::StreamStartFailed,
+                    CaptureIssueCode::StreamStartFailed,
+                    Some(prepared.device.name().to_owned()),
+                    "could not create the native capture clock",
+                );
+                return Err(error);
+            }
+        };
+        let ingress = self
+            .input
+            .as_ref()
+            .ok_or_else(|| "prepared microphone input is unavailable".to_owned())?
+            .ingress();
+        let native_runtime = match NativeCaptureRuntime::new(
+            ingress,
+            dispatcher_runtime.clone(),
+            clock,
+            NativeCaptureRuntimeConfig::default(),
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.release_prepared_input();
+                self.fail(
+                    capture_point_now(),
+                    CaptureFailureCode::StreamStartFailed,
+                    CaptureIssueCode::StreamStartFailed,
+                    Some(prepared.device.name().to_owned()),
+                    "could not prepare native microphone runtime",
+                );
+                return Err(format!(
+                    "could not prepare native microphone runtime: {error}"
+                ));
+            }
+        };
+
+        let activation = self
+            .input
+            .as_mut()
+            .expect("prepared microphone input exists while activating")
+            .activate();
+        if let Err(error) = activation {
+            self.release_prepared_input();
+            // The caller can hold the service mutex here. Signal the parked
+            // worker, retain its ownership, and let AppState join it after
+            // releasing this mutex. Dropping the handle here could detach it.
+            let cleanup_error = native_runtime
+                .abort_before_arm()
+                .err()
+                .map(|cleanup| format!("could not abort parked native runtime: {cleanup}"));
+            if cleanup_error.is_some() {
+                let _ = native_runtime.request_shutdown();
+            }
+            self.retain_prearm_runtime_for_join(native_runtime);
+            self.fail(
+                capture_point_now(),
+                CaptureFailureCode::StreamStartFailed,
+                CaptureIssueCode::StreamStartFailed,
+                Some(prepared.device.name().to_owned()),
+                "could not activate microphone capture",
+            );
+            return Err(match cleanup_error {
+                Some(cleanup_error) => {
+                    format!("could not activate microphone capture: {error}; {cleanup_error}")
+                }
+                None => format!("could not activate microphone capture: {error}"),
+            });
+        }
+
+        self.runtime = Some(native_runtime);
+        self.touch();
+        Ok(CaptureStart {
+            anchor: prepared.anchor,
+            device: prepared.device,
+            sample_rate: prepared.sample_rate,
+            channels: prepared.channels,
+            runtime: dispatcher_runtime,
         })
+    }
+
+    /// Publish Recording and permit the native dispatcher to consume ingress
+    /// only after the caller has committed the session and capture audit rows.
+    pub fn arm_after_commit(&mut self) -> Result<CaptureStart, String> {
+        let prepared = self
+            .prepared_capture
+            .clone()
+            .ok_or_else(|| "microphone capture has not been prepared".to_owned())?;
+        if self.lifecycle.status() != CaptureStatus::AwaitingPermission {
+            return Err("microphone capture is not awaiting staged activation".to_owned());
+        }
+        if self.input.is_none() {
+            return Err("prepared microphone input is unavailable".to_owned());
+        }
+        let dispatcher_runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "native capture runtime has not been activated".to_owned())?
+            .runtime()
+            .map_err(|error| format!("could not inspect native capture runtime: {error}"))?;
+        // The CPAL stream is already playing while the capture-start bundle is
+        // made durable. Its cumulative drop counter therefore includes parked
+        // pre-commit backpressure, which is not part of this recording. Take
+        // the baseline before waking the dispatcher: any loss after this
+        // boundary remains visible as an explicit capture gap.
+        let dropped_packets_at_arm = self
+            .input
+            .as_ref()
+            .expect("prepared microphone input exists while arming")
+            .telemetry()
+            .dropped_packets;
+        self.set_armed_drop_baseline(dropped_packets_at_arm);
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "native capture runtime has not been activated".to_owned())?;
+        if let Err(error) = runtime.arm() {
+            let cleanup_error = self
+                .stop_input_and_request_runtime_shutdown()
+                .err()
+                .map(|cleanup| format!("could not stop parked native runtime: {cleanup}"));
+            self.fail(
+                capture_point_now(),
+                CaptureFailureCode::StreamStartFailed,
+                CaptureIssueCode::StreamStartFailed,
+                Some(prepared.device.name().to_owned()),
+                "could not arm native microphone capture",
+            );
+            return Err(match cleanup_error {
+                Some(cleanup_error) => {
+                    format!("could not arm native capture runtime: {error}; {cleanup_error}")
+                }
+                None => format!("could not arm native capture runtime: {error}"),
+            });
+        }
+        if let Err(error) = self.lifecycle.apply(MacOsCaptureEvent::CaptureStarted {
+            device: prepared.device.clone(),
+            at: prepared.anchor.clone(),
+        }) {
+            let cleanup_error = self
+                .stop_input_and_request_runtime_shutdown()
+                .err()
+                .map(|cleanup| format!("could not stop failed native capture: {cleanup}"));
+            self.fail(
+                capture_point_now(),
+                CaptureFailureCode::StreamStartFailed,
+                CaptureIssueCode::StreamStartFailed,
+                Some(prepared.device.name().to_owned()),
+                "could not publish active microphone capture",
+            );
+            return Err(match cleanup_error {
+                Some(cleanup_error) => {
+                    format!("could not publish active microphone capture: {error}; {cleanup_error}")
+                }
+                None => format!("could not publish active microphone capture: {error}"),
+            });
+        }
+        self.permission = MicrophonePermission::Granted;
+        self.touch();
+        Ok(CaptureStart {
+            anchor: prepared.anchor,
+            device: prepared.device,
+            sample_rate: prepared.sample_rate,
+            channels: prepared.channels,
+            runtime: dispatcher_runtime,
+        })
+    }
+
+    /// Cancel a played but unarmed staged start after its audit/session commit
+    /// fails. The producer is stopped before the runtime discards ingress, so
+    /// this path cannot manufacture an inference outcome or gap.
+    pub fn abort_after_failed_commit(&mut self) -> Result<Option<NativeCaptureRuntime>, String> {
+        if self.lifecycle.status() == CaptureStatus::Recording {
+            return Err("cannot abort a capture runtime after it has been armed".to_owned());
+        }
+
+        self.release_prepared_input();
+        let Some(runtime) = self.runtime.take() else {
+            self.cancel_prepared_lifecycle()?;
+            return Ok(None);
+        };
+        if let Err(error) = runtime.abort_before_arm() {
+            self.runtime = Some(runtime);
+            return Err(format!(
+                "could not abort parked native capture runtime: {error}"
+            ));
+        }
+        self.bridge = None;
+        self.meter = None;
+        if let Err(error) = self.cancel_prepared_lifecycle() {
+            self.retain_prearm_runtime_for_join(runtime);
+            return Err(error);
+        }
+        self.touch();
+        Ok(Some(runtime))
+    }
+
+    /// Kept for source compatibility while startup is staged. A caller must
+    /// supply a session- and segment-fenced dispatcher runtime before CPAL can
+    /// be activated safely.
+    pub fn start(&mut self) -> Result<CaptureStart, String> {
+        Err(
+            "microphone capture must use prepare, activate_with_runtime, and arm_after_commit"
+                .to_owned(),
+        )
     }
 
     pub fn stop(&mut self) -> Result<bool, String> {
         self.refresh();
-        self.flush_queue_overrun_gap();
-        let Some(mut input) = self.input.take() else {
+        let status = self.lifecycle.status();
+        if status == CaptureStatus::Recording {
+            self.flush_queue_overrun_gap();
+        }
+        let input = self.input.take();
+        let had_input = input.is_some();
+        let device = input
+            .as_ref()
+            .map(|input| input.device().clone())
+            .or_else(|| self.lifecycle.selected_device().cloned());
+        if let Some(mut input) = input {
+            input.stop();
+        }
+        self.prepared_capture = None;
+
+        let had_runtime = self.runtime.is_some();
+        if !had_input && !had_runtime && status == CaptureStatus::Idle {
             return Ok(false);
-        };
-        let device = input.device().clone();
-        input.stop();
+        }
+
+        if status == CaptureStatus::AwaitingPermission {
+            if let Some(runtime) = self.runtime.take() {
+                if let Err(error) = runtime.abort_before_arm() {
+                    self.runtime = Some(runtime);
+                    return Err(format!(
+                        "could not abort parked native capture runtime: {error}"
+                    ));
+                }
+                self.retain_prearm_runtime_for_join(runtime);
+            }
+            self.bridge = None;
+            self.meter = None;
+            self.cancel_prepared_lifecycle()?;
+            self.touch();
+            return Ok(true);
+        }
+
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime
+                .request_shutdown()
+                .map_err(|error| format!("could not stop native capture runtime: {error}"))?;
+        }
         if matches!(
-            self.lifecycle.status(),
-            CaptureStatus::Recording | CaptureStatus::Interrupted
+            status,
+            CaptureStatus::Recording | CaptureStatus::Interrupted | CaptureStatus::Failed
         ) {
-            self.lifecycle
-                .apply(MacOsCaptureEvent::CaptureStopped {
-                    device,
-                    at: capture_point_now(),
-                })
-                .map_err(|error| error.to_string())?;
+            // A failed staged start can own a parked runtime before
+            // `CaptureStarted` published a selected device. That runtime must
+            // still be drained, but there is no capture lifecycle stop event
+            // to emit. A recording or interrupted capture always has one.
+            if let Some(device) = device {
+                self.lifecycle
+                    .apply(MacOsCaptureEvent::CaptureStopped {
+                        device,
+                        at: capture_point_now(),
+                    })
+                    .map_err(|error| error.to_string())?;
+            } else if status != CaptureStatus::Failed {
+                return Err("active microphone capture has no selected input device".to_owned());
+            }
         }
         self.meter = None;
         self.touch();
-        Ok(true)
+        Ok(had_input || had_runtime || status != CaptureStatus::Failed)
     }
 
     fn refresh(&mut self) {
@@ -276,6 +780,43 @@ impl CaptureService {
             }
         }
 
+        let runtime_snapshot = match self.runtime.as_ref() {
+            Some(runtime) => match runtime.snapshot() {
+                Ok(snapshot) => Some(snapshot),
+                Err(_) => {
+                    if self.lifecycle.status() == CaptureStatus::Recording {
+                        self.fail_active_input(
+                            CaptureFailureCode::StreamStartFailed,
+                            CaptureIssueCode::StreamStartFailed,
+                        );
+                    }
+                    self.last_issue = Some(CaptureIssue {
+                        code: CaptureIssueCode::StreamStartFailed,
+                        device_name: self
+                            .input
+                            .as_ref()
+                            .map(|input| input.device().name().to_owned()),
+                    });
+                    self.touch();
+                    return;
+                }
+            },
+            None => None,
+        };
+        let next_bridge = runtime_snapshot
+            .as_ref()
+            .map(CaptureBridgeProjection::from_snapshot);
+        if self.bridge != next_bridge {
+            self.bridge = next_bridge;
+            self.touch();
+        }
+
+        // Before arm, the runtime is intentionally parked. Its meter and
+        // ingress drops are not yet part of a committed capture timeline.
+        if self.lifecycle.status() != CaptureStatus::Recording {
+            return;
+        }
+
         let Some((telemetry, device_name)) = self
             .input
             .as_ref()
@@ -283,10 +824,17 @@ impl CaptureService {
         else {
             return;
         };
+        let Some(runtime_snapshot) = runtime_snapshot else {
+            self.fail_active_input(
+                CaptureFailureCode::StreamStartFailed,
+                CaptureIssueCode::StreamStartFailed,
+            );
+            return;
+        };
         let next_meter = CaptureMeter {
-            rms_dbfs: telemetry.rms_dbfs,
-            peak_dbfs: telemetry.peak_dbfs,
-            clipping: telemetry.clipping,
+            rms_dbfs: runtime_snapshot.meter.rms_dbfs,
+            peak_dbfs: runtime_snapshot.meter.peak_dbfs,
+            clipping: runtime_snapshot.meter.clipping,
             dropped_packets: telemetry.dropped_packets,
         };
         if self.meter.as_ref() != Some(&next_meter) {
@@ -326,6 +874,10 @@ impl CaptureService {
         };
         let device = input.device().clone();
         input.stop();
+        self.prepared_capture = None;
+        if let Some(runtime) = self.runtime.as_ref() {
+            let _ = runtime.request_shutdown();
+        }
         let at = capture_point_now();
         self.flush_queue_overrun_gap();
         self.record_input_device_unavailable_gap(at.clone());
@@ -362,6 +914,13 @@ impl CaptureService {
         });
     }
 
+    fn set_armed_drop_baseline(&mut self, dropped_packets: u64) {
+        self.observed_dropped_packets = dropped_packets;
+        // A parked runtime must not contribute a physical discontinuity to
+        // the session that starts at the durable arm boundary.
+        self.active_queue_overrun_gap = None;
+    }
+
     fn record_input_device_unavailable_gap(&mut self, observed_at: CapturePoint) {
         self.record_pending_gap(CaptureGapReason::InputDeviceUnavailable, observed_at);
     }
@@ -381,17 +940,26 @@ impl CaptureService {
     }
 
     fn enqueue_pending_gap(&mut self, gap: CaptureGap) {
-        if let Some(previous) = self.pending_gaps.back_mut() {
-            if previous.reason == gap.reason
-                && gap.started_at.monotonic_ns >= previous.ended_at.monotonic_ns
-            {
-                previous.ended_at = gap.ended_at;
-                return;
+        let can_merge_tail = self.active_gap_lease.is_none() || self.pending_gaps.len() > 1;
+        if can_merge_tail {
+            if let Some(previous) = self.pending_gaps.back_mut() {
+                if previous.reason == gap.reason
+                    && gap.started_at.monotonic_ns >= previous.ended_at.monotonic_ns
+                {
+                    previous.ended_at = gap.ended_at;
+                    return;
+                }
             }
         }
 
         if self.pending_gaps.len() == MAX_PENDING_GAPS {
-            self.pending_gaps.pop_front();
+            if self.active_gap_lease.is_some() {
+                // Never evict the lease currently being persisted. This keeps
+                // an SQLite retry bound to the exact gap it claimed.
+                self.pending_gaps.remove(1);
+            } else {
+                self.pending_gaps.pop_front();
+            }
         }
         self.pending_gaps.push_back(gap);
     }
@@ -403,6 +971,10 @@ impl CaptureService {
             .map(|input| input.device().name().to_owned());
         if let Some(mut input) = self.input.take() {
             input.stop();
+        }
+        self.prepared_capture = None;
+        if let Some(runtime) = self.runtime.as_ref() {
+            let _ = runtime.request_shutdown();
         }
         self.flush_queue_overrun_gap();
         self.fail(
@@ -445,20 +1017,112 @@ impl CaptureService {
         self.touch();
     }
 
+    fn require_active_gap_lease(&self, token: u64) -> Result<&CaptureGapLease, String> {
+        let lease = self
+            .active_gap_lease
+            .as_ref()
+            .ok_or_else(|| "no capture gap delivery is active".to_owned())?;
+        if lease.token != token {
+            return Err("capture gap delivery token does not match the active lease".to_owned());
+        }
+        Ok(lease)
+    }
+
+    fn release_prepared_input(&mut self) {
+        if let Some(mut input) = self.input.take() {
+            input.stop();
+        }
+        self.prepared_capture = None;
+    }
+
+    fn retain_prearm_runtime_for_join(&mut self, runtime: NativeCaptureRuntime) {
+        self.prearm_runtimes_for_join.push_back(runtime);
+    }
+
+    fn stop_input_and_request_runtime_shutdown(&mut self) -> Result<(), String> {
+        self.release_prepared_input();
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime
+                .request_shutdown()
+                .map_err(|error| format!("could not stop native capture runtime: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn cancel_prepared_lifecycle(&mut self) -> Result<(), String> {
+        if self.lifecycle.status() == CaptureStatus::AwaitingPermission {
+            self.lifecycle
+                .cancel_preparation(capture_point_now())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     fn touch(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }
+}
+
+fn preflight_input_sample_rate(sample_rate: u32) -> Result<(), String> {
+    if SUPPORTED_CAPTURE_SAMPLE_RATES.contains(&sample_rate) {
+        return Ok(());
+    }
+    Err(format!(
+        "microphone sample rate {sample_rate} Hz is unsupported; only 16000 Hz and 48000 Hz inputs are currently supported"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{DateTime, Duration, Utc};
+    use std::time::{Duration as StdDuration, Instant};
+    use uuid::Uuid;
 
     fn point(monotonic_ns: u64, milliseconds: i64) -> CapturePoint {
         CapturePoint {
             monotonic_ns,
             wall_clock: DateTime::<Utc>::UNIX_EPOCH + Duration::milliseconds(milliseconds),
+        }
+    }
+
+    fn prearm_runtime() -> NativeCaptureRuntime {
+        let anchor = point(1_000, 1);
+        let ingress = crate::audio::CaptureIngress::new(2, 160).unwrap();
+        let runtime = DispatcherRuntime::new(
+            crate::audio::DispatcherRuntimeId::generate(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            anchor.clone(),
+        )
+        .unwrap();
+        NativeCaptureRuntime::new(
+            ingress,
+            runtime,
+            CaptureClock::new(anchor, 16_000).unwrap(),
+            NativeCaptureRuntimeConfig {
+                idle_wait: StdDuration::from_millis(1),
+                ..NativeCaptureRuntimeConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_device() -> MacOsInputDevice {
+        MacOsInputDevice::new("test-input", "Test microphone").unwrap()
+    }
+
+    fn wait_for_drained_runtime(service: &mut CaptureService) -> NativeCaptureRuntime {
+        let deadline = Instant::now() + StdDuration::from_secs(1);
+        loop {
+            if let Some(runtime) = service.take_drained_native_runtime().unwrap() {
+                return runtime;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native capture runtime did not drain after shutdown"
+            );
+            std::thread::sleep(StdDuration::from_millis(1));
         }
     }
 
@@ -509,6 +1173,159 @@ mod tests {
             }]
         );
         assert!(service.take_pending_gaps().is_empty());
+    }
+
+    #[test]
+    fn arm_drop_baseline_excludes_parked_queue_overruns() {
+        let mut service = CaptureService::new();
+
+        service.observe_dropped_packets(4, point(20, 20));
+        service.set_armed_drop_baseline(4);
+        service.observe_dropped_packets(4, point(30, 30));
+        assert!(service.take_pending_gaps().is_empty());
+
+        service.observe_dropped_packets(5, point(40, 40));
+        service.flush_queue_overrun_gap();
+        assert_eq!(
+            service.take_pending_gaps(),
+            vec![CaptureGap {
+                started_at: point(40, 40),
+                ended_at: point(40, 40),
+                reason: CaptureGapReason::QueueOverrun,
+            }]
+        );
+    }
+
+    #[test]
+    fn capture_gap_lease_retries_the_same_gap_until_commit() {
+        let mut service = CaptureService::new();
+        let gap = CaptureGap {
+            started_at: point(20, 20),
+            ended_at: point(40, 40),
+            reason: CaptureGapReason::QueueOverrun,
+        };
+        service.pending_gaps.push_back(gap.clone());
+
+        let first = service.begin_pending_gap().unwrap().unwrap();
+        assert_eq!(first.gap(), &gap);
+        assert!(service.take_pending_gaps().is_empty());
+        assert!(service
+            .commit_pending_gap(first.token().saturating_add(1))
+            .is_err());
+
+        service.abort_pending_gap(first.token()).unwrap();
+        let retry = service.begin_pending_gap().unwrap().unwrap();
+        assert_ne!(retry.token(), first.token());
+        assert_eq!(retry.gap(), &gap);
+
+        service.commit_pending_gap(retry.token()).unwrap();
+        assert!(service.begin_pending_gap().unwrap().is_none());
+    }
+
+    #[test]
+    fn leased_head_is_not_coalesced_with_a_later_gap() {
+        let mut service = CaptureService::new();
+        service.record_pending_gap(CaptureGapReason::QueueOverrun, point(20, 20));
+        let lease = service.begin_pending_gap().unwrap().unwrap();
+
+        service.record_pending_gap(CaptureGapReason::QueueOverrun, point(40, 40));
+
+        assert_eq!(lease.gap().ended_at, point(20, 20));
+        service.commit_pending_gap(lease.token()).unwrap();
+        let later = service.begin_pending_gap().unwrap().unwrap();
+        assert_eq!(later.gap().started_at, point(40, 40));
+    }
+
+    #[test]
+    fn preflight_accepts_only_the_supported_native_input_rates() {
+        assert!(preflight_input_sample_rate(16_000).is_ok());
+        assert!(preflight_input_sample_rate(48_000).is_ok());
+        assert!(preflight_input_sample_rate(44_100)
+            .unwrap_err()
+            .contains("44100"));
+    }
+
+    #[test]
+    fn bridge_projection_serializes_only_status_and_compact_metrics() {
+        let bridge = CaptureBridgeProjection::from_snapshot(&NativeCaptureRuntimeSnapshot {
+            status: NativeCaptureRuntimeStatus::Armed,
+            dispatcher_status: crate::audio::DispatcherStatus::Running,
+            armed: true,
+            shutdown_requested: false,
+            worker_finished: false,
+            meter: crate::audio::DispatcherMeter::default(),
+            metrics: AsrQueueMetrics {
+                ingress_packets_consumed: 4,
+                job_queue_depth: 1,
+                unavailable_engine_outcomes: 2,
+                ..AsrQueueMetrics::default()
+            },
+        });
+
+        let encoded = serde_json::to_string(&bridge).unwrap();
+        assert!(encoded.contains("unavailableEngineOutcomes"));
+        assert!(!encoded.contains("samples"));
+        assert!(!encoded.contains("text"));
+    }
+
+    #[test]
+    fn prearm_failure_runtime_is_explicitly_transferred_for_lock_external_join() {
+        let mut service = CaptureService::new();
+        let runtime = prearm_runtime();
+        runtime.abort_before_arm().unwrap();
+        service.retain_prearm_runtime_for_join(runtime);
+
+        let mut cleanup = service
+            .take_prearm_runtime_for_join()
+            .expect("aborted pre-arm runtime stays owned until the caller retrieves it");
+        cleanup.join_after_abort().unwrap();
+
+        assert!(service.take_prearm_runtime_for_join().is_none());
+    }
+
+    #[test]
+    fn stop_cleans_up_a_parked_runtime_after_input_was_already_released() {
+        let mut service = CaptureService::new();
+        service
+            .lifecycle
+            .begin_permission_resolution(point(10, 10))
+            .unwrap();
+        service.runtime = Some(prearm_runtime());
+
+        assert!(service.stop().unwrap());
+        assert_eq!(service.lifecycle.status(), CaptureStatus::Idle);
+
+        let mut runtime = service
+            .take_prearm_runtime_for_join()
+            .expect("the parked runtime stays available for lock-external cleanup");
+        runtime.join_after_abort().unwrap();
+        assert!(!service.stop().unwrap());
+    }
+
+    #[test]
+    fn stop_retries_runtime_shutdown_after_input_was_already_released() {
+        let mut service = CaptureService::new();
+        let device = test_device();
+        service
+            .lifecycle
+            .apply(MacOsCaptureEvent::CaptureStarted {
+                device,
+                at: point(10, 10),
+            })
+            .unwrap();
+        let runtime = prearm_runtime();
+        runtime.arm().unwrap();
+        service.runtime = Some(runtime);
+
+        assert!(service.stop().unwrap());
+        assert_eq!(service.lifecycle.status(), CaptureStatus::Idle);
+        // The first stop may have already stopped CPAL. Keep signalling the
+        // native worker until ownership is handed off for its final join.
+        assert!(service.stop().unwrap());
+
+        let mut runtime = wait_for_drained_runtime(&mut service);
+        assert!(runtime.join_if_drained().unwrap());
+        assert!(!service.stop().unwrap());
     }
 
     #[test]

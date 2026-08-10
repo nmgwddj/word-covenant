@@ -4,8 +4,10 @@ mod clock;
 mod cpal_input;
 #[cfg(any(test, debug_assertions))]
 mod development_mock;
+mod dispatcher;
 mod lifecycle;
 mod macos;
+mod native_runtime;
 #[cfg(target_os = "macos")]
 mod service;
 #[cfg(any(test, debug_assertions))]
@@ -25,6 +27,12 @@ pub use cpal_input::{
 pub use development_mock::{
     DevelopmentMockProgress, DevelopmentMockRunner, DEVELOPMENT_MOCK_MAX_PACKETS_PER_ADVANCE,
 };
+pub use dispatcher::{
+    AsrBridgeConfig, AsrJob, AsrJobMetadata, AsrOutcome, AsrQueueMetrics, CaptureDispatcher,
+    DispatcherError, DispatcherMeter, DispatcherRuntime, DispatcherRuntimeId, DispatcherStatus,
+    IngressPumpResult, OwnedOutcomeLease, OwnedOutcomeLeaseError, ShutdownDrainResult,
+    WorkerPumpResult,
+};
 pub use lifecycle::{
     CaptureFailureCode, CaptureLifecycle, CaptureLifecycleAction, CaptureLifecycleError,
     CaptureLifecycleFailure, CaptureStatus,
@@ -33,9 +41,14 @@ pub use macos::{
     MacOsCaptureAdapter, MacOsCaptureCallbackSink, MacOsCaptureError, MacOsCaptureEvent,
     MacOsInputCallback, MacOsInputDevice,
 };
+pub use native_runtime::{
+    NativeCaptureRuntime, NativeCaptureRuntimeConfig, NativeCaptureRuntimeError,
+    NativeCaptureRuntimeSnapshot, NativeCaptureRuntimeStatus,
+};
 #[cfg(target_os = "macos")]
 pub use service::{
-    CaptureIssue, CaptureIssueCode, CaptureMeter, CaptureProjection, CaptureService, CaptureStart,
+    CaptureBridgeProjection, CaptureBridgeStatus, CaptureGapLease, CaptureIssue, CaptureIssueCode,
+    CaptureMeter, CapturePreparation, CaptureProjection, CaptureService, CaptureStart,
 };
 #[cfg(any(test, debug_assertions))]
 pub use test_source::{CaptureSource, TestCaptureSource};

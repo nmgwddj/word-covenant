@@ -1,5 +1,6 @@
 #[cfg(all(target_os = "macos", not(test)))]
-use crate::audio::CaptureStart;
+use crate::audio::{capture_point_now, CaptureStart, DispatcherRuntimeId};
+use crate::audio::{AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime};
 #[cfg(target_os = "macos")]
 use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
 #[cfg(any(test, debug_assertions))]
@@ -14,9 +15,11 @@ use crate::domain::{
     CaptureSession, DataCategory, TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
     TranscriptSpan, TranscriptTiming,
 };
+use crate::inference::asr::MAX_ASR_EMISSIONS_PER_REQUEST;
 use crate::inference::model_registry::{ModelImportRequest, ModelRegistry, RegisteredModel};
 use crate::inference::{
-    AsrResponse, MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionMapper,
+    AsrResponse, InferenceGap, InferenceGapReason, InferenceGapStage, MappedTranscriptEmission,
+    TranscriptEmission, TranscriptEmissionKind, TranscriptEmissionMapper,
 };
 use crate::policy::{EgressApproval, EgressPolicy, EgressRequest, PolicyDecision, PolicyReason};
 use chrono::{DateTime, Utc};
@@ -54,6 +57,33 @@ pub struct AgentAction {
     pub kind: String,
 }
 
+/// The application-owned lifecycle fence for one native dispatcher generation.
+///
+/// A capture service can only expose one live native runtime, but this fence
+/// deliberately lives beside session state. It prevents a delayed worker
+/// outcome from an earlier generation from entering a restarted session.
+#[derive(Clone, Debug)]
+struct NativeRuntimeFence {
+    runtime: DispatcherRuntime,
+    phase: NativeRuntimePhase,
+    capture_input_stopped_audited: bool,
+    capture_stop_point: Option<CapturePoint>,
+}
+
+#[derive(Clone, Debug)]
+struct NativeCaptureStop {
+    runtime: DispatcherRuntime,
+    point: CapturePoint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeRuntimePhase {
+    Active,
+    Closing,
+    Handoff,
+    Drained,
+}
+
 pub struct AppState {
     started_at: Instant,
     sessions: Mutex<BTreeMap<Uuid, CaptureSession>>,
@@ -64,9 +94,14 @@ pub struct AppState {
     audit_store: Mutex<AuditStore>,
     model_registry: Mutex<ModelRegistry>,
     inference_mapper: Mutex<TranscriptEmissionMapper>,
+    native_runtime: Mutex<Option<NativeRuntimeFence>>,
     model_root: Option<PathBuf>,
     #[cfg(target_os = "macos")]
     capture_service: Mutex<CaptureService>,
+    /// Serializes the externally visible start/stop transition. CPAL must not
+    /// be stopped between the durable start bundle and dispatcher arm.
+    #[cfg(target_os = "macos")]
+    native_capture_lifecycle: Mutex<()>,
     #[cfg(any(test, debug_assertions))]
     development_mock: Mutex<Option<DevelopmentMockRunner>>,
 }
@@ -125,9 +160,12 @@ impl AppState {
             audit_store: Mutex::new(audit_store),
             model_registry: Mutex::new(model_registry),
             inference_mapper: Mutex::new(TranscriptEmissionMapper::default()),
+            native_runtime: Mutex::new(None),
             model_root,
             #[cfg(target_os = "macos")]
             capture_service: Mutex::new(CaptureService::new()),
+            #[cfg(target_os = "macos")]
+            native_capture_lifecycle: Mutex::new(()),
             #[cfg(any(test, debug_assertions))]
             development_mock: Mutex::new(None),
         })
@@ -198,20 +236,20 @@ impl AppState {
 
     #[cfg(target_os = "macos")]
     pub fn capture_projection(&self) -> Result<CaptureProjection, String> {
-        let (projection, gaps) = {
-            let mut service = self
-                .capture_service
-                .lock()
-                .map_err(|_| "capture service lock poisoned".to_owned())?;
-            let projection = service.projection();
-            let gaps = service.take_pending_gaps();
-            (projection, gaps)
-        };
+        // A failed SessionStopped transaction leaves the dispatcher fence in
+        // Drained state so the exact capture-clock stop point is retryable.
+        // Projection polling is the normal native heartbeat, so use it to
+        // finish that narrow, durable-only tail before returning stale live
+        // state to the frontend.
+        self.retry_drained_native_session_stop_from_projection()?;
+        let projection = self
+            .capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .projection();
         if let Some(session) = self.active_recording_session()? {
-            if let Err(error) = self.record_capture_gaps(session.id, gaps) {
-                let _ = self.stop_session();
-                return Err(error);
-            }
+            self.pump_capture_gaps(session.id)?;
+            self.pump_native_outcomes()?;
         }
         if matches!(
             projection.status,
@@ -234,31 +272,92 @@ impl AppState {
     #[cfg(target_os = "macos")]
     #[cfg(not(test))]
     fn start_microphone_session(&self) -> Result<CaptureSession, String> {
-        if let Some(active) = self.active_recording_session()? {
-            return Ok(active);
+        let native_lifecycle = self
+            .native_capture_lifecycle
+            .lock()
+            .map_err(|_| "native capture lifecycle lock poisoned".to_owned())?;
+        if let Some(active) = self.active_live_session()? {
+            if let Some(fence) = self.native_runtime_fence()? {
+                if fence.runtime.session_id == active.id
+                    && fence.phase != NativeRuntimePhase::Active
+                {
+                    return Err("a native capture session is still starting or draining".to_owned());
+                }
+            }
+            if matches!(active.state, crate::domain::SessionState::Recording) {
+                return Ok(active);
+            }
+            return Err("a native capture session is still starting or draining".to_owned());
         }
 
-        let capture_start = self
+        let preparation = self
             .capture_service
             .lock()
             .map_err(|_| "capture service lock poisoned".to_owned())?
-            .start()?;
-        let session = match self.start_session_at(capture_start.anchor.clone(), false) {
-            Ok(session) => session,
+            .prepare()?;
+        let session_id = Uuid::new_v4();
+        let runtime = DispatcherRuntime::new(
+            DispatcherRuntimeId::generate(),
+            session_id,
+            Uuid::new_v4(),
+            preparation.anchor.clone(),
+        )?;
+        let capture_start = match self
+            .capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .activate_with_runtime(runtime.clone())
+        {
+            Ok(capture_start) => capture_start,
             Err(error) => {
-                let _ = self
-                    .capture_service
-                    .lock()
-                    .map_err(|_| "capture service lock poisoned".to_owned())
-                    .and_then(|mut service| service.stop().map(|_| ()));
-                return Err(error);
+                return Err(with_staged_capture_cleanup(
+                    error,
+                    self.abort_staged_native_capture(),
+                ));
             }
         };
-        if let Err(error) = self.record_capture_started(&session, &capture_start) {
-            let _ = self.stop_session();
-            return Err(error);
+        if capture_start.runtime != runtime {
+            let cleanup = self.abort_staged_native_capture();
+            return Err(with_staged_capture_cleanup(
+                "activated native runtime does not match its requested generation".to_owned(),
+                cleanup,
+            ));
         }
-        Ok(session)
+
+        let _staged_session = match self.commit_native_capture_start(session_id, &capture_start) {
+            Ok(session) => session,
+            Err(error) => {
+                return Err(with_staged_capture_cleanup(
+                    error,
+                    self.abort_staged_native_capture(),
+                ));
+            }
+        };
+        let arm_result = {
+            let mut service = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?;
+            service.arm_after_commit()
+        };
+        let publish_result = arm_result.and_then(|armed_start| {
+            if armed_start.runtime != capture_start.runtime {
+                return Err(
+                    "armed native runtime does not match its committed generation".to_owned(),
+                );
+            }
+            self.publish_native_capture_recording(&capture_start.runtime)
+        });
+        // `stop_session` takes the same transition lock. Release it before
+        // entering the standard post-commit drain path for an arm failure.
+        drop(native_lifecycle);
+        match publish_result {
+            Ok(session) => Ok(session),
+            Err(error) => Err(with_staged_capture_cleanup(
+                error,
+                self.stop_session().map(|_| ()),
+            )),
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -279,13 +378,48 @@ impl AppState {
             })
     }
 
+    fn active_live_session(&self) -> Result<Option<CaptureSession>, String> {
+        self.sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())
+            .map(|sessions| {
+                sessions
+                    .values()
+                    .find(|session| {
+                        matches!(
+                            session.state,
+                            crate::domain::SessionState::Starting
+                                | crate::domain::SessionState::Recording
+                        )
+                    })
+                    .cloned()
+            })
+    }
+
     #[cfg(all(target_os = "macos", not(test)))]
-    fn record_capture_started(
+    fn commit_native_capture_start(
         &self,
-        session: &CaptureSession,
+        session_id: Uuid,
         capture_start: &CaptureStart,
-    ) -> Result<(), String> {
-        let segment = CaptureSegment::new(
+    ) -> Result<CaptureSession, String> {
+        if capture_start.runtime.session_id != session_id {
+            return Err(
+                "native capture start session does not match its dispatcher runtime".to_owned(),
+            );
+        }
+        if capture_start.runtime.capture_anchor != capture_start.anchor {
+            return Err(
+                "native capture start anchor does not match its dispatcher runtime".to_owned(),
+            );
+        }
+        validate_dispatcher_runtime(&capture_start.runtime)?;
+        let session = CaptureSession::begin_starting_with_id(
+            session_id,
+            capture_start.anchor.monotonic_ns,
+            capture_start.anchor.wall_clock,
+        )?;
+        let segment = CaptureSegment::new_with_id(
+            capture_start.runtime.capture_segment_id,
             session.id,
             capture_start.device.uid(),
             capture_start.device.name(),
@@ -294,22 +428,111 @@ impl AppState {
             capture_start.anchor.monotonic_ns,
             capture_start.anchor.wall_clock,
         )?;
-        self.record_capture_segment(&segment)?;
-        self.record_audit(
-            AuditKind::CaptureInputStarted,
-            capture_start.anchor.monotonic_ns,
-            &serde_json::json!({
-                "sessionId": session.id,
-                "deviceUid": capture_start.device.uid(),
-                "deviceName": capture_start.device.name(),
-                "sampleRate": capture_start.sample_rate,
-                "channels": capture_start.channels,
-                "anchor": capture_start.anchor,
-            }),
-        )
+        let input_started_payload = serde_json::json!({
+            "sessionId": session.id,
+            "runtimeId": capture_start.runtime.id.as_uuid(),
+            "captureSegmentId": segment.id,
+            "deviceUid": capture_start.device.uid(),
+            "deviceName": capture_start.device.name(),
+            "sampleRate": capture_start.sample_rate,
+            "channels": capture_start.channels,
+            "anchor": capture_start.anchor,
+        });
+
+        // Acquire every fallible projection lock before committing the audit
+        // bundle. A failed staged start then leaves neither an active in-memory
+        // session nor any partial durable start records. The native runtime
+        // fence is acquired here too, so registering its generation cannot
+        // fail after the immutable start bundle has committed.
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        if native_runtime.is_some() {
+            return Err("a native dispatcher runtime is already registered".to_owned());
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?;
+        if sessions
+            .values()
+            .any(|session| matches!(session.state, crate::domain::SessionState::Recording))
+        {
+            return Err(
+                "a recording session became active while microphone capture was preparing"
+                    .to_owned(),
+            );
+        }
+        let mut timelines = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut staged_trail = trail.clone();
+        let session_started = staged_trail
+            .next_event(
+                Some(session.id),
+                None,
+                AuditKind::SessionStarted,
+                session.started_monotonic_ns,
+                session.started_at,
+                &session,
+            )
+            .map_err(|error| format!("could not serialize capture session start: {error}"))?;
+        assert!(staged_trail.append_event(session_started.clone()));
+        let segment_recorded = staged_trail
+            .next_event(
+                Some(session.id),
+                None,
+                AuditKind::CaptureSegmentRecorded,
+                segment.anchor_monotonic_ns,
+                segment.anchor_wall_clock,
+                &segment,
+            )
+            .map_err(|error| format!("could not serialize capture segment: {error}"))?;
+        assert!(staged_trail.append_event(segment_recorded.clone()));
+        let input_started = staged_trail
+            .next_event(
+                Some(session.id),
+                None,
+                AuditKind::CaptureInputStarted,
+                capture_start.anchor.monotonic_ns,
+                capture_start.anchor.wall_clock,
+                &input_started_payload,
+            )
+            .map_err(|error| format!("could not serialize capture input start: {error}"))?;
+
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .append_capture_start_bundle_with_audit(
+                &session,
+                &segment,
+                &session_started,
+                &segment_recorded,
+                &input_started,
+                &input_started_payload,
+            )
+            .map_err(|error| format!("could not persist native capture start: {error}"))?;
+        assert!(trail.append_event(session_started));
+        assert!(trail.append_event(segment_recorded));
+        assert!(trail.append_event(input_started));
+        timelines.entry(session.id).or_default();
+        sessions.insert(session.id, session.clone());
+        *native_runtime = Some(NativeRuntimeFence {
+            runtime: capture_start.runtime.clone(),
+            phase: NativeRuntimePhase::Active,
+            capture_input_stopped_audited: false,
+            capture_stop_point: None,
+        });
+        Ok(session)
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", test))]
     fn record_capture_segment(&self, segment: &CaptureSegment) -> Result<(), String> {
         let mut trail = self
             .audit_trail
@@ -332,14 +555,6 @@ impl AppState {
             .map_err(|error| format!("could not persist capture segment: {error}"))?;
         if !trail.append_event(event) {
             return Err("could not append verified capture segment event".to_owned());
-        }
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
-    fn record_capture_gaps(&self, session_id: Uuid, gaps: Vec<CaptureGap>) -> Result<(), String> {
-        for gap in gaps {
-            self.record_capture_gap(session_id, &gap)?;
         }
         Ok(())
     }
@@ -371,6 +586,778 @@ impl AppState {
         Ok(())
     }
 
+    /// Persist every currently claimable physical discontinuity. Claim and
+    /// acknowledgement hold the service mutex briefly; SQLite and audit work
+    /// deliberately occur after that mutex is released.
+    #[cfg(target_os = "macos")]
+    fn pump_capture_gaps(&self, session_id: Uuid) -> Result<usize, String> {
+        let mut persisted = 0;
+        loop {
+            let lease = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?
+                .begin_pending_gap()?;
+            let Some(lease) = lease else {
+                return Ok(persisted);
+            };
+            let token = lease.token();
+            let persistence = self.record_capture_gap(session_id, lease.gap());
+            match persistence {
+                Ok(()) => {
+                    self.capture_service
+                        .lock()
+                        .map_err(|_| "capture service lock poisoned".to_owned())?
+                        .commit_pending_gap(token)?;
+                    persisted += 1;
+                }
+                Err(error) => {
+                    let abort = self
+                        .capture_service
+                        .lock()
+                        .map_err(|_| "capture service lock poisoned".to_owned())?
+                        .abort_pending_gap(token);
+                    return match abort {
+                        Ok(()) => Err(error),
+                        Err(abort_error) => Err(format!(
+                            "{error}; could not release capture gap delivery for retry: {abort_error}"
+                        )),
+                    };
+                }
+            }
+        }
+    }
+
+    /// Persist every currently claimable native outcome under the currently
+    /// registered fence. Native dispatcher locks are never held while a
+    /// transcript, gap, or audit event is written to SQLite.
+    #[cfg(target_os = "macos")]
+    fn pump_native_outcomes(&self) -> Result<usize, String> {
+        let Some(runtime) = self.native_runtime_context()? else {
+            return Ok(0);
+        };
+        let service_runtime = self
+            .capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .runtime_context()?;
+        if service_runtime.as_ref() != Some(&runtime) {
+            return Err("native capture service runtime does not match the state fence".to_owned());
+        }
+
+        let mut persisted = 0;
+        loop {
+            let lease = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?
+                .begin_native_outcome()?;
+            let Some(lease) = lease else {
+                return Ok(persisted);
+            };
+            let token = lease.token();
+            let persistence = self.persist_native_outcome(&runtime, lease.outcome());
+            match persistence {
+                Ok(_) => {
+                    self.capture_service
+                        .lock()
+                        .map_err(|_| "capture service lock poisoned".to_owned())?
+                        .commit_native_outcome(token)?;
+                    persisted += 1;
+                }
+                Err(error) => {
+                    let abort = self
+                        .capture_service
+                        .lock()
+                        .map_err(|_| "capture service lock poisoned".to_owned())?
+                        .abort_native_outcome(token);
+                    return match abort {
+                        Ok(()) => Err(error),
+                        Err(abort_error) => Err(format!(
+                            "{error}; could not release native outcome delivery for retry: {abort_error}"
+                        )),
+                    };
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn abort_staged_native_capture(&self) -> Result<(), String> {
+        let aborted_runtime = self
+            .capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .abort_after_failed_commit();
+        let mut failures = Vec::new();
+        match aborted_runtime {
+            Ok(Some(mut runtime)) => {
+                if let Err(error) = runtime.join_after_abort() {
+                    failures.push(format!(
+                        "could not join aborted native capture runtime: {error}"
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => failures.push(error),
+        }
+
+        // Activation can fail after constructing its parked worker but before
+        // returning a CaptureStart. CaptureService retains that worker until
+        // it is explicitly moved here and joined outside its mutex.
+        loop {
+            let runtime = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?
+                .take_prearm_runtime_for_join();
+            let Some(mut runtime) = runtime else {
+                break;
+            };
+            if let Err(error) = runtime.join_after_abort() {
+                failures.push(format!(
+                    "could not join aborted native capture runtime: {error}"
+                ));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn stop_native_capture_before_session_stop(&self) -> Result<Option<NativeCaptureStop>, String> {
+        let Some(fence) = self.native_runtime_fence()? else {
+            let service_runtime = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?
+                .runtime_context()?;
+            if service_runtime.is_some() {
+                return Err("native capture runtime is missing its state fence".to_owned());
+            }
+            return Ok(None);
+        };
+        let runtime = fence.runtime;
+        match fence.phase {
+            NativeRuntimePhase::Drained => {
+                return self
+                    .finish_drained_native_runtime(&runtime)
+                    .map(|point| Some(NativeCaptureStop { runtime, point }))
+            }
+            NativeRuntimePhase::Handoff => {
+                return Err("native capture shutdown handoff is already in progress".to_owned())
+            }
+            NativeRuntimePhase::Active | NativeRuntimePhase::Closing => {}
+        }
+
+        self.begin_native_runtime_shutdown(&runtime)?;
+        self.capture_service
+            .lock()
+            .map_err(|_| "capture service lock poisoned".to_owned())?
+            .stop()?;
+        self.capture_native_stop_point(&runtime, capture_point_now().monotonic_ns)?;
+
+        loop {
+            self.pump_capture_gaps(runtime.session_id)?;
+            self.pump_native_outcomes()?;
+
+            // Claim state-side ownership before removing the runtime from the
+            // service. Projection polling then sees an explicit handoff phase
+            // rather than treating the short transfer as a stale generation.
+            self.begin_native_runtime_handoff(&runtime)?;
+            let drained_runtime = match self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?
+                .take_drained_native_runtime()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.restore_native_runtime_closing(&runtime)?;
+                    return Err(error);
+                }
+            };
+            let Some(mut drained_runtime) = drained_runtime else {
+                self.restore_native_runtime_closing(&runtime)?;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            };
+
+            // `take_drained_native_runtime` verifies the dispatcher is
+            // terminal before moving it. Record that ownership change first;
+            // a worker panic during join is therefore retryable without a
+            // service/fence mismatch.
+            self.mark_native_runtime_drained(&runtime)?;
+            let joined = drained_runtime
+                .join_if_drained()
+                .map_err(|error| format!("could not join native capture runtime: {error}"))?;
+            if !joined {
+                return Err("native capture runtime was removed before it drained".to_owned());
+            }
+            return self
+                .finish_drained_native_runtime(&runtime)
+                .map(|point| Some(NativeCaptureStop { runtime, point }));
+        }
+    }
+
+    fn finish_drained_native_runtime(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<CapturePoint, String> {
+        // All queue-owned results are terminal before we discard transient
+        // mapper state. Keeping the Drained fence through the two following
+        // durable steps makes a failed stop safe to retry.
+        let capture_stop_point = self.native_capture_stop_point(runtime)?;
+        self.clear_local_asr_session(runtime.session_id)?;
+        if self.native_runtime_needs_capture_input_stop_event(runtime)? {
+            self.record_native_capture_input_stopped(runtime, &capture_stop_point)?;
+            self.mark_native_capture_input_stopped(runtime)?;
+        }
+        Ok(capture_stop_point)
+    }
+
+    /// Complete the durable tail of a native stop that had already drained
+    /// before an earlier `SessionStopped` write failed. This is deliberately
+    /// driven from the compact projection poll: users otherwise have no
+    /// visible action that can release a live session whose microphone is
+    /// already idle.
+    #[cfg(target_os = "macos")]
+    fn retry_drained_native_session_stop_from_projection(&self) -> Result<bool, String> {
+        let _native_lifecycle = self
+            .native_capture_lifecycle
+            .lock()
+            .map_err(|_| "native capture lifecycle lock poisoned".to_owned())?;
+        let fence = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?
+            .clone();
+        let Some(fence) = fence else {
+            return Ok(false);
+        };
+        if fence.phase != NativeRuntimePhase::Drained {
+            return Ok(false);
+        }
+
+        let Some(session) = self.active_live_session()? else {
+            return Ok(false);
+        };
+        if session.id != fence.runtime.session_id {
+            return Err("drained native dispatcher does not match the live session".to_owned());
+        }
+
+        let stop_point = self.finish_drained_native_runtime(&fence.runtime)?;
+        let stopped = self.finish_capture_session_at(stop_point)?;
+        if stopped.is_none() {
+            return Err("live native session disappeared before stop finalization".to_owned());
+        }
+        self.clear_native_runtime_after_drain(&fence.runtime)?;
+        Ok(true)
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn native_runtime_fence(&self) -> Result<Option<NativeRuntimeFence>, String> {
+        self.native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())
+            .map(|runtime| runtime.clone())
+    }
+
+    /// Freeze the one capture-clock point used by both native stop events.
+    /// The wall clock is always derived from the runtime anchor, never from a
+    /// fresh system-clock read, so CoreAudio chronology remains coherent.
+    fn capture_native_stop_point(
+        &self,
+        runtime: &DispatcherRuntime,
+        observed_monotonic_ns: u64,
+    ) -> Result<CapturePoint, String> {
+        let point = native_capture_point_at(runtime, observed_monotonic_ns)?;
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_mut()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        match fence.phase {
+            NativeRuntimePhase::Closing | NativeRuntimePhase::Drained => {
+                if let Some(existing) = fence.capture_stop_point.as_ref() {
+                    return Ok(existing.clone());
+                }
+                fence.capture_stop_point = Some(point.clone());
+                Ok(point)
+            }
+            NativeRuntimePhase::Active => Err(
+                "native capture stop point cannot be recorded before shutdown begins".to_owned(),
+            ),
+            NativeRuntimePhase::Handoff => Err(
+                "native capture stop point cannot be recorded during runtime handoff".to_owned(),
+            ),
+        }
+    }
+
+    fn native_capture_stop_point(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<CapturePoint, String> {
+        let native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_ref()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Drained {
+            return Err(
+                "native capture stop point is unavailable before dispatcher drain".to_owned(),
+            );
+        }
+        fence
+            .capture_stop_point
+            .clone()
+            .ok_or_else(|| "native capture stop point is missing after input stop".to_owned())
+    }
+
+    fn record_native_capture_input_stopped(
+        &self,
+        runtime: &DispatcherRuntime,
+        capture_stop_point: &CapturePoint,
+    ) -> Result<(), String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let payload = serde_json::json!({
+            "sessionId": runtime.session_id,
+            "runtimeId": runtime.id.as_uuid(),
+            "captureSegmentId": runtime.capture_segment_id,
+        });
+        let event = trail
+            .next_event(
+                Some(runtime.session_id),
+                None,
+                AuditKind::CaptureInputStopped,
+                capture_stop_point.monotonic_ns,
+                capture_stop_point.wall_clock,
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize capture input stop: {error}"))?;
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .append(&event)
+            .map_err(|error| format!("could not persist capture input stop: {error}"))?;
+        if !trail.append_event(event) {
+            return Err("could not append verified capture input stop event".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Atomically records a native inference terminal outcome and its audit
+    /// event. The captured range remains distinct from a physical capture gap.
+    pub(crate) fn record_inference_gap(&self, gap: &InferenceGap) -> Result<(), String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let existing = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .lookup_inference_gap_with_audit(gap.id)
+            .map_err(|error| format!("could not query persisted inference gap: {error}"))?;
+        if let Some(existing) = existing {
+            if existing.gap != *gap {
+                return Err(
+                    "inference gap ID is already bound to a different immutable payload".to_owned(),
+                );
+            }
+            if let Some(in_memory) = trail
+                .events()
+                .iter()
+                .find(|event| event.id == existing.audit_event.id)
+            {
+                if in_memory == &existing.audit_event {
+                    return Ok(());
+                }
+                return Err(
+                    "inference gap ID is bound to an audit event that differs from the in-memory trail"
+                        .to_owned(),
+                );
+            }
+            if !trail.append_event(existing.audit_event) {
+                return Err(
+                    "could not restore the persisted inference gap audit event into the in-memory trail"
+                        .to_owned(),
+                );
+            }
+            return Ok(());
+        }
+
+        let event = trail
+            .next_event(
+                Some(gap.session_id),
+                gap.job_id,
+                AuditKind::InferenceGapRecorded,
+                gap.ended_at.monotonic_ns,
+                gap.ended_at.wall_clock,
+                gap,
+            )
+            .map_err(|error| format!("could not serialize inference gap: {error}"))?;
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .append_inference_gap_with_audit(&event, gap)
+            .map_err(|error| format!("could not persist inference gap: {error}"))?;
+        if !trail.append_event(event) {
+            return Err("could not append verified inference gap event".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Register the dispatcher generation that is allowed to write native
+    /// outcomes for the active recording session.
+    #[cfg(test)]
+    pub(crate) fn activate_native_runtime(&self, runtime: DispatcherRuntime) -> Result<(), String> {
+        validate_dispatcher_runtime(&runtime)?;
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?
+            .get(&runtime.session_id)
+            .cloned()
+            .ok_or_else(|| "native dispatcher references an unknown session".to_owned())?;
+        if !matches!(session.state, crate::domain::SessionState::Recording) {
+            return Err("native dispatcher requires an active recording session".to_owned());
+        }
+
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        if let Some(existing) = native_runtime.as_ref() {
+            if existing.runtime == runtime && existing.phase == NativeRuntimePhase::Active {
+                return Ok(());
+            }
+            return Err("a different native dispatcher runtime is already registered".to_owned());
+        }
+        *native_runtime = Some(NativeRuntimeFence {
+            runtime,
+            phase: NativeRuntimePhase::Active,
+            capture_input_stopped_audited: false,
+            capture_stop_point: None,
+        });
+        Ok(())
+    }
+
+    /// Publish a staged native session only after the CPAL stream and its
+    /// dispatcher both completed the arm handoff. The start/stop lifecycle
+    /// gate is held by the caller while this runs.
+    fn publish_native_capture_recording(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<CaptureSession, String> {
+        let native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_ref()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Active {
+            return Err("native dispatcher cannot publish after shutdown begins".to_owned());
+        }
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?;
+        let session = sessions
+            .get_mut(&runtime.session_id)
+            .ok_or_else(|| "native dispatcher references an unknown session".to_owned())?;
+        session.publish_recording()?;
+        Ok(session.clone())
+    }
+
+    /// Fence an active dispatcher before its capture producer is stopped.
+    ///
+    /// Closing outcomes are still accepted so the final drain can preserve a
+    /// transcript or a durable gap before the session stop event is written.
+    pub(crate) fn begin_native_runtime_shutdown(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<(), String> {
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_mut()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        match fence.phase {
+            NativeRuntimePhase::Active => {
+                fence.phase = NativeRuntimePhase::Closing;
+                Ok(())
+            }
+            NativeRuntimePhase::Closing => Ok(()),
+            NativeRuntimePhase::Handoff | NativeRuntimePhase::Drained => Err(
+                "native dispatcher shutdown has already moved beyond its closing phase".to_owned(),
+            ),
+        }
+    }
+
+    fn begin_native_runtime_handoff(&self, runtime: &DispatcherRuntime) -> Result<(), String> {
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_mut()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Closing {
+            return Err("native dispatcher cannot be handed off before closing".to_owned());
+        }
+        fence.phase = NativeRuntimePhase::Handoff;
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn restore_native_runtime_closing(&self, runtime: &DispatcherRuntime) -> Result<(), String> {
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_mut()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Handoff {
+            return Err("native dispatcher handoff is not active".to_owned());
+        }
+        fence.phase = NativeRuntimePhase::Closing;
+        Ok(())
+    }
+
+    fn mark_native_runtime_drained(&self, runtime: &DispatcherRuntime) -> Result<(), String> {
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_mut()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Handoff {
+            return Err("native dispatcher cannot be marked drained before handoff".to_owned());
+        }
+        fence.phase = NativeRuntimePhase::Drained;
+        Ok(())
+    }
+
+    /// Remove the generation fence only after its dispatcher has terminally
+    /// drained every outcome.
+    pub(crate) fn clear_native_runtime_after_drain(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<(), String> {
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_ref()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Drained {
+            return Err("cannot clear a native dispatcher before its drain completes".to_owned());
+        }
+        *native_runtime = None;
+        Ok(())
+    }
+
+    fn native_runtime_context(&self) -> Result<Option<DispatcherRuntime>, String> {
+        self.native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())
+            .map(|runtime| {
+                runtime.as_ref().and_then(|fence| {
+                    matches!(
+                        fence.phase,
+                        NativeRuntimePhase::Active | NativeRuntimePhase::Closing
+                    )
+                    .then(|| fence.runtime.clone())
+                })
+            })
+    }
+
+    fn native_runtime_needs_capture_input_stop_event(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<bool, String> {
+        let native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_ref()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Drained {
+            return Err("native capture input cannot stop before dispatcher drain".to_owned());
+        }
+        Ok(!fence.capture_input_stopped_audited)
+    }
+
+    fn mark_native_capture_input_stopped(&self, runtime: &DispatcherRuntime) -> Result<(), String> {
+        let mut native_runtime = self
+            .native_runtime
+            .lock()
+            .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+        let fence = native_runtime
+            .as_mut()
+            .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+        if fence.runtime != *runtime {
+            return Err("native dispatcher runtime does not match the active fence".to_owned());
+        }
+        if fence.phase != NativeRuntimePhase::Drained {
+            return Err(
+                "native capture input cannot be marked stopped before dispatcher drain".to_owned(),
+            );
+        }
+        fence.capture_input_stopped_audited = true;
+        Ok(())
+    }
+
+    /// Persist one terminal native outcome under its runtime and segment
+    /// fence. This intentionally has no knowledge of the capture-service
+    /// mutex: callers claim an owned outcome, call this method, then commit or
+    /// abort the lease after the SQLite transaction succeeds or fails.
+    pub(crate) fn persist_native_outcome(
+        &self,
+        runtime: &DispatcherRuntime,
+        outcome: &AsrOutcome,
+    ) -> Result<Vec<TranscriptSpan>, String> {
+        let session = self.active_session_for_native_runtime(runtime)?;
+
+        match outcome {
+            AsrOutcome::Gap(gap) => {
+                validate_native_inference_gap(runtime, gap)?;
+                self.record_inference_gap(gap)?;
+                Ok(Vec::new())
+            }
+            AsrOutcome::Response { job, response } => {
+                validate_native_asr_job(runtime, job)?;
+                match validate_native_asr_response(job, response) {
+                    Ok(true) => self.append_local_asr_response_with_capture_anchor(
+                        &session,
+                        response.clone(),
+                        &runtime.capture_anchor,
+                    ),
+                    // A completed worker result that contains no final, or
+                    // whose emissions violate the local contract, has no
+                    // recoverable transcript. Account for the captured range
+                    // once instead of making its result lease retry forever.
+                    Ok(false) | Err(_) => self.record_native_response_failure_gap(runtime, job),
+                }
+            }
+        }
+    }
+
+    fn record_native_response_failure_gap(
+        &self,
+        runtime: &DispatcherRuntime,
+        job: &AsrJobMetadata,
+    ) -> Result<Vec<TranscriptSpan>, String> {
+        let gap = InferenceGap::new(
+            // A completed job has a globally unique UUID. Reusing it as the
+            // derived gap identity makes a retry after a lost lease-commit
+            // acknowledgement converge on the same terminal evidence.
+            job.id,
+            runtime.session_id,
+            runtime.id.as_uuid(),
+            runtime.capture_segment_id,
+            Some(job.id),
+            job.started_at.clone(),
+            job.ended_at.clone(),
+            InferenceGapStage::Worker,
+            InferenceGapReason::EngineFailed,
+        )
+        .map_err(|error| {
+            format!("could not create terminal inference gap for failed ASR output: {error}")
+        })?;
+        self.record_inference_gap(&gap)?;
+        Ok(Vec::new())
+    }
+
+    fn active_session_for_native_runtime(
+        &self,
+        runtime: &DispatcherRuntime,
+    ) -> Result<CaptureSession, String> {
+        validate_dispatcher_runtime(runtime)?;
+        {
+            let native_runtime = self
+                .native_runtime
+                .lock()
+                .map_err(|_| "native runtime fence lock poisoned".to_owned())?;
+            let fence = native_runtime
+                .as_ref()
+                .ok_or_else(|| "no native dispatcher runtime is registered".to_owned())?;
+            if fence.runtime != *runtime {
+                return Err("native dispatcher runtime does not match the active fence".to_owned());
+            }
+            if matches!(
+                fence.phase,
+                NativeRuntimePhase::Handoff | NativeRuntimePhase::Drained
+            ) {
+                return Err(
+                    "native dispatcher outcome arrived after runtime drain began".to_owned(),
+                );
+            }
+        }
+
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?
+            .get(&runtime.session_id)
+            .cloned()
+            .ok_or_else(|| "native dispatcher references an unknown session".to_owned())?;
+        if !matches!(
+            session.state,
+            crate::domain::SessionState::Starting | crate::domain::SessionState::Recording
+        ) {
+            return Err("native dispatcher outcome arrived after its session stopped".to_owned());
+        }
+        Ok(session)
+    }
+
     #[cfg(any(test, debug_assertions))]
     fn start_session_with_active(
         &self,
@@ -385,6 +1372,7 @@ impl AppState {
         )
     }
 
+    #[cfg(any(test, debug_assertions))]
     fn start_session_at(
         &self,
         point: crate::audio::CapturePoint,
@@ -395,10 +1383,12 @@ impl AppState {
             .lock()
             .map_err(|_| "session state lock poisoned".to_owned())?;
 
-        if let Some(active) = sessions
-            .values()
-            .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
-        {
+        if let Some(active) = sessions.values().find(|session| {
+            matches!(
+                session.state,
+                crate::domain::SessionState::Starting | crate::domain::SessionState::Recording
+            )
+        }) {
             if reject_active_session {
                 return Err(
                     "stop the active recording session before starting a development mock"
@@ -463,25 +1453,16 @@ impl AppState {
 
     pub fn stop_session(&self) -> Result<Option<CaptureSession>, String> {
         #[cfg(all(target_os = "macos", not(test)))]
-        let (stopped_native_input, pending_gaps) = {
-            let mut service = self
-                .capture_service
-                .lock()
-                .map_err(|_| "capture service lock poisoned".to_owned())?;
-            let stopped_native_input = service.stop()?;
-            let pending_gaps = service.take_pending_gaps();
-            (stopped_native_input, pending_gaps)
-        };
-        #[cfg(any(not(target_os = "macos"), test))]
-        let stopped_native_input = false;
+        let _native_lifecycle = self
+            .native_capture_lifecycle
+            .lock()
+            .map_err(|_| "native capture lifecycle lock poisoned".to_owned())?;
 
         #[cfg(all(target_os = "macos", not(test)))]
-        let active_session = self.active_recording_session()?;
-        #[cfg(all(target_os = "macos", not(test)))]
-        let capture_gap_result = active_session
-            .as_ref()
-            .map(|session| self.record_capture_gaps(session.id, pending_gaps))
-            .transpose();
+        let native_capture_stop_point = self.stop_native_capture_before_session_stop()?;
+
+        #[cfg(not(all(target_os = "macos", not(test))))]
+        let native_capture_stop_point: Option<NativeCaptureStop> = None;
 
         #[cfg(any(test, debug_assertions))]
         if let Some(session) = self.active_recording_session()? {
@@ -494,41 +1475,58 @@ impl AppState {
             self.finish_development_mock(session.id)?;
         }
 
-        if let Some(session) = self.active_recording_session()? {
+        if let Some(session) = self.active_live_session()? {
             self.clear_local_asr_session(session.id)?;
         }
 
-        let now = Utc::now();
-        let monotonic_ns = self.monotonic_ns();
+        let stop_point = native_capture_stop_point
+            .as_ref()
+            .map(|native_stop| native_stop.point.clone())
+            .unwrap_or_else(|| CapturePoint {
+                monotonic_ns: self.monotonic_ns(),
+                wall_clock: Utc::now(),
+            });
+        let stopped = self.finish_capture_session_at(stop_point)?;
+
+        // Keep the Drained fence, including its captured stop point, until
+        // SessionStopped is durable. A retry after an audit failure then
+        // reuses the exact same chronology without duplicating input stop.
+        if let Some(native_stop) = native_capture_stop_point.as_ref() {
+            self.clear_native_runtime_after_drain(&native_stop.runtime)?;
+        }
+
+        Ok(stopped)
+    }
+
+    fn finish_capture_session_at(
+        &self,
+        stop_point: CapturePoint,
+    ) -> Result<Option<CaptureSession>, String> {
         let stopped = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| "session state lock poisoned".to_owned())?;
-            let Some(session) = sessions
-                .values_mut()
-                .find(|session| matches!(session.state, crate::domain::SessionState::Recording))
-            else {
+            let Some(session) = sessions.values_mut().find(|session| {
+                matches!(
+                    session.state,
+                    crate::domain::SessionState::Starting | crate::domain::SessionState::Recording
+                )
+            }) else {
                 return Ok(None);
             };
 
-            session.stop(now);
-            let stopped = session.clone();
-            self.record_audit(AuditKind::SessionStopped, monotonic_ns, &stopped)?;
+            let mut stopped = session.clone();
+            stopped.stop(stop_point.wall_clock);
+            self.record_audit_at(
+                AuditKind::SessionStopped,
+                stop_point.monotonic_ns,
+                stop_point.wall_clock,
+                &stopped,
+            )?;
+            *session = stopped.clone();
             stopped
         };
-
-        #[cfg(target_os = "macos")]
-        if stopped_native_input {
-            self.record_audit(
-                AuditKind::CaptureInputStopped,
-                monotonic_ns,
-                &serde_json::json!({ "sessionId": stopped.id }),
-            )?;
-        }
-
-        #[cfg(all(target_os = "macos", not(test)))]
-        capture_gap_result?;
 
         Ok(Some(stopped))
     }
@@ -736,6 +1734,23 @@ impl AppState {
             .cloned()
             .ok_or_else(|| "ASR response references an unknown local session".to_owned())?;
 
+        let capture_anchor = CapturePoint {
+            monotonic_ns: session.started_monotonic_ns,
+            wall_clock: session.started_at,
+        };
+        self.append_local_asr_response_with_capture_anchor(&session, response, &capture_anchor)
+    }
+
+    fn append_local_asr_response_with_capture_anchor(
+        &self,
+        session: &CaptureSession,
+        response: AsrResponse,
+        capture_anchor: &CapturePoint,
+    ) -> Result<Vec<TranscriptSpan>, String> {
+        if capture_anchor.monotonic_ns < session.started_monotonic_ns {
+            return Err("ASR capture anchor begins before its session".to_owned());
+        }
+
         let mut mapper = self
             .inference_mapper
             .lock()
@@ -743,7 +1758,7 @@ impl AppState {
         let mut projections = Vec::new();
         for emission in response.emissions {
             let mapped = mapper
-                .map(session_id, emission)
+                .map(session.id, emission)
                 .map_err(|error| format!("could not map local ASR emission: {error}"))?;
             let MappedTranscriptEmission::Final(final_emission) = mapped else {
                 continue;
@@ -751,9 +1766,10 @@ impl AppState {
 
             let persisted = (|| {
                 let revision = transcript_revision_from_final_emission(
-                    &session,
+                    session,
                     &final_emission.emission,
                     final_emission.logical_span_id,
+                    capture_anchor,
                 )?;
                 self.append_final_asr_transcript_revision(
                     revision,
@@ -1048,12 +2064,22 @@ impl AppState {
         monotonic_ns: u64,
         payload: &T,
     ) -> Result<(), String> {
+        self.record_audit_at(kind, monotonic_ns, Utc::now(), payload)
+    }
+
+    fn record_audit_at<T: Serialize>(
+        &self,
+        kind: AuditKind,
+        monotonic_ns: u64,
+        wall_clock: DateTime<Utc>,
+        payload: &T,
+    ) -> Result<(), String> {
         let mut trail = self
             .audit_trail
             .lock()
             .map_err(|_| "audit state lock poisoned".to_owned())?;
         let event = trail
-            .next_event(None, None, kind, monotonic_ns, Utc::now(), payload)
+            .next_event(None, None, kind, monotonic_ns, wall_clock, payload)
             .map_err(|error| format!("could not serialize audit payload: {error}"))?;
         self.audit_store
             .lock()
@@ -1090,6 +2116,16 @@ impl AppState {
             return Err("could not append verified local model import event".to_owned());
         }
         Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn with_staged_capture_cleanup(primary: String, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup_error) => {
+            format!("{primary}; could not clean up staged microphone capture: {cleanup_error}")
+        }
     }
 }
 
@@ -1130,12 +2166,13 @@ fn transcript_revision_from_final_emission(
     session: &CaptureSession,
     emission: &TranscriptEmission,
     logical_span_id: Uuid,
+    capture_anchor: &CapturePoint,
 ) -> Result<TranscriptRevision, String> {
     let timing = TranscriptTiming::new(
         emission.capture_start_ns,
         emission.capture_end_ns,
-        session_wall_clock_at(session, emission.capture_start_ns)?,
-        session_wall_clock_at(session, emission.capture_end_ns)?,
+        capture_anchor_wall_clock_at(capture_anchor, emission.capture_start_ns)?,
+        capture_anchor_wall_clock_at(capture_anchor, emission.capture_end_ns)?,
     )?;
     let model = TranscriptModelProvenance::new(
         emission.model_provenance.provider(),
@@ -1157,16 +2194,157 @@ fn transcript_revision_from_final_emission(
     )
 }
 
-fn session_wall_clock_at(
-    session: &CaptureSession,
+fn capture_anchor_wall_clock_at(
+    capture_anchor: &CapturePoint,
     capture_ns: u64,
 ) -> Result<DateTime<Utc>, String> {
     let offset_ns = capture_ns
-        .checked_sub(session.started_monotonic_ns)
-        .ok_or_else(|| "ASR emission begins before its capture session".to_owned())?;
+        .checked_sub(capture_anchor.monotonic_ns)
+        .ok_or_else(|| "ASR emission begins before its capture segment".to_owned())?;
     let offset_ns = i64::try_from(offset_ns)
         .map_err(|_| "ASR emission offset exceeds the supported wall-clock range".to_owned())?;
-    Ok(session.started_at + chrono::Duration::nanoseconds(offset_ns))
+    Ok(capture_anchor.wall_clock + chrono::Duration::nanoseconds(offset_ns))
+}
+
+fn validate_dispatcher_runtime(runtime: &DispatcherRuntime) -> Result<(), String> {
+    if runtime.session_id.is_nil() {
+        return Err("native dispatcher session ID must not be empty".to_owned());
+    }
+    if runtime.capture_segment_id.is_nil() {
+        return Err("native dispatcher capture segment ID must not be empty".to_owned());
+    }
+    if runtime.id.as_uuid().is_nil() {
+        return Err("native dispatcher runtime ID must not be empty".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_native_asr_job(
+    runtime: &DispatcherRuntime,
+    job: &AsrJobMetadata,
+) -> Result<(), String> {
+    if job.id.is_nil() {
+        return Err("native ASR job ID must not be empty".to_owned());
+    }
+    if job.session_id != runtime.session_id {
+        return Err("native ASR job session does not match its dispatcher runtime".to_owned());
+    }
+    if job.runtime_id != runtime.id {
+        return Err("native ASR job generation does not match its dispatcher runtime".to_owned());
+    }
+    if job.capture_segment_id != runtime.capture_segment_id {
+        return Err("native ASR job segment does not match its dispatcher runtime".to_owned());
+    }
+    if job.ended_at.monotonic_ns <= job.started_at.monotonic_ns {
+        return Err("native ASR job capture range must not be empty or inverted".to_owned());
+    }
+    validate_native_capture_range(runtime, &job.started_at, &job.ended_at, "native ASR job")
+}
+
+fn validate_native_asr_response(
+    job: &AsrJobMetadata,
+    response: &AsrResponse,
+) -> Result<bool, String> {
+    if response.emissions.len() > MAX_ASR_EMISSIONS_PER_REQUEST {
+        return Err(format!(
+            "native ASR response exceeds {MAX_ASR_EMISSIONS_PER_REQUEST} emissions"
+        ));
+    }
+
+    let mut revisions = BTreeMap::<String, (u32, bool)>::new();
+    let mut has_final = false;
+    for emission in &response.emissions {
+        emission.validate().map_err(|error| {
+            format!("native ASR response contains an invalid emission: {error}")
+        })?;
+        if emission.capture_start_ns < job.started_at.monotonic_ns
+            || emission.capture_end_ns > job.ended_at.monotonic_ns
+        {
+            return Err("native ASR emission falls outside its job capture range".to_owned());
+        }
+
+        let history = revisions
+            .entry(emission.utterance_key.clone())
+            .or_insert((0, false));
+        if history.1 {
+            return Err("a native ASR utterance cannot emit after its final revision".to_owned());
+        }
+        if emission.revision <= history.0 {
+            return Err("native ASR emission revisions must increase".to_owned());
+        }
+        history.0 = emission.revision;
+        history.1 = emission.kind == TranscriptEmissionKind::Final;
+        has_final |= history.1;
+    }
+    Ok(has_final)
+}
+
+fn validate_native_inference_gap(
+    runtime: &DispatcherRuntime,
+    gap: &InferenceGap,
+) -> Result<(), String> {
+    gap.validate()
+        .map_err(|error| format!("native inference gap is invalid: {error}"))?;
+    if gap.session_id != runtime.session_id {
+        return Err(
+            "native inference gap session does not match its dispatcher runtime".to_owned(),
+        );
+    }
+    if gap.runtime_id != runtime.id.as_uuid() {
+        return Err(
+            "native inference gap generation does not match its dispatcher runtime".to_owned(),
+        );
+    }
+    if gap.capture_segment_id != runtime.capture_segment_id {
+        return Err(
+            "native inference gap segment does not match its dispatcher runtime".to_owned(),
+        );
+    }
+    validate_native_capture_range(
+        runtime,
+        &gap.started_at,
+        &gap.ended_at,
+        "native inference gap",
+    )
+}
+
+fn validate_native_capture_range(
+    runtime: &DispatcherRuntime,
+    started_at: &CapturePoint,
+    ended_at: &CapturePoint,
+    label: &str,
+) -> Result<(), String> {
+    if ended_at.monotonic_ns < started_at.monotonic_ns {
+        return Err(format!("{label} capture range is inverted"));
+    }
+    if ended_at.wall_clock < started_at.wall_clock {
+        return Err(format!("{label} wall-clock range is inverted"));
+    }
+
+    for (endpoint, point) in [("start", started_at), ("end", ended_at)] {
+        let expected = native_capture_point_at(runtime, point.monotonic_ns)?;
+        if point.wall_clock != expected.wall_clock {
+            return Err(format!(
+                "{label} {endpoint} wall-clock does not match its capture segment clock"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn native_capture_point_at(
+    runtime: &DispatcherRuntime,
+    monotonic_ns: u64,
+) -> Result<CapturePoint, String> {
+    let offset_ns = monotonic_ns
+        .checked_sub(runtime.capture_anchor.monotonic_ns)
+        .ok_or_else(|| "native capture time precedes its capture segment".to_owned())?;
+    let offset_ns = i64::try_from(offset_ns)
+        .map_err(|_| "native capture time exceeds the supported wall-clock range".to_owned())?;
+    Ok(CapturePoint {
+        monotonic_ns,
+        wall_clock: runtime.capture_anchor.wall_clock + chrono::Duration::nanoseconds(offset_ns),
+    })
 }
 
 fn timeline_projections(revisions: Vec<TranscriptRevision>) -> BTreeMap<Uuid, Vec<TranscriptSpan>> {
@@ -1196,7 +2374,8 @@ fn timeline_projections(revisions: Vec<TranscriptRevision>) -> BTreeMap<Uuid, Ve
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use crate::audio::{CaptureGap, CaptureGapReason, CapturePoint};
+    use crate::audio::{CaptureGap, CaptureGapReason};
+    use crate::audio::{CapturePoint, DispatcherRuntimeId};
     #[cfg(target_os = "macos")]
     use crate::domain::CaptureSegment;
     use crate::domain::{
@@ -1206,8 +2385,9 @@ mod tests {
         LicenseAcknowledgement, LocalModelKind, ModelImportRequest,
     };
     use crate::inference::{
-        AsrEngine, AsrRequest, FixtureAsr, InferenceAudioWindow, TranscriptEmissionKind,
-        TranscriptEmissionMapper, INFERENCE_CHANNELS, INFERENCE_SAMPLE_RATE_HZ,
+        AsrEngine, AsrRequest, FixtureAsr, InferenceAudioWindow, InferenceGap, InferenceGapReason,
+        InferenceGapStage, ModelProvenance, TranscriptEmissionKind, TranscriptEmissionMapper,
+        INFERENCE_CHANNELS, INFERENCE_SAMPLE_RATE_HZ,
     };
     use chrono::Duration;
     use sha2::{Digest, Sha256};
@@ -1223,6 +2403,646 @@ mod tests {
         );
         assert!(state.stop_session().unwrap().is_some());
         assert!(state.audit_is_valid().unwrap());
+    }
+
+    fn native_runtime_for(session: &CaptureSession, capture_segment_id: Uuid) -> DispatcherRuntime {
+        let anchor_offset_ns = 1_000_000;
+        DispatcherRuntime::new(
+            DispatcherRuntimeId::generate(),
+            session.id,
+            capture_segment_id,
+            CapturePoint {
+                monotonic_ns: session.started_monotonic_ns + anchor_offset_ns,
+                wall_clock: session.started_at + Duration::nanoseconds(anchor_offset_ns as i64),
+            },
+        )
+        .unwrap()
+    }
+
+    fn native_point(runtime: &DispatcherRuntime, offset_ns: u64) -> CapturePoint {
+        CapturePoint {
+            monotonic_ns: runtime.capture_anchor.monotonic_ns + offset_ns,
+            wall_clock: runtime.capture_anchor.wall_clock + Duration::nanoseconds(offset_ns as i64),
+        }
+    }
+
+    fn install_starting_native_session(state: &AppState) -> (CaptureSession, DispatcherRuntime) {
+        let session = CaptureSession::begin_starting_with_id(
+            Uuid::new_v4(),
+            1_000,
+            DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(1),
+        )
+        .unwrap();
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(session.id, session.clone());
+        state
+            .timelines
+            .lock()
+            .unwrap()
+            .entry(session.id)
+            .or_default();
+
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        *state.native_runtime.lock().unwrap() = Some(NativeRuntimeFence {
+            runtime: runtime.clone(),
+            phase: NativeRuntimePhase::Active,
+            capture_input_stopped_audited: false,
+            capture_stop_point: None,
+        });
+        (session, runtime)
+    }
+
+    #[test]
+    fn native_starting_session_is_private_until_dispatcher_arm_publishes_it() {
+        let state = AppState::in_memory();
+        let (session, runtime) = install_starting_native_session(&state);
+
+        assert_eq!(session.state, crate::domain::SessionState::Starting);
+        assert_eq!(state.privacy_status().unwrap().recording_session_id, None);
+        assert!(state.active_recording_session().unwrap().is_none());
+        assert_eq!(
+            state.active_live_session().unwrap().map(|live| live.id),
+            Some(session.id)
+        );
+
+        let published = state.publish_native_capture_recording(&runtime).unwrap();
+        assert_eq!(published.state, crate::domain::SessionState::Recording);
+        assert_eq!(
+            state.privacy_status().unwrap().recording_session_id,
+            Some(session.id)
+        );
+    }
+
+    #[test]
+    fn native_outcome_can_finish_while_a_started_session_is_still_starting() {
+        let state = AppState::in_memory();
+        let (session, runtime) = install_starting_native_session(&state);
+        let job = native_job(&runtime, Uuid::new_v4());
+        let response = AsrResponse {
+            emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
+        };
+
+        let projections = state
+            .persist_native_outcome(&runtime, &AsrOutcome::Response { job, response })
+            .unwrap();
+
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].session_id, session.id);
+    }
+
+    #[test]
+    fn stopping_a_starting_session_does_not_leave_it_live() {
+        let state = AppState::in_memory();
+        let (session, _) = install_starting_native_session(&state);
+
+        let stopped = state
+            .stop_session()
+            .unwrap()
+            .expect("starting session stops");
+
+        assert_eq!(stopped.id, session.id);
+        assert_eq!(stopped.state, crate::domain::SessionState::Stopped);
+        assert_eq!(state.privacy_status().unwrap().recording_session_id, None);
+    }
+
+    #[test]
+    fn native_stop_events_reuse_one_capture_clock_point_until_session_stop_commits() {
+        let state = AppState::in_memory();
+        let (session, runtime) = install_starting_native_session(&state);
+        state.begin_native_runtime_shutdown(&runtime).unwrap();
+
+        let first = state
+            .capture_native_stop_point(&runtime, runtime.capture_anchor.monotonic_ns + 2_000_000)
+            .unwrap();
+        let retry = state
+            .capture_native_stop_point(&runtime, runtime.capture_anchor.monotonic_ns + 9_000_000)
+            .unwrap();
+        assert_eq!(retry, first);
+
+        state.begin_native_runtime_handoff(&runtime).unwrap();
+        state.mark_native_runtime_drained(&runtime).unwrap();
+        assert_eq!(
+            state.finish_drained_native_runtime(&runtime).unwrap(),
+            first
+        );
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate session stop audit persistence failure after native drain");
+        }))
+        .is_err());
+        assert!(state.finish_capture_session_at(first.clone()).is_err());
+        {
+            let fence = state.native_runtime.lock().unwrap();
+            let fence = fence.as_ref().expect("drained fence remains retryable");
+            assert_eq!(fence.phase, NativeRuntimePhase::Drained);
+            assert_eq!(fence.capture_stop_point, Some(first.clone()));
+            assert!(fence.capture_input_stopped_audited);
+        }
+
+        state.audit_store.clear_poison();
+        assert_eq!(
+            state.finish_drained_native_runtime(&runtime).unwrap(),
+            first
+        );
+        let stopped = state
+            .finish_capture_session_at(first.clone())
+            .unwrap()
+            .expect("starting session stops after native drain");
+        assert_eq!(stopped.id, session.id);
+        assert_eq!(stopped.stopped_at, Some(first.wall_clock));
+
+        let events = state.audit_trail.lock().unwrap().events().to_vec();
+        for kind in [AuditKind::CaptureInputStopped, AuditKind::SessionStopped] {
+            let matching = events
+                .iter()
+                .filter(|event| event.kind == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{kind:?} is only recorded once");
+            let event = matching[0];
+            assert_eq!(event.monotonic_ns, first.monotonic_ns);
+            assert_eq!(event.wall_clock, first.wall_clock);
+        }
+
+        state.clear_native_runtime_after_drain(&runtime).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_projection_retries_a_drained_stop_after_session_audit_failure() {
+        let state = AppState::in_memory();
+        let (session, runtime) = install_starting_native_session(&state);
+        state.begin_native_runtime_shutdown(&runtime).unwrap();
+        let stop_point = state
+            .capture_native_stop_point(&runtime, runtime.capture_anchor.monotonic_ns + 2_000_000)
+            .unwrap();
+        state.begin_native_runtime_handoff(&runtime).unwrap();
+        state.mark_native_runtime_drained(&runtime).unwrap();
+
+        // This is the successful portion of the first stop attempt. The
+        // following session audit is the part that transiently fails.
+        assert_eq!(
+            state.finish_drained_native_runtime(&runtime).unwrap(),
+            stop_point
+        );
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate SessionStopped persistence failure after native drain");
+        }))
+        .is_err());
+
+        let error = state.capture_projection().unwrap_err();
+        assert!(error.contains("audit store lock poisoned"));
+        assert_eq!(
+            state.active_live_session().unwrap().map(|live| live.id),
+            Some(session.id)
+        );
+        assert_eq!(
+            state
+                .native_runtime
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .capture_stop_point,
+            Some(stop_point.clone())
+        );
+
+        state.audit_store.clear_poison();
+        let projection = state.capture_projection().unwrap();
+        assert_eq!(projection.status, crate::audio::CaptureStatus::Idle);
+        assert!(state.active_live_session().unwrap().is_none());
+        assert!(state.native_runtime.lock().unwrap().is_none());
+
+        let events = state.audit_trail.lock().unwrap().events().to_vec();
+        for kind in [AuditKind::CaptureInputStopped, AuditKind::SessionStopped] {
+            let matching = events
+                .iter()
+                .filter(|event| event.kind == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching.len(),
+                1,
+                "{kind:?} is recorded once across projection retry"
+            );
+            assert_eq!(matching[0].monotonic_ns, stop_point.monotonic_ns);
+            assert_eq!(matching[0].wall_clock, stop_point.wall_clock);
+        }
+    }
+
+    #[test]
+    fn session_stop_keeps_the_session_live_when_audit_persistence_fails() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let point = CapturePoint {
+            monotonic_ns: session.started_monotonic_ns + 1_000,
+            wall_clock: session.started_at + Duration::microseconds(1),
+        };
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate session stop audit persistence failure");
+        }))
+        .is_err());
+        let error = state.finish_capture_session_at(point.clone()).unwrap_err();
+        assert!(error.contains("audit store lock poisoned"));
+        assert_eq!(
+            state.privacy_status().unwrap().recording_session_id,
+            Some(session.id)
+        );
+        assert_eq!(
+            state
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .state,
+            crate::domain::SessionState::Recording
+        );
+
+        state.audit_store.clear_poison();
+        let stopped = state
+            .finish_capture_session_at(point)
+            .unwrap()
+            .expect("retry stops the live session");
+        assert_eq!(stopped.state, crate::domain::SessionState::Stopped);
+        assert_eq!(state.privacy_status().unwrap().recording_session_id, None);
+    }
+
+    fn native_job(runtime: &DispatcherRuntime, id: Uuid) -> AsrJobMetadata {
+        AsrJobMetadata {
+            id,
+            session_id: runtime.session_id,
+            runtime_id: runtime.id,
+            capture_segment_id: runtime.capture_segment_id,
+            started_at: native_point(runtime, 100_000),
+            ended_at: native_point(runtime, 900_000),
+        }
+    }
+
+    fn native_emission(
+        runtime: &DispatcherRuntime,
+        kind: TranscriptEmissionKind,
+        revision: u32,
+    ) -> TranscriptEmission {
+        TranscriptEmission {
+            utterance_key: "native-window-1".to_owned(),
+            capture_start_ns: runtime.capture_anchor.monotonic_ns + 200_000,
+            capture_end_ns: runtime.capture_anchor.monotonic_ns + 800_000,
+            text: "本地结果。".to_owned(),
+            kind,
+            revision,
+            word_timings: Vec::new(),
+            model_provenance: ModelProvenance::new(
+                "word-covenant",
+                "fixture-local-asr",
+                "1",
+                "a".repeat(64),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn persists_a_fenced_native_final_using_its_capture_segment_anchor() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+
+        let job = native_job(&runtime, Uuid::new_v4());
+        let response = AsrResponse {
+            emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
+        };
+        let projections = state
+            .persist_native_outcome(&runtime, &AsrOutcome::Response { job, response })
+            .unwrap();
+
+        assert_eq!(projections.len(), 1);
+        assert_eq!(
+            projections[0].wall_clock_start,
+            Some(runtime.capture_anchor.wall_clock + Duration::nanoseconds(200_000))
+        );
+        assert_eq!(state.list_timeline(Some(session.id)).unwrap(), projections);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn turns_an_asr_response_without_a_final_into_a_durable_gap() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+
+        let job = native_job(&runtime, Uuid::new_v4());
+        let response = AsrResponse {
+            emissions: vec![native_emission(
+                &runtime,
+                TranscriptEmissionKind::Partial,
+                1,
+            )],
+        };
+        let projections = state
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job: job.clone(),
+                    response,
+                },
+            )
+            .unwrap();
+
+        assert!(projections.is_empty());
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        let store = state.audit_store.lock().unwrap();
+        let gaps = store.list_inference_gaps(session.id).unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].job_id, Some(job.id));
+        assert_eq!(gaps[0].stage, InferenceGapStage::Worker);
+        assert_eq!(gaps[0].reason, InferenceGapReason::EngineFailed);
+        drop(store);
+
+        let final_projections = state
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job: native_job(&runtime, Uuid::new_v4()),
+                    response: AsrResponse {
+                        emissions: vec![native_emission(
+                            &runtime,
+                            TranscriptEmissionKind::Final,
+                            1,
+                        )],
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(final_projections.len(), 1);
+    }
+
+    #[test]
+    fn turns_a_malformed_native_response_into_a_durable_gap() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+
+        let job = native_job(&runtime, Uuid::new_v4());
+        let response = AsrResponse {
+            emissions: vec![
+                native_emission(&runtime, TranscriptEmissionKind::Final, 1),
+                native_emission(&runtime, TranscriptEmissionKind::Partial, 2),
+            ],
+        };
+        let projections = state
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job: job.clone(),
+                    response,
+                },
+            )
+            .unwrap();
+
+        assert!(projections.is_empty());
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        let gaps = state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_inference_gaps(session.id)
+            .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].job_id, Some(job.id));
+        assert_eq!(gaps[0].stage, InferenceGapStage::Worker);
+        assert_eq!(gaps[0].reason, InferenceGapReason::EngineFailed);
+    }
+
+    #[test]
+    fn rejects_a_native_outcome_from_a_cleared_generation() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let original = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(original.clone()).unwrap();
+        state.begin_native_runtime_shutdown(&original).unwrap();
+        state.begin_native_runtime_handoff(&original).unwrap();
+        state.mark_native_runtime_drained(&original).unwrap();
+        state.clear_native_runtime_after_drain(&original).unwrap();
+
+        let replacement = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(replacement).unwrap();
+        let stale_gap = InferenceGap::new(
+            Uuid::new_v4(),
+            original.session_id,
+            original.id.as_uuid(),
+            original.capture_segment_id,
+            None,
+            native_point(&original, 100_000),
+            native_point(&original, 100_000),
+            InferenceGapStage::Shutdown,
+            InferenceGapReason::StoppedBeforeInference,
+        )
+        .unwrap();
+
+        let error = state
+            .persist_native_outcome(&original, &AsrOutcome::Gap(stale_gap))
+            .unwrap_err();
+        assert!(error.contains("does not match the active fence"));
+        assert!(state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list()
+            .unwrap()
+            .iter()
+            .all(|event| { event.kind != AuditKind::InferenceGapRecorded }));
+    }
+
+    #[test]
+    fn rejects_a_native_outcome_once_runtime_handoff_begins() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+        state.begin_native_runtime_shutdown(&runtime).unwrap();
+        state.begin_native_runtime_handoff(&runtime).unwrap();
+
+        let gap = InferenceGap::new(
+            Uuid::new_v4(),
+            runtime.session_id,
+            runtime.id.as_uuid(),
+            runtime.capture_segment_id,
+            None,
+            native_point(&runtime, 100_000),
+            native_point(&runtime, 100_000),
+            InferenceGapStage::Shutdown,
+            InferenceGapReason::StoppedBeforeInference,
+        )
+        .unwrap();
+        let error = state
+            .persist_native_outcome(&runtime, &AsrOutcome::Gap(gap))
+            .unwrap_err();
+        assert!(error.contains("after runtime drain began"));
+        assert!(state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list()
+            .unwrap()
+            .iter()
+            .all(|event| event.kind != AuditKind::InferenceGapRecorded));
+    }
+
+    #[test]
+    fn native_final_can_retry_after_a_transient_persistence_failure() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+
+        let outcome = AsrOutcome::Response {
+            job: native_job(&runtime, Uuid::new_v4()),
+            response: AsrResponse {
+                emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
+            },
+        };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _store = state.audit_store.lock().expect("audit store is available");
+            panic!("simulate a transient native outcome persistence failure");
+        }))
+        .is_err());
+        let error = state
+            .persist_native_outcome(&runtime, &outcome)
+            .unwrap_err();
+        assert!(error.contains("audit store lock poisoned"));
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+
+        state.audit_store.clear_poison();
+        let persisted = state.persist_native_outcome(&runtime, &outcome).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn persists_reopens_and_audits_inference_gaps_through_application_state() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-state-inference-gap-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let gap = {
+            let state = AppState::open(&database).unwrap();
+            let session = state.start_session().unwrap();
+            let started_at = CapturePoint {
+                monotonic_ns: 5_000,
+                wall_clock: DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(5),
+            };
+            let gap = InferenceGap::new(
+                Uuid::new_v4(),
+                session.id,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Some(Uuid::new_v4()),
+                started_at.clone(),
+                CapturePoint {
+                    monotonic_ns: 9_000,
+                    wall_clock: started_at.wall_clock + Duration::milliseconds(4),
+                },
+                InferenceGapStage::JobQueue,
+                InferenceGapReason::JobQueueSaturated,
+            )
+            .unwrap();
+
+            state.record_inference_gap(&gap).unwrap();
+            // A retry after the dispatcher lost its lease acknowledgement
+            // must reuse the durable binding rather than extend the chain.
+            state.record_inference_gap(&gap).unwrap();
+
+            {
+                let store = state.audit_store.lock().unwrap();
+                assert_eq!(
+                    store.list_inference_gaps(session.id).unwrap(),
+                    vec![gap.clone()]
+                );
+                assert!(store.verify().unwrap());
+            }
+            let event = {
+                let trail = state.audit_trail.lock().unwrap();
+                trail
+                    .events()
+                    .iter()
+                    .find(|event| event.kind == AuditKind::InferenceGapRecorded)
+                    .cloned()
+                    .expect("the inference gap is audit recorded")
+            };
+            assert_eq!(event.run_id, Some(session.id));
+            assert_eq!(event.causation_id, gap.job_id);
+            assert_eq!(event.monotonic_ns, gap.ended_at.monotonic_ns);
+            assert_eq!(event.wall_clock, gap.ended_at.wall_clock);
+            assert!(event.matches_payload(&gap).unwrap());
+            assert!(state.audit_is_valid().unwrap());
+
+            // Model a process-local interruption after SQLite committed the
+            // transaction but before the matching event was appended to the
+            // in-memory trail. A replay restores that exact durable event.
+            let events_without_gap = {
+                let trail = state.audit_trail.lock().unwrap();
+                trail
+                    .events()
+                    .iter()
+                    .filter(|candidate| candidate.id != event.id)
+                    .cloned()
+                    .collect()
+            };
+            *state.audit_trail.lock().unwrap() = AuditTrail::from_events(events_without_gap);
+            state.record_inference_gap(&gap).unwrap();
+            assert!(state.audit_is_valid().unwrap());
+
+            let mut conflicting = gap.clone();
+            conflicting.reason = InferenceGapReason::EngineFailed;
+            let error = state.record_inference_gap(&conflicting).unwrap_err();
+            assert!(error.contains("different immutable payload"));
+            assert_eq!(
+                state
+                    .audit_store
+                    .lock()
+                    .unwrap()
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .filter(|candidate| candidate.kind == AuditKind::InferenceGapRecorded)
+                    .count(),
+                1
+            );
+
+            gap
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        reopened.record_inference_gap(&gap).unwrap();
+        {
+            let store = reopened.audit_store.lock().unwrap();
+            assert_eq!(
+                store.list_inference_gaps(gap.session_id).unwrap(),
+                vec![gap.clone()]
+            );
+            assert_eq!(
+                store
+                    .list()
+                    .unwrap()
+                    .iter()
+                    .filter(|candidate| candidate.kind == AuditKind::InferenceGapRecorded)
+                    .count(),
+                1
+            );
+            assert!(store.verify().unwrap());
+        }
+        assert!(reopened.audit_is_valid().unwrap());
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
     }
 
     #[cfg(target_os = "macos")]
