@@ -8,7 +8,7 @@ use super::{
     CaptureGapReason, CaptureLifecycle, CapturePoint, CaptureStatus, CpalInput, CpalInputFailure,
     DispatcherRuntime, MacOsCaptureEvent, MacOsInputDevice, MicrophonePermission,
     NativeCaptureRuntime, NativeCaptureRuntimeConfig, NativeCaptureRuntimeSnapshot,
-    NativeCaptureRuntimeStatus, OwnedOutcomeLease,
+    NativeCaptureRuntimeStatus, NativeInferenceEngines, OwnedOutcomeLease,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -461,6 +461,25 @@ impl CaptureService {
         &mut self,
         dispatcher_runtime: DispatcherRuntime,
     ) -> Result<CaptureStart, String> {
+        self.activate_with_runtime_inner(dispatcher_runtime, None)
+    }
+
+    /// Activate prepared microphone capture with native-only local VAD and
+    /// ASR engines chosen before microphone access. The engines are consumed
+    /// by the runtime and never cross a Tauri command boundary.
+    pub fn activate_with_runtime_and_engines(
+        &mut self,
+        dispatcher_runtime: DispatcherRuntime,
+        engines: NativeInferenceEngines,
+    ) -> Result<CaptureStart, String> {
+        self.activate_with_runtime_inner(dispatcher_runtime, Some(engines))
+    }
+
+    fn activate_with_runtime_inner(
+        &mut self,
+        dispatcher_runtime: DispatcherRuntime,
+        engines: Option<NativeInferenceEngines>,
+    ) -> Result<CaptureStart, String> {
         let prepared = self
             .prepared_capture
             .clone()
@@ -501,12 +520,22 @@ impl CaptureService {
             .as_ref()
             .ok_or_else(|| "prepared microphone input is unavailable".to_owned())?
             .ingress();
-        let native_runtime = match NativeCaptureRuntime::new(
-            ingress,
-            dispatcher_runtime.clone(),
-            clock,
-            NativeCaptureRuntimeConfig::default(),
-        ) {
+        let runtime_result = match engines {
+            Some(engines) => NativeCaptureRuntime::new_with_engines(
+                ingress,
+                dispatcher_runtime.clone(),
+                clock,
+                NativeCaptureRuntimeConfig::default(),
+                engines,
+            ),
+            None => NativeCaptureRuntime::new(
+                ingress,
+                dispatcher_runtime.clone(),
+                clock,
+                NativeCaptureRuntimeConfig::default(),
+            ),
+        };
+        let native_runtime = match runtime_result {
             Ok(runtime) => runtime,
             Err(error) => {
                 self.release_prepared_input();

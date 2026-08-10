@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import type {
+  ActiveLocalAsrProfile,
   AgentAction,
   CaptureProjection,
   CaptureSession,
@@ -21,6 +22,7 @@ const developmentMockTotalNs = 12_000_000_000
 let demoSession: CaptureSession | null = null
 let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
+let browserActiveLocalAsrProfile: ActiveLocalAsrProfile | null = null
 const browserSpeakerClustersBySession = new Map<string, SpeakerCluster[]>()
 
 const browserCaptureProjection: CaptureProjection = {
@@ -464,6 +466,24 @@ export const wordCovenantApi = {
     }
 
     return []
+  },
+
+  async getActiveLocalAsrProfile(): Promise<ActiveLocalAsrProfile | null> {
+    if (isTauriRuntime()) {
+      return invoke<ActiveLocalAsrProfile | null>('get_active_local_asr_profile')
+    }
+
+    return browserActiveLocalAsrProfile
+  },
+
+  async selectActiveLocalAsrModel(modelId: string): Promise<ActiveLocalAsrProfile> {
+    if (isTauriRuntime()) {
+      return invoke<ActiveLocalAsrProfile>('select_active_local_asr_model', {
+        input: { modelId },
+      })
+    }
+
+    throw new Error('浏览器预览不能启用本地转写模型')
   },
 
   async selectLocalModelFile(): Promise<string | null> {

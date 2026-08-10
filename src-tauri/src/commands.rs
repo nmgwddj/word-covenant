@@ -3,7 +3,9 @@ use crate::inference::model_registry::{
     LicenseAcknowledgement, LocalModelKind, ModelImportRequest, RegisteredModel,
 };
 use crate::policy::{EgressApproval, PolicyDecision};
-use crate::state::{AgentAction, AppState, PrivacyStatus, SpeakerOperationResult};
+use crate::state::{
+    ActiveLocalAsrProfile, AgentAction, AppState, PrivacyStatus, SpeakerOperationResult,
+};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -46,6 +48,12 @@ pub struct ImportLocalModelInput {
     pub model_card_id: String,
     pub license_id: String,
     pub license_acknowledged: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectActiveLocalAsrModelInput {
+    pub model_id: Uuid,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +200,21 @@ pub fn list_local_models(state: State<'_, AppState>) -> Result<Vec<RegisteredMod
 }
 
 #[tauri::command]
+pub fn get_active_local_asr_profile(
+    state: State<'_, AppState>,
+) -> Result<Option<ActiveLocalAsrProfile>, String> {
+    state.active_local_asr_profile()
+}
+
+#[tauri::command]
+pub fn select_active_local_asr_model(
+    state: State<'_, AppState>,
+    input: SelectActiveLocalAsrModelInput,
+) -> Result<ActiveLocalAsrProfile, String> {
+    state.select_active_local_asr_model(input.model_id)
+}
+
+#[tauri::command]
 pub async fn select_local_model_file(window: WebviewWindow) -> Result<Option<String>, String> {
     let dialog = window
         .dialog()
@@ -294,7 +317,7 @@ pub fn attempt_http_profile(
 mod tests {
     use super::{
         selected_local_model_path, CreateSpeakerClusterInput, ReassignTranscriptSpeakerInput,
-        RenameSpeakerClusterInput,
+        RenameSpeakerClusterInput, SelectActiveLocalAsrModelInput,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -354,5 +377,11 @@ mod tests {
         assert_eq!(reassign.logical_span_id, logical_span_id);
         assert_eq!(reassign.expected_revision, 7);
         assert_eq!(reassign.target_cluster_id, None);
+
+        let select: SelectActiveLocalAsrModelInput = serde_json::from_value(json!({
+            "modelId": session_id,
+        }))
+        .unwrap();
+        assert_eq!(select.model_id, session_id);
     }
 }

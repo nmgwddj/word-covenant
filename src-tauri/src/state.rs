@@ -1,5 +1,5 @@
 #[cfg(all(target_os = "macos", not(test)))]
-use crate::audio::{capture_point_now, CaptureStart, DispatcherRuntimeId};
+use crate::audio::{capture_point_now, CaptureStart, DispatcherRuntimeId, NativeInferenceEngines};
 use crate::audio::{AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime};
 #[cfg(target_os = "macos")]
 use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
@@ -17,11 +17,16 @@ use crate::domain::{
     TranscriptRevision, TranscriptSource, TranscriptSpan, TranscriptTiming,
 };
 use crate::inference::asr::MAX_ASR_EMISSIONS_PER_REQUEST;
-use crate::inference::model_registry::{ModelImportRequest, ModelRegistry, RegisteredModel};
-use crate::inference::{
-    AsrResponse, InferenceGap, InferenceGapReason, InferenceGapStage, MappedTranscriptEmission,
-    TranscriptEmission, TranscriptEmissionKind, TranscriptEmissionMapper,
+use crate::inference::model_registry::{
+    LocalModelKind, ModelImportRequest, ModelRegistry, RegisteredModel,
 };
+use crate::inference::{
+    is_whisper_cpp_compatible_input_format, AsrResponse, InferenceGap, InferenceGapReason,
+    InferenceGapStage, MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionKind,
+    TranscriptEmissionMapper,
+};
+#[cfg(all(target_os = "macos", not(test)))]
+use crate::inference::{WebRtcVad, WhisperCppAsrEngine};
 use crate::policy::{EgressApproval, EgressPolicy, EgressRequest, PolicyDecision, PolicyReason};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -87,6 +92,18 @@ pub struct FinalTranscriptProjection {
     pub revision: u64,
 }
 
+/// The explicitly chosen local speech-recognition model for this app run.
+///
+/// This is intentionally not persisted: reopening WordCovenant requires a
+/// fresh visible choice before microphone recording can load a local model.
+/// It contains an opaque model ID only, never a file path, audio, or model
+/// artifact bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveLocalAsrProfile {
+    pub model_id: Uuid,
+}
+
 #[derive(Default)]
 struct FinalTranscriptProjectionState {
     revision: u64,
@@ -129,6 +146,7 @@ pub struct AppState {
     audit_trail: Mutex<AuditTrail>,
     audit_store: Mutex<AuditStore>,
     model_registry: Mutex<ModelRegistry>,
+    active_local_asr_profile: Mutex<Option<ActiveLocalAsrProfile>>,
     inference_mapper: Mutex<TranscriptEmissionMapper>,
     final_transcript_projection: Mutex<FinalTranscriptProjectionState>,
     native_runtime: Mutex<Option<NativeRuntimeFence>>,
@@ -196,6 +214,7 @@ impl AppState {
             audit_trail: Mutex::new(audit_trail),
             audit_store: Mutex::new(audit_store),
             model_registry: Mutex::new(model_registry),
+            active_local_asr_profile: Mutex::new(None),
             inference_mapper: Mutex::new(TranscriptEmissionMapper::default()),
             final_transcript_projection: Mutex::new(FinalTranscriptProjectionState::default()),
             native_runtime: Mutex::new(None),
@@ -328,6 +347,11 @@ impl AppState {
             return Err("a native capture session is still starting or draining".to_owned());
         }
 
+        // Resolve and load the user-selected local model before touching the
+        // microphone. A missing, tampered, incompatible, or unreadable model
+        // therefore fails closed without starting a capture session.
+        let inference_engines = self.build_active_local_inference_engines()?;
+
         let preparation = self
             .capture_service
             .lock()
@@ -344,7 +368,7 @@ impl AppState {
             .capture_service
             .lock()
             .map_err(|_| "capture service lock poisoned".to_owned())?
-            .activate_with_runtime(runtime.clone())
+            .activate_with_runtime_and_engines(runtime.clone(), inference_engines)
         {
             Ok(capture_start) => capture_start,
             Err(error) => {
@@ -2163,6 +2187,71 @@ impl AppState {
         Ok(registry.models().cloned().collect())
     }
 
+    /// Returns the deliberately selected ASR model for this application run.
+    pub fn active_local_asr_profile(&self) -> Result<Option<ActiveLocalAsrProfile>, String> {
+        self.active_local_asr_profile
+            .lock()
+            .map_err(|_| "active local ASR profile lock poisoned".to_owned())
+            .map(|profile| profile.clone())
+    }
+
+    /// Select a compatible, already-imported local Whisper model. Importing a
+    /// file never selects it automatically; changing this choice during an
+    /// active capture would make its provenance ambiguous and is rejected.
+    pub fn select_active_local_asr_model(
+        &self,
+        model_id: Uuid,
+    ) -> Result<ActiveLocalAsrProfile, String> {
+        // Share the native start/stop gate so a model cannot change while a
+        // microphone start is loading and binding its selected artifact.
+        #[cfg(target_os = "macos")]
+        let _native_lifecycle = self
+            .native_capture_lifecycle
+            .lock()
+            .map_err(|_| "native capture lifecycle lock poisoned".to_owned())?;
+
+        if self.active_live_session()?.is_some() {
+            return Err("cannot change the local transcription model while recording".to_owned());
+        }
+
+        let model = self
+            .model_registry
+            .lock()
+            .map_err(|_| "model registry lock poisoned".to_owned())?
+            .get(model_id)
+            .cloned()
+            .ok_or_else(|| "the selected local transcription model is not registered".to_owned())?;
+        validate_active_local_asr_model(&model)?;
+
+        let profile = ActiveLocalAsrProfile { model_id };
+        *self
+            .active_local_asr_profile
+            .lock()
+            .map_err(|_| "active local ASR profile lock poisoned".to_owned())? =
+            Some(profile.clone());
+        Ok(profile)
+    }
+
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn build_active_local_inference_engines(&self) -> Result<NativeInferenceEngines, String> {
+        let profile = self.active_local_asr_profile().and_then(|profile| {
+            profile.ok_or_else(|| {
+                "select a compatible local Whisper model before starting microphone recording"
+                    .to_owned()
+            })
+        })?;
+        let artifact = self
+            .model_registry
+            .lock()
+            .map_err(|_| "model registry lock poisoned".to_owned())?
+            .verified_artifact(profile.model_id)
+            .map_err(|error| format!("could not verify the selected local ASR model: {error}"))?;
+        validate_active_local_asr_model(artifact.model())?;
+        let asr = WhisperCppAsrEngine::from_registered_artifact(artifact)
+            .map_err(|error| format!("could not load the selected local ASR model: {error}"))?;
+        Ok(NativeInferenceEngines::new(WebRtcVad::new(), asr))
+    }
+
     /// Imports a user-selected model into application-managed local storage.
     ///
     /// The file copy is rolled back if the accompanying model/audit database
@@ -2474,6 +2563,19 @@ fn with_staged_capture_cleanup(primary: String, cleanup: Result<(), String>) -> 
     }
 }
 
+fn validate_active_local_asr_model(model: &RegisteredModel) -> Result<(), String> {
+    if model.model_kind != LocalModelKind::SpeechRecognition {
+        return Err("the selected model is not a speech-recognition model".to_owned());
+    }
+    if !is_whisper_cpp_compatible_input_format(&model.input_format) {
+        return Err(
+            "the selected speech-recognition model is not compatible with the local Whisper runtime"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn policy_reason_message(reason: PolicyReason) -> String {
     match reason {
         PolicyReason::EgressDisabled => "network egress is disabled for this session".to_owned(),
@@ -2746,7 +2848,7 @@ mod tests {
     use crate::inference::{
         AsrEngine, AsrRequest, FixtureAsr, InferenceAudioWindow, InferenceGap, InferenceGapReason,
         InferenceGapStage, ModelProvenance, TranscriptEmissionKind, TranscriptEmissionMapper,
-        INFERENCE_CHANNELS, INFERENCE_SAMPLE_RATE_HZ,
+        INFERENCE_CHANNELS, INFERENCE_SAMPLE_RATE_HZ, WHISPER_CPP_GGML_INPUT_FORMAT,
     };
     use chrono::Duration;
     use sha2::{Digest, Sha256};
@@ -4497,7 +4599,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("word-covenant.sqlite3");
-        let source_path = directory.join("fixture-model.gguf");
+        let source_path = directory.join("fixture-model.ggml");
         let bytes = b"local model fixture bytes";
         std::fs::write(&source_path, bytes).unwrap();
         let expected_sha256 = format!("{:x}", Sha256::digest(bytes));
@@ -4506,7 +4608,7 @@ mod tests {
             source_path,
             model_kind: LocalModelKind::SpeechRecognition,
             version: "fixture-v1".to_owned(),
-            input_format: "gguf".to_owned(),
+            input_format: WHISPER_CPP_GGML_INPUT_FORMAT.to_owned(),
             expected_sha256,
             license_acknowledgement: Some(
                 LicenseAcknowledgement::new(
@@ -4530,6 +4632,92 @@ mod tests {
 
         let reopened = AppState::open(&database).unwrap();
         assert_eq!(reopened.list_local_models().unwrap(), vec![imported]);
+        assert!(reopened.audit_is_valid().unwrap());
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn local_asr_profile_requires_an_explicit_compatible_model() {
+        let directory = std::env::temp_dir().join(format!(
+            "word-covenant-active-asr-profile-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("word-covenant.sqlite3");
+        let state = AppState::open(&database).unwrap();
+
+        assert_eq!(state.active_local_asr_profile().unwrap(), None);
+        assert!(state
+            .select_active_local_asr_model(Uuid::new_v4())
+            .unwrap_err()
+            .contains("not registered"));
+
+        let import = |kind: LocalModelKind, input_format: &str| {
+            let id = Uuid::new_v4();
+            let source_path = directory.join(format!("fixture-{id}.model"));
+            let bytes = format!("local model fixture {id}").into_bytes();
+            std::fs::write(&source_path, &bytes).unwrap();
+            state
+                .import_local_model(ModelImportRequest {
+                    id,
+                    source_path,
+                    model_kind: kind,
+                    version: "fixture-v1".to_owned(),
+                    input_format: input_format.to_owned(),
+                    expected_sha256: format!("{:x}", Sha256::digest(&bytes)),
+                    license_acknowledgement: Some(
+                        LicenseAcknowledgement::new(
+                            "word-covenant/fixture-model",
+                            "test-license",
+                            DateTime::<Utc>::UNIX_EPOCH,
+                        )
+                        .unwrap(),
+                    ),
+                })
+                .unwrap()
+        };
+
+        let vad_model = import(
+            LocalModelKind::VoiceActivityDetection,
+            WHISPER_CPP_GGML_INPUT_FORMAT,
+        );
+        assert!(state
+            .select_active_local_asr_model(vad_model.id)
+            .unwrap_err()
+            .contains("not a speech-recognition model"));
+
+        let incompatible_asr = import(LocalModelKind::SpeechRecognition, "gguf");
+        assert!(state
+            .select_active_local_asr_model(incompatible_asr.id)
+            .unwrap_err()
+            .contains("not compatible"));
+
+        let selected_model = import(
+            LocalModelKind::SpeechRecognition,
+            WHISPER_CPP_GGML_INPUT_FORMAT,
+        );
+        let profile = state
+            .select_active_local_asr_model(selected_model.id)
+            .unwrap();
+        assert_eq!(profile.model_id, selected_model.id);
+        assert_eq!(
+            serde_json::to_value(&profile).unwrap(),
+            serde_json::json!({ "modelId": selected_model.id })
+        );
+
+        // Test builds intentionally use the separate development mock path;
+        // selecting a real ASR model remains forbidden while it is recording.
+        let session = state.start_session().unwrap();
+        assert!(state
+            .select_active_local_asr_model(selected_model.id)
+            .unwrap_err()
+            .contains("while recording"));
+        assert_eq!(state.stop_session().unwrap().unwrap().id, session.id);
+
+        drop(state);
+        let reopened = AppState::open(&database).unwrap();
+        assert_eq!(reopened.active_local_asr_profile().unwrap(), None);
         assert!(reopened.audit_is_valid().unwrap());
 
         std::fs::remove_dir_all(directory).unwrap();

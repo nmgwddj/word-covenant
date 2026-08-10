@@ -114,6 +114,14 @@ export interface RegisteredModel {
   importedAt: string
 }
 
+/**
+ * A user-visible, per-app-run selection of an already imported local ASR
+ * model. The file path and artifact bytes remain native-only.
+ */
+export interface ActiveLocalAsrProfile {
+  modelId: string
+}
+
 export interface LocalModelImportInput {
   sourcePath: string
   modelKind: LocalModelKind
