@@ -13,7 +13,7 @@ use crate::inference::pipeline::{
 };
 use crate::inference::{
     AsrEngine, AsrRequest, AsrResponse, InferenceError, InferenceGap, InferenceGapReason,
-    InferenceGapStage,
+    InferenceGapStage, ModelProvenance,
 };
 use chrono::Duration;
 use crossbeam_queue::ArrayQueue;
@@ -195,6 +195,83 @@ impl AsrJob {
     }
 }
 
+/// One native ASR job claimed by the sequential inference worker.
+///
+/// The lease owns the PCM-bearing request and deliberately cannot be
+/// serialized. A worker must return it through
+/// [`CaptureDispatcher::complete_asr_job`] after executing inference outside
+/// the dispatcher mutex. The dispatcher retains compact metadata while the
+/// lease is active so shutdown cannot silently forget an in-flight job.
+#[derive(Debug)]
+pub struct AsrJobLease {
+    token: u64,
+    job: AsrJob,
+}
+
+impl AsrJobLease {
+    pub fn token(&self) -> u64 {
+        self.token
+    }
+
+    pub fn metadata(&self) -> &AsrJobMetadata {
+        self.job.metadata()
+    }
+
+    pub fn request(&self) -> &AsrRequest {
+        self.job.request()
+    }
+}
+
+/// One bounded result of asking the dispatcher for work for its ASR worker.
+///
+/// Only [`Self::Claimed`] transfers PCM-bearing work out of the dispatcher.
+/// The remaining variants report bounded delivery/backpressure state without
+/// manufacturing a transcript.
+#[derive(Debug)]
+pub enum AsrJobClaim {
+    Claimed(AsrJobLease),
+    DeliveredHeldOutcome,
+    NoJob,
+    BlockedByResultQueue,
+    InFlight,
+}
+
+/// A local engine result returned by the ASR worker after it has released the
+/// dispatcher mutex.
+///
+/// The engine provenance is copied rather than borrowing a non-`Sync` engine
+/// context across threads. A missing engine remains an explicit terminal
+/// local-engine-unavailable gap.
+#[derive(Debug)]
+pub enum AsrJobExecution {
+    EngineUnavailable,
+    EngineResult {
+        model_provenance: ModelProvenance,
+        result: Result<AsrResponse, InferenceError>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsrJobLeaseError {
+    NoActiveLease,
+    TokenMismatch,
+    MetadataMismatch,
+}
+
+impl fmt::Display for AsrJobLeaseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoActiveLease => formatter.write_str("no active ASR job lease exists"),
+            Self::TokenMismatch => formatter.write_str("ASR job lease token does not match"),
+            Self::MetadataMismatch => {
+                formatter.write_str("ASR job lease metadata does not match the active job")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AsrJobLeaseError {}
+
 /// A local result available for durable native projection.
 ///
 /// A response can contain transient partial emissions. The state layer keeps
@@ -322,6 +399,7 @@ pub enum WorkerPumpResult {
     DeliveredHeldOutcome,
     NoJob,
     BlockedByResultQueue,
+    InFlight,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -329,7 +407,22 @@ pub enum ShutdownDrainResult {
     WaitingForIngress,
     WaitingForPendingEvent,
     WaitingForOutcomeDelivery,
+    AwaitingInference,
     AwaitingOutcomeCommit,
+    Drained,
+}
+
+/// Progress made while sealing capture input before shutdown inference.
+///
+/// This phase deliberately never terminalizes admitted ASR jobs. The native
+/// runtime uses it to give a sealed final window its bounded inference budget
+/// before [`CaptureDispatcher::drain_shutdown_once`] converts remaining work
+/// into terminal gaps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownPreparationResult {
+    WaitingForIngress,
+    WaitingForPendingEvent,
+    ReadyForInference,
     Drained,
 }
 
@@ -424,6 +517,11 @@ struct ActiveOwnedOutcomeLease {
     outcome: AsrOutcome,
 }
 
+struct ActiveAsrJobLease {
+    token: u64,
+    metadata: AsrJobMetadata,
+}
+
 /// The only native consumer of a [`CaptureIngress`] for one active runtime.
 ///
 /// `pump_ingress_once` is deliberately synchronous. The later CPAL bridge can
@@ -439,9 +537,11 @@ pub struct CaptureDispatcher<S> {
     pending_events: ArrayQueue<SpeechWindowEvent>,
     pending_event: Option<PendingDispatcherEvent>,
     worker_held_outcome: Option<AsrOutcome>,
+    active_asr_job_lease: Option<ActiveAsrJobLease>,
     retry_outcome: Option<AsrOutcome>,
     active_owned_outcome_lease: Option<ActiveOwnedOutcomeLease>,
     next_owned_outcome_token: u64,
+    next_asr_job_token: u64,
     meter: DispatcherMeter,
     metrics: AsrQueueMetrics,
     status: DispatcherStatus,
@@ -477,9 +577,11 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
             pending_events: ArrayQueue::new(MAX_PENDING_SEGMENTER_EVENTS),
             pending_event: None,
             worker_held_outcome: None,
+            active_asr_job_lease: None,
             retry_outcome: None,
             active_owned_outcome_lease: None,
             next_owned_outcome_token: 1,
+            next_asr_job_token: 1,
             meter: DispatcherMeter::default(),
             metrics: AsrQueueMetrics::default(),
             status: DispatcherStatus::Running,
@@ -573,21 +675,30 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
         Ok(IngressPumpResult::Consumed)
     }
 
-    /// Process one job sequentially. Passing `None` is an explicit local
-    /// engine-unavailable state; it creates a gap and never manufactures text.
-    pub fn pump_worker_once(&mut self, engine: Option<&mut dyn AsrEngine>) -> WorkerPumpResult {
+    /// Claim one bounded ASR job without retaining the dispatcher mutex while
+    /// inference executes.
+    ///
+    /// A single native ASR worker owns this API. It must return a claimed job
+    /// through [`Self::complete_asr_job`]. A full result queue terminalizes
+    /// the popped job before an engine call, preserving the existing bounded
+    /// backpressure and gap accounting behavior.
+    pub fn claim_asr_job(&mut self) -> AsrJobClaim {
         if let Some(outcome) = self.worker_held_outcome.take() {
             match self.try_push_result(outcome) {
-                Ok(()) => return WorkerPumpResult::DeliveredHeldOutcome,
+                Ok(()) => return AsrJobClaim::DeliveredHeldOutcome,
                 Err(outcome) => {
                     self.worker_held_outcome = Some(outcome);
-                    return WorkerPumpResult::BlockedByResultQueue;
+                    return AsrJobClaim::BlockedByResultQueue;
                 }
             }
         }
 
+        if self.active_asr_job_lease.is_some() {
+            return AsrJobClaim::InFlight;
+        }
+
         let Some(job) = self.jobs.pop() else {
-            return WorkerPumpResult::NoJob;
+            return AsrJobClaim::NoJob;
         };
 
         // There is a single sequential worker. If delivery is already full,
@@ -602,31 +713,56 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
                 InferenceGapReason::ResultQueueSaturated,
             ));
             self.metrics.jobs_completed = self.metrics.jobs_completed.saturating_add(1);
-            return WorkerPumpResult::BlockedByResultQueue;
+            return AsrJobClaim::BlockedByResultQueue;
         }
 
-        let outcome = match engine {
-            None => {
+        let token = self.next_asr_job_token;
+        self.next_asr_job_token = self.next_asr_job_token.saturating_add(1).max(1);
+        self.active_asr_job_lease = Some(ActiveAsrJobLease {
+            token,
+            metadata: job.metadata().clone(),
+        });
+        AsrJobClaim::Claimed(AsrJobLease { token, job })
+    }
+
+    /// Complete an ASR job that was previously claimed by the native worker.
+    ///
+    /// The response has already been produced outside the dispatcher mutex.
+    /// This method validates the engine's provenance and converts every
+    /// unavailable/failed result into an explicit terminal gap before placing
+    /// it on the bounded result queue.
+    pub fn complete_asr_job(
+        &mut self,
+        lease: AsrJobLease,
+        execution: AsrJobExecution,
+    ) -> Result<WorkerPumpResult, AsrJobLeaseError> {
+        self.take_active_asr_job(&lease)?;
+
+        let outcome = match execution {
+            AsrJobExecution::EngineUnavailable => {
                 self.metrics.unavailable_engine_outcomes =
                     self.metrics.unavailable_engine_outcomes.saturating_add(1);
                 self.gap_for_job(
-                    &job,
+                    &lease.job,
                     InferenceGapStage::Worker,
                     InferenceGapReason::LocalEngineUnavailable,
                 )
             }
-            Some(engine) => match engine.transcribe(job.request()) {
+            AsrJobExecution::EngineResult {
+                model_provenance,
+                result,
+            } => match result {
                 Ok(response) => {
-                    match response.validate_against(job.request(), engine.model_provenance()) {
+                    match response.validate_against(lease.job.request(), &model_provenance) {
                         Ok(()) => AsrOutcome::Response {
-                            job: job.metadata().clone(),
+                            job: lease.job.metadata().clone(),
                             response,
                         },
                         Err(_) => {
                             self.metrics.engine_failure_outcomes =
                                 self.metrics.engine_failure_outcomes.saturating_add(1);
                             self.gap_for_job(
-                                &job,
+                                &lease.job,
                                 InferenceGapStage::Worker,
                                 InferenceGapReason::EngineFailed,
                             )
@@ -637,7 +773,7 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
                     self.metrics.unavailable_engine_outcomes =
                         self.metrics.unavailable_engine_outcomes.saturating_add(1);
                     self.gap_for_job(
-                        &job,
+                        &lease.job,
                         InferenceGapStage::Worker,
                         InferenceGapReason::LocalEngineUnavailable,
                     )
@@ -646,7 +782,7 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
                     self.metrics.engine_failure_outcomes =
                         self.metrics.engine_failure_outcomes.saturating_add(1);
                     self.gap_for_job(
-                        &job,
+                        &lease.job,
                         InferenceGapStage::Worker,
                         InferenceGapReason::EngineFailed,
                     )
@@ -656,12 +792,40 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
 
         self.metrics.jobs_completed = self.metrics.jobs_completed.saturating_add(1);
         match self.try_push_result(outcome) {
-            Ok(()) => WorkerPumpResult::Processed,
+            Ok(()) => Ok(WorkerPumpResult::Processed),
             Err(outcome) => {
                 self.worker_held_outcome = Some(outcome);
-                WorkerPumpResult::BlockedByResultQueue
+                Ok(WorkerPumpResult::BlockedByResultQueue)
             }
         }
+    }
+
+    /// Process one job synchronously for deterministic tests and callers that
+    /// intentionally do not need a separate native ASR worker. The native
+    /// runtime uses [`Self::claim_asr_job`] and [`Self::complete_asr_job`] so
+    /// `AsrEngine::transcribe` never runs while its dispatcher mutex is held.
+    /// Passing `None` remains an explicit local-engine-unavailable state.
+    pub fn pump_worker_once(&mut self, engine: Option<&mut dyn AsrEngine>) -> WorkerPumpResult {
+        let claim = self.claim_asr_job();
+        let AsrJobClaim::Claimed(lease) = claim else {
+            return match claim {
+                AsrJobClaim::DeliveredHeldOutcome => WorkerPumpResult::DeliveredHeldOutcome,
+                AsrJobClaim::NoJob => WorkerPumpResult::NoJob,
+                AsrJobClaim::BlockedByResultQueue => WorkerPumpResult::BlockedByResultQueue,
+                AsrJobClaim::InFlight => WorkerPumpResult::InFlight,
+                AsrJobClaim::Claimed(_) => unreachable!("claimed ASR job must match above"),
+            };
+        };
+
+        let execution = match engine {
+            None => AsrJobExecution::EngineUnavailable,
+            Some(engine) => AsrJobExecution::EngineResult {
+                model_provenance: engine.model_provenance().clone(),
+                result: engine.transcribe(lease.request()),
+            },
+        };
+        self.complete_asr_job(lease, execution)
+            .expect("a freshly claimed ASR job completes against its active lease")
     }
 
     /// Begin a durable outcome delivery. The claim restores itself to the head
@@ -811,27 +975,52 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
         Ok(())
     }
 
-    /// One deterministic shutdown step that turns not-yet-executed jobs into
-    /// explicit terminal gaps. It is useful when stopping must not wait for a
-    /// local engine call. A normal drain can instead use `pump_worker_once`.
-    pub fn drain_shutdown_once(&mut self) -> Result<ShutdownDrainResult, DispatcherError> {
+    /// Drain and seal producer input without terminalizing any admitted ASR
+    /// jobs. This lets a runtime reserve a finite post-seal inference budget
+    /// for the final window before the normal shutdown drain accounts for
+    /// work that remains.
+    pub fn prepare_shutdown_for_inference_once(
+        &mut self,
+    ) -> Result<ShutdownPreparationResult, DispatcherError> {
         if self.status == DispatcherStatus::Running {
             return Err(DispatcherError::ShutdownNotStarted);
         }
         if self.status == DispatcherStatus::Drained {
-            return Ok(ShutdownDrainResult::Drained);
+            return Ok(ShutdownPreparationResult::Drained);
         }
         if !self.progress_pending_event() {
-            return Ok(ShutdownDrainResult::WaitingForPendingEvent);
+            return Ok(ShutdownPreparationResult::WaitingForPendingEvent);
         }
         if !self.ingress_drained {
-            return Ok(ShutdownDrainResult::WaitingForIngress);
+            return Ok(ShutdownPreparationResult::WaitingForIngress);
         }
         if !self.segmenter_sealed {
             self.seal_after_ingress_drain()?;
             if !self.progress_pending_event() {
-                return Ok(ShutdownDrainResult::WaitingForPendingEvent);
+                return Ok(ShutdownPreparationResult::WaitingForPendingEvent);
             }
+        }
+
+        Ok(ShutdownPreparationResult::ReadyForInference)
+    }
+
+    /// One deterministic shutdown step that turns not-yet-executed jobs into
+    /// explicit terminal gaps. It is useful when stopping must not wait for a
+    /// local engine call. A normal drain can instead use `pump_worker_once`.
+    pub fn drain_shutdown_once(&mut self) -> Result<ShutdownDrainResult, DispatcherError> {
+        match self.prepare_shutdown_for_inference_once()? {
+            ShutdownPreparationResult::WaitingForIngress => {
+                return Ok(ShutdownDrainResult::WaitingForIngress)
+            }
+            ShutdownPreparationResult::WaitingForPendingEvent => {
+                return Ok(ShutdownDrainResult::WaitingForPendingEvent)
+            }
+            ShutdownPreparationResult::Drained => return Ok(ShutdownDrainResult::Drained),
+            ShutdownPreparationResult::ReadyForInference => {}
+        }
+
+        if self.active_asr_job_lease.is_some() {
+            return Ok(ShutdownDrainResult::AwaitingInference);
         }
 
         if let Some(outcome) = self.worker_held_outcome.take() {
@@ -896,6 +1085,7 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
             && self.jobs.is_empty()
             && self.results.is_empty()
             && self.worker_held_outcome.is_none()
+            && self.active_asr_job_lease.is_none()
             && self.retry_outcome.is_none()
             && self.active_owned_outcome_lease.is_none()
             && self.last_packet_range.is_none()
@@ -912,6 +1102,21 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
             return Err(OwnedOutcomeLeaseError::TokenMismatch);
         }
         Ok(active.outcome)
+    }
+
+    fn take_active_asr_job(&mut self, lease: &AsrJobLease) -> Result<(), AsrJobLeaseError> {
+        let Some(active) = self.active_asr_job_lease.take() else {
+            return Err(AsrJobLeaseError::NoActiveLease);
+        };
+        if active.token != lease.token {
+            self.active_asr_job_lease = Some(active);
+            return Err(AsrJobLeaseError::TokenMismatch);
+        }
+        if active.metadata != *lease.metadata() {
+            self.active_asr_job_lease = Some(active);
+            return Err(AsrJobLeaseError::MetadataMismatch);
+        }
+        Ok(())
     }
 
     fn progress_pending_event(&mut self) -> bool {
@@ -1554,6 +1759,48 @@ mod tests {
         };
         assert_eq!(gap.reason, InferenceGapReason::EngineFailed);
         claim.commit();
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_claimed_asr_job_before_terminalizing_remaining_work() {
+        let session_id = Uuid::from_u128(10);
+        let mut dispatcher = dispatcher(ScriptedSegmenter::requests(session_id, [1_000]), 1, 2);
+        write_packet(&dispatcher, 0);
+        dispatcher.pump_ingress_once().unwrap();
+
+        let AsrJobClaim::Claimed(lease) = dispatcher.claim_asr_job() else {
+            panic!("an admitted job must transfer to the ASR worker");
+        };
+        dispatcher.begin_shutdown();
+        assert_eq!(
+            dispatcher.pump_ingress_once().unwrap(),
+            IngressPumpResult::NoPacket
+        );
+        assert_eq!(
+            dispatcher.prepare_shutdown_for_inference_once().unwrap(),
+            ShutdownPreparationResult::ReadyForInference
+        );
+        assert_eq!(
+            dispatcher.drain_shutdown_once().unwrap(),
+            ShutdownDrainResult::AwaitingInference
+        );
+
+        let mut engine = EmptyEngine::successful();
+        let execution = AsrJobExecution::EngineResult {
+            model_provenance: engine.model_provenance().clone(),
+            result: engine.transcribe(lease.request()),
+        };
+        assert_eq!(
+            dispatcher.complete_asr_job(lease, execution).unwrap(),
+            WorkerPumpResult::Processed
+        );
+        let claim = dispatcher.begin_outcome().unwrap();
+        assert!(matches!(claim.outcome(), AsrOutcome::Response { .. }));
+        claim.commit();
+        assert_eq!(
+            dispatcher.drain_shutdown_once().unwrap(),
+            ShutdownDrainResult::Drained
+        );
     }
 
     #[test]

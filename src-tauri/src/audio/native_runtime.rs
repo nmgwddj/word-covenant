@@ -6,20 +6,79 @@
 //! releasing the dispatcher mutex.
 
 use super::{
-    AsrBridgeConfig, AsrQueueMetrics, CaptureClock, CaptureDispatcher, CaptureIngress,
-    DispatcherError, DispatcherMeter, DispatcherRuntime, DispatcherStatus, IngressPumpResult,
-    OwnedOutcomeLease, OwnedOutcomeLeaseError, ShutdownDrainResult, WorkerPumpResult,
+    AsrBridgeConfig, AsrJobClaim, AsrJobExecution, AsrJobLease, AsrQueueMetrics, CaptureClock,
+    CaptureDispatcher, CaptureIngress, DispatcherError, DispatcherMeter, DispatcherRuntime,
+    DispatcherStatus, IngressPumpResult, OwnedOutcomeLease, OwnedOutcomeLeaseError,
+    ShutdownDrainResult, ShutdownPreparationResult, WorkerPumpResult,
 };
-use crate::inference::pipeline::{EnergySpeechDetector, SpeechPipelineConfig, SpeechSegmenter};
+use crate::inference::pipeline::{
+    EnergySpeechDetector, SpeechActivityDetector, SpeechPipelineConfig, SpeechSegmenter,
+};
+use crate::inference::{AsrEngine, InferenceError};
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const DEFAULT_IDLE_WAIT: Duration = Duration::from_millis(2);
+pub const DEFAULT_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT: usize = 1;
+pub const MAX_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT: usize = 256;
 
-type NativeDispatcher = CaptureDispatcher<SpeechSegmenter<EnergySpeechDetector>>;
+struct BoxedSpeechDetector {
+    inner: Box<dyn SpeechActivityDetector>,
+}
+
+impl SpeechActivityDetector for BoxedSpeechDetector {
+    fn is_speech(
+        &mut self,
+        frame: &crate::inference::InferenceAudioWindow,
+    ) -> Result<bool, InferenceError> {
+        self.inner.is_speech(frame)
+    }
+}
+
+type NativeDispatcher = CaptureDispatcher<SpeechSegmenter<BoxedSpeechDetector>>;
 type RuntimeControl = (Mutex<WorkerControl>, Condvar);
+
+/// Native-only VAD and ASR instances transferred into one capture runtime.
+///
+/// The VAD stays with the dispatcher thread. The ASR engine is moved into its
+/// dedicated worker, so a non-`Sync` local model context never shares the
+/// capture dispatcher mutex or crosses a Tauri boundary.
+pub struct NativeInferenceEngines {
+    vad_detector: Box<dyn SpeechActivityDetector>,
+    asr_engine: Option<Box<dyn AsrEngine>>,
+}
+
+impl NativeInferenceEngines {
+    pub fn new<D, A>(vad_detector: D, asr_engine: A) -> Self
+    where
+        D: SpeechActivityDetector + 'static,
+        A: AsrEngine + 'static,
+    {
+        Self::from_boxed(Box::new(vad_detector), Some(Box::new(asr_engine)))
+    }
+
+    pub fn without_asr<D>(vad_detector: D) -> Self
+    where
+        D: SpeechActivityDetector + 'static,
+    {
+        Self::from_boxed(Box::new(vad_detector), None)
+    }
+
+    /// Accept boxed engines from a profile/runtime factory without exposing
+    /// their implementation type to application state.
+    pub fn from_boxed(
+        vad_detector: Box<dyn SpeechActivityDetector>,
+        asr_engine: Option<Box<dyn AsrEngine>>,
+    ) -> Self {
+        Self {
+            vad_detector,
+            asr_engine,
+        }
+    }
+}
 
 /// Local configuration for a parked native dispatcher worker.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +87,9 @@ pub struct NativeCaptureRuntimeConfig {
     pub energy_threshold: f32,
     pub pipeline: SpeechPipelineConfig,
     pub idle_wait: Duration,
+    /// At shutdown, at most this many pending jobs may invoke ASR after input
+    /// sealing. Remaining jobs become auditable terminal gaps.
+    pub shutdown_inference_attempt_limit: usize,
 }
 
 impl Default for NativeCaptureRuntimeConfig {
@@ -37,6 +99,7 @@ impl Default for NativeCaptureRuntimeConfig {
             energy_threshold: 0.015,
             pipeline: SpeechPipelineConfig::default(),
             idle_wait: DEFAULT_IDLE_WAIT,
+            shutdown_inference_attempt_limit: DEFAULT_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT,
         }
     }
 }
@@ -51,6 +114,13 @@ impl NativeCaptureRuntimeConfig {
         }
         if self.idle_wait.is_zero() {
             return Err("native capture worker idle wait must be greater than zero".to_owned());
+        }
+        if self.shutdown_inference_attempt_limit == 0
+            || self.shutdown_inference_attempt_limit > MAX_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT
+        {
+            return Err(format!(
+                "native shutdown inference attempt limit must be between 1 and {MAX_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT}"
+            ));
         }
         Ok(())
     }
@@ -142,7 +212,22 @@ struct WorkerControl {
     armed: bool,
     shutdown_requested: bool,
     abort_before_arm_requested: bool,
-    worker_finished: bool,
+    shutdown_input_prepared: bool,
+    shutdown_asr_finished: bool,
+    dispatcher_worker_finished: bool,
+    asr_worker_finished: bool,
+    signal_generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct WorkerControlSnapshot {
+    armed: bool,
+    shutdown_requested: bool,
+    abort_before_arm_requested: bool,
+    shutdown_input_prepared: bool,
+    shutdown_asr_finished: bool,
+    dispatcher_worker_finished: bool,
+    asr_worker_finished: bool,
     signal_generation: u64,
 }
 
@@ -153,16 +238,18 @@ enum WorkerWait {
     Drained,
 }
 
-/// One parked native dispatcher and the thread that drives it.
+/// One parked native dispatcher, its ingress thread, and its ASR worker.
 ///
-/// Before [`Self::arm`] the thread waits on a condition variable and never
-/// calls `CaptureIngress::try_consume`. After arm it pumps at most one ingress
-/// packet and one unavailable-engine ASR job per iteration. No PCM crosses a
-/// Tauri boundary.
+/// Before [`Self::arm`] neither thread calls `CaptureIngress::try_consume`.
+/// After arm, the dispatcher thread alone consumes ingress, updates the meter,
+/// and segments speech. The ASR worker alone owns the local engine and never
+/// retains the dispatcher mutex while it transcribes. No PCM crosses a Tauri
+/// boundary.
 pub struct NativeCaptureRuntime {
     dispatcher: Arc<Mutex<NativeDispatcher>>,
     control: Arc<RuntimeControl>,
-    worker: Option<JoinHandle<()>>,
+    dispatcher_worker: Option<JoinHandle<()>>,
+    asr_worker: Option<JoinHandle<()>>,
 }
 
 impl NativeCaptureRuntime {
@@ -172,13 +259,43 @@ impl NativeCaptureRuntime {
         clock: CaptureClock,
         config: NativeCaptureRuntimeConfig,
     ) -> Result<Self, NativeCaptureRuntimeError> {
+        let detector = EnergySpeechDetector::new(config.energy_threshold)
+            .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
+        Self::new_with_engines(
+            ingress,
+            runtime,
+            clock,
+            config,
+            NativeInferenceEngines::without_asr(detector),
+        )
+    }
+
+    /// Create a runtime with explicitly injected local VAD and ASR engines.
+    ///
+    /// The caller transfers ownership during construction. The VAD remains on
+    /// the dispatcher thread while the ASR engine moves to the dedicated
+    /// sequential worker, allowing a local engine to be `Send` but not
+    /// `Sync`.
+    pub fn new_with_engines(
+        ingress: Arc<CaptureIngress>,
+        runtime: DispatcherRuntime,
+        clock: CaptureClock,
+        config: NativeCaptureRuntimeConfig,
+        engines: NativeInferenceEngines,
+    ) -> Result<Self, NativeCaptureRuntimeError> {
         config
             .validate()
             .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
-        let segmenter = SpeechSegmenter::with_energy_gate(
+        let NativeInferenceEngines {
+            vad_detector,
+            asr_engine,
+        } = engines;
+        let segmenter = SpeechSegmenter::new(
             runtime.session_id,
             clock.clone(),
-            config.energy_threshold,
+            BoxedSpeechDetector {
+                inner: vad_detector,
+            },
             config.pipeline,
         )
         .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
@@ -188,19 +305,44 @@ impl NativeCaptureRuntime {
         let worker_dispatcher = Arc::clone(&dispatcher);
         let worker_control = Arc::clone(&control);
         let idle_wait = config.idle_wait;
-        let worker = thread::Builder::new()
+        let dispatcher_worker = thread::Builder::new()
             .name("word-covenant-native-dispatcher".to_owned())
-            .spawn(move || run_worker(worker_dispatcher, worker_control, idle_wait))
+            .spawn(move || run_dispatcher_worker(worker_dispatcher, worker_control, idle_wait))
             .map_err(|error| {
                 NativeCaptureRuntimeError::ThreadSpawn(format!(
                     "could not start native capture dispatcher: {error}"
                 ))
             })?;
 
+        let asr_dispatcher = Arc::clone(&dispatcher);
+        let asr_control = Arc::clone(&control);
+        let shutdown_inference_attempt_limit = config.shutdown_inference_attempt_limit;
+        let asr_worker = match thread::Builder::new()
+            .name("word-covenant-native-asr".to_owned())
+            .spawn(move || {
+                run_asr_worker(
+                    asr_dispatcher,
+                    asr_control,
+                    idle_wait,
+                    asr_engine,
+                    shutdown_inference_attempt_limit,
+                )
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                request_unarmed_abort(&control);
+                let _ = dispatcher_worker.join();
+                return Err(NativeCaptureRuntimeError::ThreadSpawn(format!(
+                    "could not start native ASR worker: {error}"
+                )));
+            }
+        };
+
         Ok(Self {
             dispatcher,
             control,
-            worker: Some(worker),
+            dispatcher_worker: Some(dispatcher_worker),
+            asr_worker: Some(asr_worker),
         })
     }
 
@@ -295,12 +437,16 @@ impl NativeCaptureRuntime {
         if !self.is_drained()? {
             return Ok(false);
         }
-        let Some(worker) = self.worker.take() else {
-            return Ok(true);
-        };
-        worker
-            .join()
-            .map_err(|_| NativeCaptureRuntimeError::WorkerPanicked)?;
+        if let Some(worker) = self.dispatcher_worker.take() {
+            worker
+                .join()
+                .map_err(|_| NativeCaptureRuntimeError::WorkerPanicked)?;
+        }
+        if let Some(worker) = self.asr_worker.take() {
+            worker
+                .join()
+                .map_err(|_| NativeCaptureRuntimeError::WorkerPanicked)?;
+        }
         Ok(true)
     }
 
@@ -317,7 +463,7 @@ impl NativeCaptureRuntime {
         if control.armed || !control.abort_before_arm_requested {
             return Err(NativeCaptureRuntimeError::CannotJoinAfterAbort);
         }
-        while !control.worker_finished {
+        while !workers_finished(&control) {
             control = match condition.wait(control) {
                 Ok(control) => control,
                 Err(poisoned) => poisoned.into_inner(),
@@ -325,12 +471,17 @@ impl NativeCaptureRuntime {
         }
         drop(control);
 
-        let Some(worker) = self.worker.take() else {
-            return Ok(());
-        };
-        worker
-            .join()
-            .map_err(|_| NativeCaptureRuntimeError::WorkerPanicked)
+        if let Some(worker) = self.dispatcher_worker.take() {
+            worker
+                .join()
+                .map_err(|_| NativeCaptureRuntimeError::WorkerPanicked)?;
+        }
+        if let Some(worker) = self.asr_worker.take() {
+            worker
+                .join()
+                .map_err(|_| NativeCaptureRuntimeError::WorkerPanicked)?;
+        }
+        Ok(())
     }
 
     pub fn metrics(&self) -> Result<AsrQueueMetrics, NativeCaptureRuntimeError> {
@@ -354,13 +505,13 @@ impl NativeCaptureRuntime {
                 dispatcher.metrics(),
             )
         };
-        let (armed, shutdown_requested, _, worker_finished, _) = control_snapshot(&self.control);
+        let control = control_snapshot(&self.control);
         Ok(NativeCaptureRuntimeSnapshot {
-            status: runtime_status(dispatcher_status, armed),
+            status: runtime_status(dispatcher_status, control.armed),
             dispatcher_status,
-            armed,
-            shutdown_requested,
-            worker_finished,
+            armed: control.armed,
+            shutdown_requested: control.shutdown_requested,
+            worker_finished: control.dispatcher_worker_finished && control.asr_worker_finished,
             meter,
             metrics,
         })
@@ -409,73 +560,216 @@ impl Drop for NativeCaptureRuntime {
     }
 }
 
-fn run_worker(
+fn run_dispatcher_worker(
     dispatcher: Arc<Mutex<NativeDispatcher>>,
     control: Arc<RuntimeControl>,
     idle_wait: Duration,
 ) {
     loop {
-        let (armed, shutdown_requested, abort_before_arm, _, signal_generation) =
-            control_snapshot(&control);
-        if !armed && !shutdown_requested {
-            wait_for_signal(&control, signal_generation);
+        let snapshot = control_snapshot(&control);
+        if !snapshot.armed && !snapshot.shutdown_requested {
+            wait_for_signal(&control, snapshot.signal_generation);
             continue;
         }
 
-        let wait = if abort_before_arm {
+        let wait = if snapshot.abort_before_arm_requested {
             drive_unarmed_abort_once(&dispatcher)
-        } else if shutdown_requested {
-            drive_shutdown_once(&dispatcher)
+        } else if snapshot.shutdown_requested {
+            drive_shutdown_dispatcher_once(&dispatcher, &control)
         } else {
-            drive_running_once(&dispatcher)
+            drive_running_dispatcher_once(&dispatcher, &control)
         };
         match wait {
             WorkerWait::Immediate => continue,
-            WorkerWait::Idle => wait_for_signal_or_timeout(&control, signal_generation, idle_wait),
-            WorkerWait::ExternalProgress => wait_for_signal(&control, signal_generation),
+            WorkerWait::Idle => {
+                wait_for_signal_or_timeout(&control, snapshot.signal_generation, idle_wait)
+            }
+            WorkerWait::ExternalProgress => wait_for_signal(&control, snapshot.signal_generation),
             WorkerWait::Drained => {
-                mark_worker_finished(&control);
+                mark_dispatcher_worker_finished(&control);
                 return;
             }
         }
     }
 }
 
-fn drive_running_once(dispatcher: &Arc<Mutex<NativeDispatcher>>) -> WorkerWait {
-    let mut dispatcher = recover_mutex(dispatcher);
-    let ingress = dispatcher.pump_ingress_once();
-    let worker = dispatcher.pump_worker_once(None);
+fn run_asr_worker(
+    dispatcher: Arc<Mutex<NativeDispatcher>>,
+    control: Arc<RuntimeControl>,
+    idle_wait: Duration,
+    mut engine: Option<Box<dyn AsrEngine>>,
+    mut shutdown_attempts_remaining: usize,
+) {
+    loop {
+        let snapshot = control_snapshot(&control);
+        if !snapshot.armed && !snapshot.shutdown_requested {
+            wait_for_signal(&control, snapshot.signal_generation);
+            continue;
+        }
+        if snapshot.abort_before_arm_requested {
+            mark_asr_worker_finished(&control);
+            return;
+        }
+        if snapshot.shutdown_requested && !snapshot.shutdown_input_prepared {
+            wait_for_signal(&control, snapshot.signal_generation);
+            continue;
+        }
+        if snapshot.shutdown_requested && shutdown_attempts_remaining == 0 {
+            mark_shutdown_asr_finished(&control);
+            mark_asr_worker_finished(&control);
+            return;
+        }
 
-    if matches!(ingress, Ok(IngressPumpResult::BlockedByPendingEvent))
-        || matches!(worker, WorkerPumpResult::BlockedByResultQueue)
-    {
+        let claim = {
+            let mut dispatcher = recover_mutex(&dispatcher);
+            dispatcher.claim_asr_job()
+        };
+        match claim {
+            AsrJobClaim::Claimed(lease) => {
+                let used_shutdown_attempt = snapshot.shutdown_requested;
+                let execution = execute_asr_job(&mut engine, &lease);
+                let completion = {
+                    let mut dispatcher = recover_mutex(&dispatcher);
+                    dispatcher
+                        .complete_asr_job(lease, execution)
+                        .expect("a native ASR worker completes its active job lease")
+                };
+                if used_shutdown_attempt {
+                    shutdown_attempts_remaining = shutdown_attempts_remaining.saturating_sub(1);
+                }
+                wake_worker(&control);
+                if used_shutdown_attempt && shutdown_attempts_remaining == 0 {
+                    mark_shutdown_asr_finished(&control);
+                    mark_asr_worker_finished(&control);
+                    return;
+                }
+                match completion {
+                    WorkerPumpResult::BlockedByResultQueue => {
+                        wait_for_signal(&control, snapshot.signal_generation)
+                    }
+                    WorkerPumpResult::Processed
+                    | WorkerPumpResult::DeliveredHeldOutcome
+                    | WorkerPumpResult::NoJob
+                    | WorkerPumpResult::InFlight => continue,
+                }
+            }
+            AsrJobClaim::DeliveredHeldOutcome => continue,
+            AsrJobClaim::BlockedByResultQueue | AsrJobClaim::InFlight => {
+                wait_for_signal(&control, snapshot.signal_generation)
+            }
+            AsrJobClaim::NoJob => {
+                if snapshot.shutdown_requested {
+                    mark_shutdown_asr_finished(&control);
+                    mark_asr_worker_finished(&control);
+                    return;
+                }
+                wait_for_signal_or_timeout(&control, snapshot.signal_generation, idle_wait);
+            }
+        }
+    }
+}
+
+fn execute_asr_job(
+    engine: &mut Option<Box<dyn AsrEngine>>,
+    lease: &AsrJobLease,
+) -> AsrJobExecution {
+    let Some(asr_engine) = engine.as_mut() else {
+        return AsrJobExecution::EngineUnavailable;
+    };
+    let model_provenance = asr_engine.model_provenance().clone();
+    let result = catch_unwind(AssertUnwindSafe(|| asr_engine.transcribe(lease.request())));
+    match result {
+        Ok(result) => AsrJobExecution::EngineResult {
+            model_provenance,
+            result,
+        },
+        Err(_) => {
+            // An engine panic still needs a terminal outcome for the active
+            // job. Retire the context so later jobs become explicit
+            // local-engine-unavailable gaps instead of reusing a broken model.
+            *engine = None;
+            AsrJobExecution::EngineResult {
+                model_provenance,
+                result: Err(InferenceError::failed("local ASR engine panicked")),
+            }
+        }
+    }
+}
+
+fn drive_running_dispatcher_once(
+    dispatcher: &Arc<Mutex<NativeDispatcher>>,
+    control: &Arc<RuntimeControl>,
+) -> WorkerWait {
+    let ingress = {
+        let mut dispatcher = recover_mutex(dispatcher);
+        dispatcher.pump_ingress_once()
+    };
+
+    if matches!(ingress, Ok(IngressPumpResult::BlockedByPendingEvent)) {
         return WorkerWait::ExternalProgress;
     }
-    if dispatcher.status() == DispatcherStatus::Drained {
+    if matches!(ingress, Ok(IngressPumpResult::Drained)) {
         return WorkerWait::Drained;
     }
-    if matches!(ingress, Ok(IngressPumpResult::Consumed))
-        || matches!(
-            worker,
-            WorkerPumpResult::Processed | WorkerPumpResult::DeliveredHeldOutcome
-        )
-    {
+    if matches!(ingress, Ok(IngressPumpResult::Consumed)) {
+        wake_worker(control);
         WorkerWait::Immediate
     } else {
         WorkerWait::Idle
     }
 }
 
-fn drive_shutdown_once(dispatcher: &Arc<Mutex<NativeDispatcher>>) -> WorkerWait {
-    let mut dispatcher = recover_mutex(dispatcher);
-    dispatcher.begin_shutdown();
-    let _ = dispatcher.pump_ingress_once();
-    match dispatcher.drain_shutdown_once() {
+fn drive_shutdown_dispatcher_once(
+    dispatcher: &Arc<Mutex<NativeDispatcher>>,
+    control: &Arc<RuntimeControl>,
+) -> WorkerWait {
+    let (ingress, preparation) = {
+        let mut dispatcher = recover_mutex(dispatcher);
+        dispatcher.begin_shutdown();
+        let ingress = dispatcher.pump_ingress_once();
+        let preparation = match ingress {
+            Ok(IngressPumpResult::BlockedByPendingEvent) => None,
+            _ => Some(dispatcher.prepare_shutdown_for_inference_once()),
+        };
+        (ingress, preparation)
+    };
+
+    if matches!(ingress, Ok(IngressPumpResult::BlockedByPendingEvent)) {
+        return WorkerWait::ExternalProgress;
+    }
+    if matches!(ingress, Ok(IngressPumpResult::Consumed)) {
+        return WorkerWait::Immediate;
+    }
+    let Some(preparation) = preparation else {
+        return WorkerWait::Idle;
+    };
+    match preparation {
+        Ok(ShutdownPreparationResult::WaitingForIngress) => WorkerWait::Immediate,
+        Ok(ShutdownPreparationResult::WaitingForPendingEvent) => WorkerWait::ExternalProgress,
+        Ok(ShutdownPreparationResult::Drained) => WorkerWait::Drained,
+        Ok(ShutdownPreparationResult::ReadyForInference) => {
+            mark_shutdown_input_prepared(control);
+            if !control_snapshot(control).shutdown_asr_finished {
+                return WorkerWait::ExternalProgress;
+            }
+            drain_shutdown_once(dispatcher)
+        }
+        Err(_) => WorkerWait::Idle,
+    }
+}
+
+fn drain_shutdown_once(dispatcher: &Arc<Mutex<NativeDispatcher>>) -> WorkerWait {
+    let result = {
+        let mut dispatcher = recover_mutex(dispatcher);
+        dispatcher.drain_shutdown_once()
+    };
+    match result {
         Ok(ShutdownDrainResult::Drained) => WorkerWait::Drained,
         Ok(ShutdownDrainResult::WaitingForIngress) => WorkerWait::Immediate,
         Ok(
             ShutdownDrainResult::WaitingForPendingEvent
             | ShutdownDrainResult::WaitingForOutcomeDelivery
+            | ShutdownDrainResult::AwaitingInference
             | ShutdownDrainResult::AwaitingOutcomeCommit,
         ) => WorkerWait::ExternalProgress,
         Err(_) => WorkerWait::Idle,
@@ -493,6 +787,7 @@ fn drive_unarmed_abort_once(dispatcher: &Arc<Mutex<NativeDispatcher>>) -> Worker
         Ok(
             ShutdownDrainResult::WaitingForPendingEvent
             | ShutdownDrainResult::WaitingForOutcomeDelivery
+            | ShutdownDrainResult::AwaitingInference
             | ShutdownDrainResult::AwaitingOutcomeCommit,
         ) => WorkerWait::ExternalProgress,
         Err(_) => WorkerWait::Idle,
@@ -508,16 +803,19 @@ fn runtime_status(dispatcher_status: DispatcherStatus, armed: bool) -> NativeCap
     }
 }
 
-fn control_snapshot(control: &Arc<RuntimeControl>) -> (bool, bool, bool, bool, u64) {
+fn control_snapshot(control: &Arc<RuntimeControl>) -> WorkerControlSnapshot {
     let (mutex, _) = &**control;
     let control = recover_mutex(mutex);
-    (
-        control.armed,
-        control.shutdown_requested,
-        control.abort_before_arm_requested,
-        control.worker_finished,
-        control.signal_generation,
-    )
+    WorkerControlSnapshot {
+        armed: control.armed,
+        shutdown_requested: control.shutdown_requested,
+        abort_before_arm_requested: control.abort_before_arm_requested,
+        shutdown_input_prepared: control.shutdown_input_prepared,
+        shutdown_asr_finished: control.shutdown_asr_finished,
+        dispatcher_worker_finished: control.dispatcher_worker_finished,
+        asr_worker_finished: control.asr_worker_finished,
+        signal_generation: control.signal_generation,
+    }
 }
 
 fn wake_worker(control: &Arc<RuntimeControl>) {
@@ -526,11 +824,52 @@ fn wake_worker(control: &Arc<RuntimeControl>) {
     signal_control(&mut control, condition);
 }
 
-fn mark_worker_finished(control: &Arc<RuntimeControl>) {
+fn mark_shutdown_input_prepared(control: &Arc<RuntimeControl>) {
     let (mutex, condition) = &**control;
     let mut control = recover_mutex(mutex);
-    control.worker_finished = true;
+    if !control.shutdown_input_prepared {
+        control.shutdown_input_prepared = true;
+        signal_control(&mut control, condition);
+    }
+}
+
+fn mark_shutdown_asr_finished(control: &Arc<RuntimeControl>) {
+    let (mutex, condition) = &**control;
+    let mut control = recover_mutex(mutex);
+    if !control.shutdown_asr_finished {
+        control.shutdown_asr_finished = true;
+        signal_control(&mut control, condition);
+    }
+}
+
+fn mark_dispatcher_worker_finished(control: &Arc<RuntimeControl>) {
+    let (mutex, condition) = &**control;
+    let mut control = recover_mutex(mutex);
+    if !control.dispatcher_worker_finished {
+        control.dispatcher_worker_finished = true;
+        signal_control(&mut control, condition);
+    }
+}
+
+fn mark_asr_worker_finished(control: &Arc<RuntimeControl>) {
+    let (mutex, condition) = &**control;
+    let mut control = recover_mutex(mutex);
+    if !control.asr_worker_finished {
+        control.asr_worker_finished = true;
+        signal_control(&mut control, condition);
+    }
+}
+
+fn request_unarmed_abort(control: &Arc<RuntimeControl>) {
+    let (mutex, condition) = &**control;
+    let mut control = recover_mutex(mutex);
+    control.shutdown_requested = true;
+    control.abort_before_arm_requested = true;
     signal_control(&mut control, condition);
+}
+
+fn workers_finished(control: &WorkerControl) -> bool {
+    control.dispatcher_worker_finished && control.asr_worker_finished
 }
 
 fn signal_control(control: &mut WorkerControl, condition: &Condvar) {
@@ -577,10 +916,88 @@ mod tests {
     use crate::audio::{
         AsrOutcome, CapturePoint, CaptureWriteResult, DispatcherMeter, DispatcherRuntimeId,
     };
-    use crate::inference::{InferenceGapReason, INFERENCE_SAMPLE_RATE_HZ};
+    use crate::inference::{
+        AsrRequest, AsrResponse, InferenceEngine, InferenceExecutionScope, InferenceGapReason,
+        ModelProvenance, TranscriptEmission, TranscriptEmissionKind, INFERENCE_SAMPLE_RATE_HZ,
+    };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::Instant;
     use uuid::Uuid;
+
+    struct BlockingAsr {
+        model: ModelProvenance,
+        gate: Arc<(Mutex<BlockingAsrState>, Condvar)>,
+    }
+
+    #[derive(Default)]
+    struct BlockingAsrState {
+        started: bool,
+        released: bool,
+        calls: usize,
+    }
+
+    impl BlockingAsr {
+        fn new(gate: Arc<(Mutex<BlockingAsrState>, Condvar)>) -> Self {
+            Self {
+                model: test_model(),
+                gate,
+            }
+        }
+    }
+
+    impl InferenceEngine for BlockingAsr {
+        fn model_provenance(&self) -> &ModelProvenance {
+            &self.model
+        }
+
+        fn execution_scope(&self) -> InferenceExecutionScope {
+            InferenceExecutionScope::OnDevice
+        }
+    }
+
+    impl AsrEngine for BlockingAsr {
+        fn transcribe(&mut self, request: &AsrRequest) -> Result<AsrResponse, InferenceError> {
+            let (mutex, condition) = &*self.gate;
+            let mut state = recover_mutex(mutex);
+            state.started = true;
+            state.calls = state.calls.saturating_add(1);
+            condition.notify_all();
+            while !state.released {
+                state = match condition.wait(state) {
+                    Ok(state) => state,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+            }
+            drop(state);
+            test_response(request, &self.model)
+        }
+    }
+
+    fn test_model() -> ModelProvenance {
+        ModelProvenance::new("test", "native-runtime-asr", "v1", "b".repeat(64)).unwrap()
+    }
+
+    fn test_response(
+        request: &AsrRequest,
+        model: &ModelProvenance,
+    ) -> Result<AsrResponse, InferenceError> {
+        AsrResponse::new(
+            request,
+            model,
+            vec![TranscriptEmission {
+                utterance_key: format!("native-runtime-{}", request.audio.capture_start_ns()),
+                capture_start_ns: request.audio.capture_start_ns(),
+                capture_end_ns: request.audio.capture_end_ns(),
+                text: "local speech".to_owned(),
+                kind: TranscriptEmissionKind::Final,
+                revision: 1,
+                word_timings: Vec::new(),
+                model_provenance: model.clone(),
+            }],
+        )
+        .map_err(InferenceError::invalid)
+    }
 
     fn anchor() -> CapturePoint {
         CapturePoint {
@@ -614,6 +1031,7 @@ mod tests {
                 emit_partials: false,
             },
             idle_wait: Duration::from_millis(1),
+            shutdown_inference_attempt_limit: 1,
         }
     }
 
@@ -624,6 +1042,21 @@ mod tests {
             dispatcher_runtime(),
             CaptureClock::new(anchor(), INFERENCE_SAMPLE_RATE_HZ).unwrap(),
             config(),
+        )
+        .unwrap();
+        (runtime, ingress)
+    }
+
+    fn new_runtime_with_engine(
+        engine: impl AsrEngine + 'static,
+    ) -> (NativeCaptureRuntime, Arc<CaptureIngress>) {
+        let ingress = CaptureIngress::new(8, 160).unwrap();
+        let runtime = NativeCaptureRuntime::new_with_engines(
+            Arc::clone(&ingress),
+            dispatcher_runtime(),
+            CaptureClock::new(anchor(), INFERENCE_SAMPLE_RATE_HZ).unwrap(),
+            config(),
+            NativeInferenceEngines::new(EnergySpeechDetector::new(0.01).unwrap(), engine),
         )
         .unwrap();
         (runtime, ingress)
@@ -663,6 +1096,44 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    fn wait_for_ingress_packets(runtime: &NativeCaptureRuntime, minimum: u64) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if runtime.metrics().unwrap().ingress_packets_consumed >= minimum {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "dispatcher did not consume the expected ingress packet"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn wait_for_engine_start(gate: &Arc<(Mutex<BlockingAsrState>, Condvar)>) {
+        let (mutex, condition) = &**gate;
+        let mut state = recover_mutex(mutex);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !state.started {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "ASR engine did not begin its blocked inference call"
+            );
+            state = match condition.wait_timeout(state, remaining) {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+
+    fn release_engine(gate: &Arc<(Mutex<BlockingAsrState>, Condvar)>) {
+        let (mutex, condition) = &**gate;
+        let mut state = recover_mutex(mutex);
+        state.released = true;
+        condition.notify_all();
     }
 
     #[test]
@@ -742,6 +1213,70 @@ mod tests {
         runtime.commit_owned_outcome(lease.token()).unwrap();
         runtime.request_shutdown().unwrap();
         wait_for_drained(&runtime);
+        assert!(runtime.join_if_drained().unwrap());
+    }
+
+    #[test]
+    fn dispatcher_keeps_consuming_ingress_while_asr_blocks_outside_its_mutex() {
+        let gate = Arc::new((Mutex::new(BlockingAsrState::default()), Condvar::new()));
+        let (mut runtime, ingress) = new_runtime_with_engine(BlockingAsr::new(Arc::clone(&gate)));
+        runtime.arm().unwrap();
+        write_speech_then_silence(&ingress);
+        wait_for_engine_start(&gate);
+
+        assert_eq!(
+            ingress.try_write(320, INFERENCE_SAMPLE_RATE_HZ, 1, &[0.25; 160]),
+            CaptureWriteResult::Enqueued
+        );
+        wait_for_ingress_packets(&runtime, 3);
+        assert_eq!(runtime.metrics().unwrap().jobs_completed, 0);
+        assert!(runtime.meter().unwrap().peak_dbfs > -20.0);
+
+        release_engine(&gate);
+        let first = wait_for_outcome(&runtime);
+        assert!(matches!(first.outcome(), AsrOutcome::Response { .. }));
+        runtime.commit_owned_outcome(first.token()).unwrap();
+
+        // The post-block packet remains an active utterance until shutdown.
+        // Sealing it must still receive the configured one-call ASR budget.
+        runtime.request_shutdown().unwrap();
+        let final_window = wait_for_outcome(&runtime);
+        assert!(matches!(
+            final_window.outcome(),
+            AsrOutcome::Response { .. }
+        ));
+        runtime.commit_owned_outcome(final_window.token()).unwrap();
+        wait_for_drained(&runtime);
+        assert!(runtime.join_if_drained().unwrap());
+    }
+
+    #[test]
+    fn shutdown_infers_one_sealed_final_window_before_terminalizing_remaining_work() {
+        let gate = Arc::new((
+            Mutex::new(BlockingAsrState {
+                released: true,
+                ..BlockingAsrState::default()
+            }),
+            Condvar::new(),
+        ));
+        let (mut runtime, ingress) = new_runtime_with_engine(BlockingAsr::new(Arc::clone(&gate)));
+        runtime.arm().unwrap();
+        assert_eq!(
+            ingress.try_write(0, INFERENCE_SAMPLE_RATE_HZ, 1, &[0.5; 160]),
+            CaptureWriteResult::Enqueued
+        );
+        wait_for_ingress_packets(&runtime, 1);
+
+        runtime.request_shutdown().unwrap();
+        let final_window = wait_for_outcome(&runtime);
+        assert!(matches!(
+            final_window.outcome(),
+            AsrOutcome::Response { .. }
+        ));
+        runtime.commit_owned_outcome(final_window.token()).unwrap();
+        wait_for_drained(&runtime);
+        assert_eq!(runtime.metrics().unwrap().shutdown_outcomes, 0);
+        assert_eq!(recover_mutex(&gate.0).calls, 1);
         assert!(runtime.join_if_drained().unwrap());
     }
 

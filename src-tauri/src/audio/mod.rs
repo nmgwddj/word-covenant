@@ -28,9 +28,10 @@ pub use development_mock::{
     DevelopmentMockProgress, DevelopmentMockRunner, DEVELOPMENT_MOCK_MAX_PACKETS_PER_ADVANCE,
 };
 pub use dispatcher::{
-    AsrBridgeConfig, AsrJob, AsrJobMetadata, AsrOutcome, AsrQueueMetrics, CaptureDispatcher,
-    DispatcherError, DispatcherMeter, DispatcherRuntime, DispatcherRuntimeId, DispatcherStatus,
-    IngressPumpResult, OwnedOutcomeLease, OwnedOutcomeLeaseError, ShutdownDrainResult,
+    AsrBridgeConfig, AsrJob, AsrJobClaim, AsrJobExecution, AsrJobLease, AsrJobLeaseError,
+    AsrJobMetadata, AsrOutcome, AsrQueueMetrics, CaptureDispatcher, DispatcherError,
+    DispatcherMeter, DispatcherRuntime, DispatcherRuntimeId, DispatcherStatus, IngressPumpResult,
+    OwnedOutcomeLease, OwnedOutcomeLeaseError, ShutdownDrainResult, ShutdownPreparationResult,
     WorkerPumpResult,
 };
 pub use lifecycle::{
@@ -43,7 +44,8 @@ pub use macos::{
 };
 pub use native_runtime::{
     NativeCaptureRuntime, NativeCaptureRuntimeConfig, NativeCaptureRuntimeError,
-    NativeCaptureRuntimeSnapshot, NativeCaptureRuntimeStatus,
+    NativeCaptureRuntimeSnapshot, NativeCaptureRuntimeStatus, NativeInferenceEngines,
+    DEFAULT_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT, MAX_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT,
 };
 #[cfg(target_os = "macos")]
 pub use service::{
