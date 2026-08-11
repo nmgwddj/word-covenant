@@ -478,8 +478,10 @@ impl AuditStore {
 
             CREATE TABLE IF NOT EXISTS capture_preferences (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                mode TEXT NOT NULL DEFAULT 'adaptive'
+                    CHECK (mode IN ('adaptive', 'manual')),
                 rms_threshold_dbfs INTEGER NOT NULL
-                    CHECK (rms_threshold_dbfs BETWEEN -60 AND 0)
+                    CHECK (rms_threshold_dbfs BETWEEN -42 AND 0)
             );
             ",
         )?;
@@ -493,15 +495,14 @@ impl AuditStore {
         let persisted = self
             .connection
             .query_row(
-                "SELECT rms_threshold_dbfs FROM capture_preferences WHERE singleton = 1",
+                "SELECT mode, rms_threshold_dbfs FROM capture_preferences WHERE singleton = 1",
                 [],
-                |row| row.get::<_, Value>(0),
+                |row| Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?)),
             )
             .optional()?;
         Ok(match persisted {
-            Some(Value::Integer(value)) => {
-                SpeechDetectionSettings::from_persisted_rms_threshold_dbfs(value)
-                    .unwrap_or_default()
+            Some((Value::Text(mode), Value::Integer(value))) => {
+                SpeechDetectionSettings::from_persisted_values(&mode, value).unwrap_or_default()
             }
             Some(_) | None => SpeechDetectionSettings::default(),
         })
@@ -514,16 +515,18 @@ impl AuditStore {
         settings
             .validate()
             .map_err(|_| AuditStoreError::InvalidCaptureMetadata {
-                field: "speech RMS threshold dBFS",
-                value: settings.rms_threshold_dbfs.to_string(),
+                field: "speech detection settings",
+                value: format!("{}:{}", settings.mode.as_str(), settings.rms_threshold_dbfs),
             })?;
         self.connection.execute(
             "
-            INSERT INTO capture_preferences (singleton, rms_threshold_dbfs)
-            VALUES (1, ?1)
-            ON CONFLICT(singleton) DO UPDATE SET rms_threshold_dbfs = excluded.rms_threshold_dbfs
+            INSERT INTO capture_preferences (singleton, mode, rms_threshold_dbfs)
+            VALUES (1, ?1, ?2)
+            ON CONFLICT(singleton) DO UPDATE SET
+                mode = excluded.mode,
+                rms_threshold_dbfs = excluded.rms_threshold_dbfs
             ",
-            params![settings.rms_threshold_dbfs],
+            params![settings.mode.as_str(), settings.rms_threshold_dbfs],
         )?;
         Ok(())
     }
@@ -3475,7 +3478,8 @@ mod tests {
 
         assert!(store
             .set_speech_detection_settings(SpeechDetectionSettings {
-                rms_threshold_dbfs: -61,
+                mode: crate::audio::SpeechDetectionMode::Manual,
+                rms_threshold_dbfs: -43,
             })
             .is_err());
         assert_eq!(store.speech_detection_settings().unwrap(), configured);
@@ -3492,7 +3496,7 @@ mod tests {
             .connection
             .execute(
                 "INSERT INTO capture_preferences (singleton, rms_threshold_dbfs) VALUES (1, ?1)",
-                params![-61],
+                params![-43],
             )
             .unwrap();
 

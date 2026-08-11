@@ -40,16 +40,16 @@ model_root="${resource_root}/models"
 
 test -d "${app_path}"
 test "$(plutil -extract LSMinimumSystemVersion raw "${app_path}/Contents/Info.plist")" = '11.0'
-test -s "${resource_root}/third-party/whisper-base-model-card.txt"
-test -s "${resource_root}/third-party/whisper-base-model-MIT.txt"
-test -f "${model_root}/ggml-base.bin"
+test -s "${resource_root}/third-party/whisper-large-v3-turbo-model-card.txt"
+test -s "${resource_root}/third-party/whisper-large-v3-turbo-model-MIT.txt"
+test -f "${model_root}/ggml-large-v3-turbo-q5_0.bin"
 test -f "${model_root}/manifest.json"
 test "$(find "${model_root}" -mindepth 1 -maxdepth 1 -type f -print | wc -l | tr -d '[:space:]')" = '2'
 test "$(find "${model_root}" -mindepth 1 -maxdepth 1 ! -type f -print | wc -l | tr -d '[:space:]')" = '0'
-test "$(stat -f '%Lp' "${model_root}/ggml-base.bin")" = '644'
-cmp -s "${project_root}/models/whisper-base.lock.json" "${model_root}/manifest.json"
+test "$(stat -f '%Lp' "${model_root}/ggml-large-v3-turbo-q5_0.bin")" = '644'
+cmp -s "${project_root}/models/whisper-large-v3-turbo-q5_0.lock.json" "${model_root}/manifest.json"
 
 cd "${project_root}"
-pnpm model:verify -- --manifest "${model_root}/manifest.json" --destination "${model_root}/ggml-base.bin"
+pnpm model:verify -- --manifest "${model_root}/manifest.json" --destination "${model_root}/ggml-large-v3-turbo-q5_0.bin"
 
 printf 'Verified packaged WordCovenant DMG: %s\n' "${dmg_path}"

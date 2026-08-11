@@ -5,12 +5,11 @@
 //! the artifact can be loaded by Whisper.
 
 use super::{
-    model_registry::{LocalModelKind, RegisteredModel, VerifiedModelArtifact},
+    model_registry::{AuthorizedModelArtifact, LocalModelKind, RegisteredModel},
     WHISPER_CPP_GGML_INPUT_FORMAT,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
@@ -28,7 +27,7 @@ const SHA256_HEX_LENGTH: usize = 64;
 ///
 /// A changed model must receive a different identity in its reviewed lock
 /// file rather than replacing this artifact in place.
-pub const BUNDLED_ASR_MODEL_ID: Uuid = Uuid::from_u128(0x32ce_7670_d303_4566_9cc3_123a_380b_efe9);
+pub const BUNDLED_ASR_MODEL_ID: Uuid = Uuid::from_u128(0xe061_b65d_e3a6_4700_86ad_9a8e_a6df_3626);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,7 +94,6 @@ pub enum BundledModelError {
     ArtifactIsSymlink,
     ArtifactIsNotRegularFile,
     ArtifactSizeMismatch,
-    ArtifactHashMismatch,
     Io,
 }
 
@@ -113,9 +111,6 @@ impl fmt::Display for BundledModelError {
             Self::ArtifactIsSymlink => "the bundled model artifact must not be a symbolic link",
             Self::ArtifactIsNotRegularFile => "the bundled model artifact is not a regular file",
             Self::ArtifactSizeMismatch => "the bundled model artifact has an unexpected size",
-            Self::ArtifactHashMismatch => {
-                "the bundled model artifact failed integrity verification"
-            }
             Self::Io => "the bundled model artifact could not be read",
         };
         formatter.write_str(message)
@@ -124,26 +119,25 @@ impl fmt::Display for BundledModelError {
 
 impl std::error::Error for BundledModelError {}
 
-/// Validates the app-packaged manifest and model bytes without retaining the
-/// model buffer. Startup uses this to project only compact model metadata.
-/// This never performs a network request or exposes a resource path over IPC.
-pub(crate) fn verified_bundled_model_metadata(
+/// Validates the app-packaged manifest and regular-file metadata without
+/// reading model bytes. The signed application bundle is the runtime trust
+/// boundary; release packaging verifies the reviewed digest before signing.
+pub(crate) fn bundled_model_metadata(
     resource_dir: impl AsRef<Path>,
 ) -> Result<RegisteredModel, BundledModelError> {
     let (resource_root, definition) = packaged_model_definition(resource_dir.as_ref())?;
-    verified_model_metadata_from_definition(&resource_root, &definition)
+    model_metadata_from_definition(&resource_root, &definition)
 }
 
-/// Reads the bundled model from one no-follow file descriptor, verifies the
-/// bytes that were read, and returns those exact owned bytes to the local
-/// Whisper adapter. The adapter must use its buffer API; it must not reopen a
-/// resource path after this function returns.
+/// Reads the bundled model once from one no-follow file descriptor and returns
+/// those exact owned bytes to the local Whisper adapter. Runtime SHA-256 is
+/// intentionally omitted because the signed application bundle is trusted.
 #[cfg_attr(not(all(target_os = "macos", not(test))), allow(dead_code))]
-pub(crate) fn verified_bundled_model(
+pub(crate) fn load_bundled_model(
     resource_dir: impl AsRef<Path>,
-) -> Result<VerifiedModelArtifact, BundledModelError> {
+) -> Result<AuthorizedModelArtifact, BundledModelError> {
     let (resource_root, definition) = packaged_model_definition(resource_dir.as_ref())?;
-    verified_model_from_definition(&resource_root, &definition)
+    load_model_from_definition(&resource_root, &definition)
 }
 
 fn packaged_model_definition(
@@ -166,74 +160,66 @@ fn packaged_model_definition(
 }
 
 fn embedded_definition() -> Result<BundledModelDefinition, BundledModelError> {
-    let definition = serde_json::from_str(include_str!("../../../models/whisper-base.lock.json"))
-        .map_err(|_| BundledModelError::EmbeddedManifest)?;
+    let definition = serde_json::from_str(include_str!(
+        "../../../models/whisper-large-v3-turbo-q5_0.lock.json"
+    ))
+    .map_err(|_| BundledModelError::EmbeddedManifest)?;
     validate_definition(&definition)?;
     Ok(definition)
 }
 
-fn verified_model_from_definition(
+fn load_model_from_definition(
     resource_root: &Path,
     definition: &BundledModelDefinition,
-) -> Result<VerifiedModelArtifact, BundledModelError> {
+) -> Result<AuthorizedModelArtifact, BundledModelError> {
     let mut file = open_bundled_model_file(resource_root, definition)?;
-    let (bytes, actual_size, actual_sha256) =
-        read_model_bytes_with_sha256(&mut file, definition.size_bytes)?;
-    verify_model_integrity(definition, actual_size, &actual_sha256)?;
+    let bytes = read_model_bytes(&mut file, definition.size_bytes)?;
 
-    Ok(VerifiedModelArtifact::from_verified_native_bytes(
+    Ok(AuthorizedModelArtifact::from_trusted_bundled_bytes(
         registered_model_from_definition(definition)?,
         bytes,
     ))
 }
 
-fn verified_model_metadata_from_definition(
+fn model_metadata_from_definition(
     resource_root: &Path,
     definition: &BundledModelDefinition,
 ) -> Result<RegisteredModel, BundledModelError> {
-    let mut file = open_bundled_model_file(resource_root, definition)?;
-    let (actual_size, actual_sha256) = read_with_sha256(&mut file)?;
-    verify_model_integrity(definition, actual_size, &actual_sha256)?;
+    let _ = bundled_model_path(resource_root, definition)?;
 
     registered_model_from_definition(definition)
-}
-
-fn verify_model_integrity(
-    definition: &BundledModelDefinition,
-    actual_size: u64,
-    actual_sha256: &str,
-) -> Result<(), BundledModelError> {
-    if actual_size != definition.size_bytes {
-        return Err(BundledModelError::ArtifactSizeMismatch);
-    }
-    if actual_sha256 != definition.sha256 {
-        return Err(BundledModelError::ArtifactHashMismatch);
-    }
-    Ok(())
 }
 
 fn open_bundled_model_file(
     resource_root: &Path,
     definition: &BundledModelDefinition,
 ) -> Result<File, BundledModelError> {
-    validate_definition(definition)?;
-    let resource_root = canonical_resource_root(resource_root)?;
-    let relative_path = Path::new(BUNDLED_RESOURCE_DIRECTORY).join(&definition.artifact_file_name);
-    let artifact_path = resolve_regular_resource_file(&resource_root, &relative_path)?;
+    let artifact_path = bundled_model_path(resource_root, definition)?;
     let file = open_no_follow_regular_file(&artifact_path)?;
     let metadata = file.metadata().map_err(|_| BundledModelError::Io)?;
 
-    // The descriptor, rather than a path preflight, is authoritative. A
-    // replacement between the preflight and `open` still cannot reach Whisper:
-    // this handle is rechecked and its bytes are hashed below.
-    if !metadata.file_type().is_file() {
-        return Err(BundledModelError::ArtifactIsNotRegularFile);
-    }
     if metadata.len() != definition.size_bytes {
         return Err(BundledModelError::ArtifactSizeMismatch);
     }
 
     Ok(file)
+}
+
+fn bundled_model_path(
+    resource_root: &Path,
+    definition: &BundledModelDefinition,
+) -> Result<PathBuf, BundledModelError> {
+    validate_definition(definition)?;
+    let resource_root = canonical_resource_root(resource_root)?;
+    let relative_path = Path::new(BUNDLED_RESOURCE_DIRECTORY).join(&definition.artifact_file_name);
+    let artifact_path = resolve_regular_resource_file(&resource_root, &relative_path)?;
+    let metadata = fs::metadata(&artifact_path).map_err(|_| BundledModelError::Io)?;
+
+    if metadata.len() != definition.size_bytes {
+        return Err(BundledModelError::ArtifactSizeMismatch);
+    }
+
+    Ok(artifact_path)
 }
 
 fn registered_model_from_definition(
@@ -263,9 +249,9 @@ fn validate_definition(definition: &BundledModelDefinition) -> Result<(), Bundle
         || definition.model_id != BUNDLED_ASR_MODEL_ID
         || definition.model_kind != LocalModelKind::SpeechRecognition
         || definition.input_format != WHISPER_CPP_GGML_INPUT_FORMAT
-        || definition.variant != "base"
+        || definition.variant != "large-v3-turbo-q5_0"
         || !definition.multilingual
-        || definition.artifact_file_name != "ggml-base.bin"
+        || definition.artifact_file_name != "ggml-large-v3-turbo-q5_0.bin"
         || definition.size_bytes == 0
         || definition.sha256.len() != SHA256_HEX_LENGTH
         || !definition
@@ -377,29 +363,7 @@ fn open_no_follow_regular_file(path: &Path) -> Result<File, BundledModelError> {
     }
 }
 
-fn read_with_sha256(file: &mut File) -> Result<(u64, String), BundledModelError> {
-    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-
-    loop {
-        let read = file.read(&mut buffer).map_err(|_| BundledModelError::Io)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size = size
-            .checked_add(u64::try_from(read).expect("read size fits in u64"))
-            .ok_or(BundledModelError::Io)?;
-    }
-
-    Ok((size, hex_digest(&hasher.finalize())))
-}
-
-fn read_model_bytes_with_sha256(
-    file: &mut File,
-    expected_size: u64,
-) -> Result<(Box<[u8]>, u64, String), BundledModelError> {
+fn read_model_bytes(file: &mut File, expected_size: u64) -> Result<Box<[u8]>, BundledModelError> {
     let capacity =
         usize::try_from(expected_size).map_err(|_| BundledModelError::ArtifactSizeMismatch)?;
     let mut bytes = Vec::new();
@@ -408,7 +372,6 @@ fn read_model_bytes_with_sha256(
         .map_err(|_| BundledModelError::Io)?;
 
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
-    let mut hasher = Sha256::new();
     let mut size = 0_u64;
     loop {
         let read = file.read(&mut buffer).map_err(|_| BundledModelError::Io)?;
@@ -421,7 +384,6 @@ fn read_model_bytes_with_sha256(
         if size > expected_size {
             return Err(BundledModelError::ArtifactSizeMismatch);
         }
-        hasher.update(&buffer[..read]);
         bytes.extend_from_slice(&buffer[..read]);
     }
 
@@ -429,25 +391,13 @@ fn read_model_bytes_with_sha256(
         return Err(BundledModelError::ArtifactSizeMismatch);
     }
 
-    Ok((
-        bytes.into_boxed_slice(),
-        size,
-        hex_digest(&hasher.finalize()),
-    ))
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    output
+    Ok(bytes.into_boxed_slice())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     struct TestDirectory {
         path: PathBuf,
@@ -474,12 +424,12 @@ mod tests {
             model_id: BUNDLED_ASR_MODEL_ID,
             model_kind: LocalModelKind::SpeechRecognition,
             input_format: WHISPER_CPP_GGML_INPUT_FORMAT.to_owned(),
-            variant: "base".to_owned(),
+            variant: "large-v3-turbo-q5_0".to_owned(),
             multilingual: true,
-            artifact_file_name: "ggml-base.bin".to_owned(),
+            artifact_file_name: "ggml-large-v3-turbo-q5_0.bin".to_owned(),
             size_bytes: bytes.len() as u64,
-            sha256: hex_digest(&Sha256::digest(bytes)),
-            version: "fixture-base".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            version: "fixture-large-v3-turbo-q5_0".to_owned(),
             model_card_id: "ggerganov/whisper.cpp".to_owned(),
             license_id: "MIT".to_owned(),
             license_confirmed_at: DateTime::<Utc>::UNIX_EPOCH,
@@ -492,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn verifies_a_regular_manifest_defined_resource() {
+    fn loads_a_regular_manifest_defined_resource() {
         let directory = TestDirectory::new();
         let bytes = b"bundled fixture model";
         let definition = definition(bytes);
@@ -500,16 +450,16 @@ mod tests {
         fs::create_dir_all(&models).unwrap();
         fs::write(models.join(&definition.artifact_file_name), bytes).unwrap();
 
-        let artifact = verified_model_from_definition(&directory.path, &definition).unwrap();
+        let artifact = load_model_from_definition(&directory.path, &definition).unwrap();
 
         assert_eq!(artifact.model().id, BUNDLED_ASR_MODEL_ID);
         assert_eq!(artifact.model().sha256, definition.sha256);
         assert_eq!(artifact.model().file_size_bytes, bytes.len() as u64);
-        assert_eq!(&*artifact.into_verified_bytes(), bytes);
+        assert_eq!(&*artifact.into_bytes(), bytes);
     }
 
     #[test]
-    fn retains_verified_bytes_after_the_resource_path_is_replaced() {
+    fn retains_loaded_bytes_after_the_resource_path_is_replaced() {
         let directory = TestDirectory::new();
         let bytes = b"bundled fixture model";
         let definition = definition(bytes);
@@ -518,27 +468,44 @@ mod tests {
         fs::create_dir_all(&models).unwrap();
         fs::write(&model_path, bytes).unwrap();
 
-        let artifact = verified_model_from_definition(&directory.path, &definition).unwrap();
+        let artifact = load_model_from_definition(&directory.path, &definition).unwrap();
         fs::write(&model_path, vec![b'x'; bytes.len()]).unwrap();
 
-        assert_eq!(&*artifact.into_verified_bytes(), bytes);
+        assert_eq!(&*artifact.into_bytes(), bytes);
     }
 
     #[test]
-    fn rejects_tampered_bytes_before_issuing_an_artifact() {
+    fn accepts_same_size_bundle_bytes_without_runtime_digest_verification() {
+        let directory = TestDirectory::new();
+        let reviewed_bytes = b"expected bundled bytes";
+        let packaged_bytes = vec![b'x'; reviewed_bytes.len()];
+        let definition = definition(reviewed_bytes);
+        let models = directory.path.join(BUNDLED_RESOURCE_DIRECTORY);
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join(&definition.artifact_file_name), &packaged_bytes).unwrap();
+
+        let metadata = model_metadata_from_definition(&directory.path, &definition).unwrap();
+        let artifact = load_model_from_definition(&directory.path, &definition).unwrap();
+
+        assert_eq!(metadata.sha256, definition.sha256);
+        assert_eq!(&*artifact.into_bytes(), packaged_bytes);
+    }
+
+    #[test]
+    fn rejects_a_bundle_resource_with_the_wrong_size() {
         let directory = TestDirectory::new();
         let definition = definition(b"expected bundled bytes");
         let models = directory.path.join(BUNDLED_RESOURCE_DIRECTORY);
         fs::create_dir_all(&models).unwrap();
-        fs::write(
-            models.join(&definition.artifact_file_name),
-            b"substituted bytes",
-        )
-        .unwrap();
+        fs::write(models.join(&definition.artifact_file_name), b"short bytes").unwrap();
 
         assert!(matches!(
-            verified_model_from_definition(&directory.path, &definition),
-            Err(BundledModelError::ArtifactSizeMismatch | BundledModelError::ArtifactHashMismatch)
+            model_metadata_from_definition(&directory.path, &definition),
+            Err(BundledModelError::ArtifactSizeMismatch)
+        ));
+        assert!(matches!(
+            load_model_from_definition(&directory.path, &definition),
+            Err(BundledModelError::ArtifactSizeMismatch)
         ));
     }
 
@@ -553,7 +520,7 @@ mod tests {
         ));
 
         bundled_definition = definition(bytes);
-        bundled_definition.artifact_file_name = "../ggml-base.bin".to_owned();
+        bundled_definition.artifact_file_name = "../ggml-large-v3-turbo-q5_0.bin".to_owned();
         assert!(matches!(
             registered_model_from_definition(&bundled_definition),
             Err(BundledModelError::InvalidDefinition)
@@ -565,11 +532,84 @@ mod tests {
         let definition = embedded_definition().unwrap();
 
         assert_eq!(definition.model_id, BUNDLED_ASR_MODEL_ID);
-        assert_eq!(definition.artifact_file_name, "ggml-base.bin");
-        assert_eq!(definition.size_bytes, 147_951_465);
+        assert_eq!(
+            definition.artifact_file_name,
+            "ggml-large-v3-turbo-q5_0.bin"
+        );
+        assert_eq!(definition.size_bytes, 574_041_195);
         assert_eq!(
             definition.sha256,
-            "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
+            "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "loads the 547 MiB release model and is run explicitly during packaging"]
+    fn loads_the_reviewed_model_into_the_metal_whisper_runtime() {
+        use crate::inference::{
+            AsrEngine, AsrRequest, InferenceAudioWindow, INFERENCE_CHANNELS,
+            INFERENCE_SAMPLE_RATE_HZ,
+        };
+
+        let resource_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("resources");
+        let started = std::time::Instant::now();
+        let artifact = load_bundled_model(&resource_root).unwrap();
+        let loaded_at = started.elapsed();
+        let mut engine = crate::inference::WhisperCppAsrEngine::from_registered_artifact(artifact)
+            .expect("the reviewed bundled model loads in whisper.cpp");
+
+        let fixture_frames = usize::try_from(INFERENCE_SAMPLE_RATE_HZ).unwrap() * 6;
+        let fixtures = [
+            ("digital silence", vec![0.0; fixture_frames]),
+            (
+                "low-level mains hum",
+                (0..fixture_frames)
+                    .map(|frame| {
+                        let phase = 2.0 * std::f32::consts::PI * 60.0 * frame as f32
+                            / INFERENCE_SAMPLE_RATE_HZ as f32;
+                        phase.sin() * 0.01
+                    })
+                    .collect(),
+            ),
+        ];
+        let mut unexpected_transcripts = Vec::new();
+        for (label, samples) in fixtures {
+            let request = AsrRequest::new(
+                InferenceAudioWindow::new(
+                    Uuid::new_v4(),
+                    0,
+                    6_000_000_000,
+                    INFERENCE_SAMPLE_RATE_HZ,
+                    INFERENCE_CHANNELS,
+                    samples,
+                )
+                .unwrap(),
+                Some("zh".to_owned()),
+                false,
+            )
+            .unwrap();
+            let response = engine.transcribe(&request).unwrap();
+            if !response.is_no_speech() {
+                unexpected_transcripts.push((
+                    label,
+                    response
+                        .emissions
+                        .iter()
+                        .map(|emission| emission.text.clone())
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        assert!(
+            unexpected_transcripts.is_empty(),
+            "non-speech fixtures must not produce transcript text: {unexpected_transcripts:?}"
+        );
+
+        eprintln!(
+            "loaded bundled model in {:.2}s and initialized Whisper in {:.2}s",
+            loaded_at.as_secs_f64(),
+            started.elapsed().as_secs_f64() - loaded_at.as_secs_f64()
         );
     }
 
@@ -588,7 +628,7 @@ mod tests {
         symlink(&outside, models.join(&definition.artifact_file_name)).unwrap();
 
         assert!(matches!(
-            verified_model_from_definition(&directory.path, &definition),
+            load_model_from_definition(&directory.path, &definition),
             Err(BundledModelError::ArtifactIsSymlink)
         ));
     }

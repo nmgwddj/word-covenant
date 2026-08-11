@@ -28,7 +28,7 @@
 
 ### MVP definition
 
-第一版可用版本是可见的本地录音器：macOS 用户能够开始/停止采集、查看带采集时间戳的最终中文转写片段、手动创建/修正会话内匿名说话人簇、搜索/修正这些片段，并手动触发本地 Agent 动作。受审查的多语种 Whisper `ggml-base.bin` 随 macOS 安装包提供并在本机验证，因此正常离线录音不要求用户下载、导入或填写模型元数据；用户导入的模型只可作为高级本地覆盖。它会在本地历史中显示录音、模型、出网、批准、间隙和动作决策。
+第一版可用版本是可见的本地录音器：macOS 用户能够开始/停止采集、查看带采集时间戳的最终中文转写片段、手动创建/修正会话内匿名说话人簇、搜索/修正这些片段，并手动触发本地 Agent 动作。受审查的多语种 Whisper `ggml-large-v3-turbo-q5_0.bin` 随 macOS 安装包提供并在本机验证，因此正常离线录音不要求用户下载、导入或填写模型元数据；用户导入的模型只可作为高级本地覆盖。它会在本地历史中显示录音、模型、出网、批准、间隙和动作决策。
 
 Not MVP: automatic human identification from a voiceprint, ambient/background recording, overlap separation guarantees, cloud transcription, runtime automatic model downloads, unattended external actions, generic plugins, legal-contract claims, or a cross-device sync service.
 
@@ -45,7 +45,7 @@ Not MVP: automatic human identification from a voiceprint, ambient/background re
 | Awaiting manual acceptance | M1 native input adapter | CoreAudio/CPAL input and microphone lifecycle code exist; the real-device exit gate remains the M1 manual acceptance run. The native source is not yet an ASR ingress. |
 | In progress | M2.1 pure Rust/local mock speech pipeline contract | Deterministic local mock PCM exercises the bounded pipeline and final transcript persistence. It does not consume the real CPAL ingress and does not claim a real VAD or `whisper.cpp` adapter. |
 | 代码已实现，待真实 macOS 人工验收 | M2.2 native capture-to-inference bridge | 单一 dispatcher、`Starting -> Recording` 两阶段启动、16/48 kHz 预检、有界 ASR job/result 队列、显式 inference gap、drain 与 generation fence 均已实现；它是 M2.3 本地模型运行时的基础，M2.2 单独不代表真实 VAD、`whisper.cpp`/Metal 或模型质量已完成。 |
-| 代码已实现，待真实 macOS 人工验收 | M2.3 real local speech experience | macOS 包内受审查的多语种 `ggml-base.bin` 经本机清单、大小和 SHA-256 复验后默认可用；WebRTC VAD、whisper.cpp/Metal、本地最终转写与时间线投影均已接通。高级本地导入只作本次进程覆盖。真实麦克风、模型质量、停止收尾、输入中断和零出网仍须按 M2.3 清单在同一构建上验收。 |
+| 代码已实现，待真实 macOS 人工验收 | M2.3 real local speech experience | macOS 包内受审查的多语种 `ggml-large-v3-turbo-q5_0.bin` 由发布流程校验摘要，并以签名 App Bundle 作为运行时信任边界；WebRTC VAD、whisper.cpp/Metal、本地最终转写与时间线投影均已接通。高级本地导入只作本次进程覆盖。真实麦克风、模型质量、停止收尾、输入中断和零出网仍须按 M2.3 清单在同一构建上验收。 |
 | 代码已实现，完整离线验收就绪 | M3.0 手动匿名说话人修正 | 可在单个会话中创建匿名簇、修订显示名称，并将当前最终转写片段改派或改回未归类。簇、标签和改派均为 SQLite 仅追加记录并绑定审计链；过期、部分、跨会话、无效或已别名目标会被拒绝。它不是自动说话人分离，不含嵌入、声纹/语音档案、置信度、重叠判定或身份声明；合并/拆分的端到端操作也尚未提供。 |
 
 ## Target Architecture
@@ -182,8 +182,8 @@ ASR 或质量指标已通过。
 证据。代码已实现不等于真实硬件验收完成。
 
 **后续本地模型适配：** M2.3 已接入真实 WebRTC VAD 与 `whisper.cpp`/Metal 运行时；
-macOS 安装包内置、经审查的多语种 `ggml-base.bin` 会在本机完成清单、大小和 SHA-256
-复验后成为默认 ASR，用户无需导入或选择模型就可开始真实麦克风会话。模型注册表保留给
+macOS 安装包内置、经审查的多语种 `ggml-large-v3-turbo-q5_0.bin` 会在发布期完成摘要校验，
+并以签名 App Bundle 作为运行时信任边界后成为默认 ASR。模型注册表保留给
 可选高级本地导入，继续记录其文件路径、SHA-256、模型卡/许可证确认、输入格式、大小和
 版本；高级覆盖只在当前进程有效。partial 只用于显示，Agent 只能收到不可变 final，修订
 不能覆盖原始模型输出。代码接通不等于质量验收，真实模型/硬件/零出网证据见
@@ -197,7 +197,7 @@ macOS 安装包内置、经审查的多语种 `ggml-base.bin` 会在本机完成
 
 #### M2.3：真实本地语音体验（代码已实现；真实 macOS 人工验收待执行）
 
-**结果：** macOS 安装包内置、经审查的多语种 Whisper `ggml-base.bin` 在本机验证后即为
+**结果：** macOS 安装包内置、经审查的多语种 Whisper `ggml-large-v3-turbo-q5_0.bin` 在本机验证后即为
 默认 ASR；正常录音无需用户下载、导入或填写模型元数据。真实麦克风经过 WebRTC VAD 和
 独立的本地 Whisper worker 后，最终中文转写通过既有 SQLite/审计事务写入时间线。原生文件
 导入只保留为高级本地模型的临时覆盖。此结果只描述匿名、最终的语音转文字路径，不描述
@@ -206,17 +206,17 @@ macOS 安装包内置、经审查的多语种 `ggml-base.bin` 会在本机完成
 **已实现范围：**
 
 1. 内置默认模型使用精确的 `whisper.cpp-ggml` 格式。应用启动时会将包内
-   `manifest.json` 与编译进可执行文件的审查锁逐项比对，并校验常规文件、大小和 SHA-256；
-   每次加载前还会重新校验。资源绝对路径是 native-only 能力，不会跨 Tauri IPC，也不会
+   `manifest.json` 与编译进可执行文件的审查锁逐项比对，并只检查常规文件与大小；不会
+   读取模型计算运行时 SHA-256。资源绝对路径是 native-only 能力，不会跨 Tauri IPC，也不会
    被写成用户导入或导入审计记录。
 2. 内置默认模型验证成功后自动成为当前进程的活动 ASR，用户只需主动开始录音。资源缺失、
-   清单/格式/哈希不一致或加载失败均在麦克风准备前失败关闭，不生成 fixture/synthetic
+   清单/格式/大小不一致或加载失败均在麦克风准备前失败关闭，不生成 fixture/synthetic
    文本，也不回退到云端或系统识别。用户可显式选择兼容的高级本地导入模型作本次进程覆盖，
    重启后恢复内置默认模型。
 3. WebRTC VAD 只处理原生内存中的 16 kHz 单声道 10 ms 帧；临时 `i16` PCM 不序列化、
    不写入 SQLite、审计记录、日志或 WebView。Whisper 仅产生带经验证模型来源的中文
    final 记录，禁用翻译与自动语言检测。
-4. 单一 dispatcher 仍是唯一 PCM 消费者。Whisper context 属于有界、单 worker 的 ASR
+4. 单一 dispatcher 仍是唯一 PCM 消费者。Whisper runtime 属于有界、单 worker 的 ASR
    路径，避免模型推理阻塞 CoreAudio 回调；最终结果只以会话 ID 与修订号投影给前端，
    前端再从本地 SQLite 查询时间线。
 5. 停止、队列饱和、模型失败、文件篡改和输入中断均须成为最终转写或范围明确的 gap，

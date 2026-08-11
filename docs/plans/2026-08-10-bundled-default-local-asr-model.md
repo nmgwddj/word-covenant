@@ -1,5 +1,11 @@
 # Bundled Default Local ASR Model Implementation Plan
 
+> 2026-08-11 update: runtime SHA-256 scanning of the bundled model was removed.
+> Release staging and DMG verification still validate the reviewed digest; the
+> signed App Bundle is the production runtime trust boundary. SHA-256 checks for
+> user-imported external models remain unchanged. The detailed runtime-hash
+> steps below are retained only as historical context for the original plan.
+
 **Goal:** Ship one reviewed multilingual Whisper GGML base model inside each
 macOS release, make it the verified offline default for a new app run, and
 retain a separately imported local model as an advanced temporary override.
@@ -253,7 +259,8 @@ git diff --check
 
 ## Release Acceptance Criteria
 
-- Lock, packaged manifest, staged artifact, and runtime SHA-256/size all match.
+- Lock, packaged manifest, and staged artifact SHA-256 match during packaging;
+  runtime checks only the signed bundle manifest, regular-file type, and size.
 - A fresh offline macOS install exposes the verified default immediately and
   reaches microphone-to-final-transcript only after the user presses Record.
 - Missing, symlinked, altered, or malformed resources never reach Whisper or

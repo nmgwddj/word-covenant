@@ -48,6 +48,7 @@ export interface CaptureMeter {
  * change its detection threshold midway through a session.
  */
 export interface SpeechDetectionSettings {
+  mode: 'adaptive' | 'manual'
   rmsThresholdDbfs: number
 }
 
@@ -161,6 +162,8 @@ export interface TranscriptSpan {
   wallClockStart?: string | null
   speakerClusterId: string | null
   text: string
+  originalText?: string
+  normalizationProfile?: string
   isFinal: boolean
   revision: number
   source: TranscriptSource

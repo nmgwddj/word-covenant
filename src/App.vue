@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import AgentActionPanel from '@/components/AgentActionPanel.vue'
-import CaptureSettingsPanel from '@/components/CaptureSettingsPanel.vue'
 import CaptureStatus from '@/components/CaptureStatus.vue'
 import DevelopmentCaptureControl from '@/components/DevelopmentCaptureControl.vue'
 import LiveAudioMeter from '@/components/LiveAudioMeter.vue'
@@ -15,7 +14,7 @@ import { useModelStore } from '@/stores/models'
 import { useSettingsStore } from '@/stores/settings'
 import { useSessionStore } from '@/stores/session'
 import { wordCovenantApi } from '@/lib/wordCovenantApi'
-import type { LocalModelImportInput } from '@/types'
+import type { LocalModelImportInput, SpeechDetectionSettings } from '@/types'
 
 const privacyStore = usePrivacyStore()
 const modelStore = useModelStore()
@@ -61,8 +60,6 @@ let unlistenCaptureProjection: (() => void) | undefined
 let unlistenFinalTranscriptProjection: (() => void) | undefined
 const selectedSpeakerSpanId = ref<string | null>(null)
 const speakerManagerTrigger = ref<HTMLElement | null>(null)
-const isCaptureSettingsOpen = ref(false)
-const captureSettingsTrigger = ref<HTMLElement | null>(null)
 const isRefreshingInputDevices = ref(false)
 const inputDeviceRefreshError = ref<string | null>(null)
 const applicationSettingsButton = ref<HTMLButtonElement | null>(null)
@@ -120,22 +117,7 @@ async function refreshInputDevices() {
   }
 }
 
-function openCaptureSettings() {
-  captureSettingsTrigger.value =
-    typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null
-  isCaptureSettingsOpen.value = true
-}
-
-function closeCaptureSettings() {
-  const trigger = captureSettingsTrigger.value
-  isCaptureSettingsOpen.value = false
-  captureSettingsTrigger.value = null
-  void nextTick(() => trigger?.focus())
-}
-
 function openApplicationSettings() {
-  isCaptureSettingsOpen.value = false
-  captureSettingsTrigger.value = null
   selectedSpeakerSpanId.value = null
   speakerManagerTrigger.value = null
   sessionStore.clearSpeakerError()
@@ -147,8 +129,8 @@ function closeApplicationSettings() {
   void nextTick(() => applicationSettingsButton.value?.focus())
 }
 
-async function saveSpeechDetectionThreshold(rmsThresholdDbfs: number) {
-  await settingsStore.setRmsThresholdDbfs(rmsThresholdDbfs)
+async function saveSpeechDetection(settings: SpeechDetectionSettings) {
+  await settingsStore.setSpeechDetection(settings)
 }
 
 async function importLocalModel(input: LocalModelImportInput) {
@@ -279,17 +261,6 @@ onBeforeUnmount(() => {
         >
           <span class="i-mdi-cog-outline" aria-hidden="true" />
         </button>
-        <button
-          class="icon-button capture-settings-toggle"
-          type="button"
-          :aria-pressed="isCaptureSettingsOpen"
-          aria-label="录音检测设置"
-          title="录音检测设置"
-          data-testid="open-capture-settings"
-          @click="openCaptureSettings"
-        >
-          <span class="i-mdi-tune-variant" aria-hidden="true" />
-        </button>
         <DevelopmentCaptureControl
           v-if="isDevelopmentBuild"
           :selected="sessionStore.captureInput === 'development_mock'"
@@ -312,6 +283,12 @@ onBeforeUnmount(() => {
       :input-device-selection-disabled="sessionStore.isLoading || sessionStore.isDevelopmentMockActive"
       :refreshing-input-devices="isRefreshingInputDevices"
       :input-device-refresh-error="inputDeviceRefreshError"
+      :speech-detection-settings="settingsStore.speechDetection"
+      :capture-meter="sessionStore.capture.meter"
+      :capture-settings-locked="isCaptureSettingsLocked"
+      :loading-speech-detection="settingsStore.isLoadingSpeechDetection"
+      :saving-speech-detection="settingsStore.isSavingSpeechDetection"
+      :speech-detection-error="settingsStore.speechDetectionError"
       :compatible-asr-models="modelStore.compatibleAsrModels"
       :bundled-asr-status="modelStore.bundledAsrStatus"
       :active-asr-profile="modelStore.activeAsrProfile"
@@ -326,6 +303,8 @@ onBeforeUnmount(() => {
       @clear-active-asr-error="modelStore.clearActiveAsrError"
       @select-input-device="selectInputDevice"
       @refresh-input-devices="refreshInputDevices"
+      @clear-speech-detection-error="settingsStore.clearSpeechDetectionError"
+      @save-speech-detection="saveSpeechDetection"
       @import="importLocalModel"
       @select-active-asr-model="selectActiveLocalAsrModel"
     />
@@ -386,19 +365,6 @@ onBeforeUnmount(() => {
       @rename="renameSpeakerCluster"
       @reassign="reassignTranscriptSpeaker"
       @clear-error="sessionStore.clearSpeakerError"
-    />
-
-    <CaptureSettingsPanel
-      v-if="isCaptureSettingsOpen"
-      :settings="settingsStore.speechDetection"
-      :meter="sessionStore.capture.meter"
-      :locked="isCaptureSettingsLocked"
-      :loading="settingsStore.isLoadingSpeechDetection"
-      :saving="settingsStore.isSavingSpeechDetection"
-      :error="settingsStore.speechDetectionError"
-      @close="closeCaptureSettings"
-      @clear-error="settingsStore.clearSpeechDetectionError"
-      @save="saveSpeechDetectionThreshold"
     />
   </main>
 </template>

@@ -50,8 +50,9 @@ describe('InputDeviceSettings', () => {
     const wrapper = mount(InputDeviceSettings, { props: { capture } })
 
     const selector = wrapper.get('[data-testid="input-device-select"]')
-    expect((selector.element as HTMLSelectElement).value).toBe('coreaudio:built-in')
-    await selector.setValue('coreaudio:usb')
+    expect(selector.text()).toContain('MacBook 麦克风')
+    await selector.trigger('click')
+    await wrapper.get('[role="option"][data-value="coreaudio:usb"]').trigger('click')
 
     expect(wrapper.emitted('select')).toEqual([['coreaudio:usb']])
   })

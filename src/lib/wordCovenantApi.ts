@@ -26,6 +26,7 @@ let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
 let browserActiveLocalAsrProfile: ActiveLocalAsrProfile | null = null
 let browserSpeechDetectionSettings: SpeechDetectionSettings = {
+  mode: 'adaptive',
   rmsThresholdDbfs: -10,
 }
 const browserBundledAsrStatus: BundledAsrStatus = {

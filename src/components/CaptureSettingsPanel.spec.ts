@@ -2,7 +2,7 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, test } from 'vitest'
 import CaptureSettingsPanel from './CaptureSettingsPanel.vue'
 
-const settings = { rmsThresholdDbfs: -10 }
+const settings = { mode: 'adaptive' as const, rmsThresholdDbfs: -10 }
 const meter = {
   rmsDbfs: -21.6,
   peakDbfs: -5.2,
@@ -22,12 +22,14 @@ function mountPanel(overrides: Record<string, unknown> = {}) {
 }
 
 describe('CaptureSettingsPanel', () => {
-  test('shows the default threshold together with RMS and peak tuning values', () => {
+  test('shows adaptive mode together with RMS and peak tuning values', () => {
     const wrapper = mountPanel()
 
-    expect(wrapper.get('[data-testid="speech-threshold-value"]').text()).toBe('-10 dBFS')
-    expect(wrapper.get('[data-testid="speech-threshold-range"]').attributes('min')).toBe('-60')
+    expect(wrapper.get('[data-testid="speech-threshold-value"]').text()).toBe('自动')
+    expect(wrapper.get('[data-testid="speech-mode-adaptive"]').attributes('aria-pressed')).toBe('true')
+    expect(wrapper.get('[data-testid="speech-threshold-range"]').attributes('min')).toBe('-42')
     expect(wrapper.get('[data-testid="speech-threshold-range"]').attributes('max')).toBe('0')
+    expect(wrapper.get('[data-testid="speech-threshold-range"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="speech-threshold-number"]').attributes('step')).toBe('1')
     expect(wrapper.get('[data-testid="capture-settings-rms"]').text()).toBe('-22 dBFS')
     expect(wrapper.get('[data-testid="capture-settings-peak"]').text()).toBe('-5 dBFS')
@@ -35,31 +37,31 @@ describe('CaptureSettingsPanel', () => {
   })
 
   test('saves the completed slider adjustment and clears a prior error', async () => {
-    const wrapper = mountPanel({ error: '无法保存语音检测门限' })
+    const wrapper = mountPanel({ settings: { mode: 'manual', rmsThresholdDbfs: -10 }, error: '无法保存语音检测门限' })
 
     await wrapper.get('[data-testid="speech-threshold-range"]').setValue('-28')
 
     expect(wrapper.emitted('clearError')).toEqual([[]])
-    expect(wrapper.emitted('save')).toEqual([[-28]])
+    expect(wrapper.emitted('save')).toEqual([[{ mode: 'manual', rmsThresholdDbfs: -28 }]])
     wrapper.unmount()
   })
 
   test('saves a completed numeric threshold adjustment', async () => {
-    const wrapper = mountPanel()
+    const wrapper = mountPanel({ settings: { mode: 'manual', rmsThresholdDbfs: -10 } })
 
     await wrapper.get('[data-testid="speech-threshold-number"]').setValue('-19')
 
-    expect(wrapper.emitted('save')).toEqual([[-19]])
+    expect(wrapper.emitted('save')).toEqual([[{ mode: 'manual', rmsThresholdDbfs: -19 }]])
     wrapper.unmount()
   })
 
   test('resets the threshold to the -10 dBFS product default', async () => {
-    const wrapper = mountPanel({ settings: { rmsThresholdDbfs: -34 } })
+    const wrapper = mountPanel({ settings: { mode: 'manual', rmsThresholdDbfs: -34 } })
 
     await wrapper.get('[data-testid="reset-speech-threshold"]').trigger('click')
 
     expect(wrapper.get('[data-testid="speech-threshold-value"]').text()).toBe('-10 dBFS')
-    expect(wrapper.emitted('save')).toEqual([[-10]])
+    expect(wrapper.emitted('save')).toEqual([[{ mode: 'manual', rmsThresholdDbfs: -10 }]])
     wrapper.unmount()
   })
 
@@ -70,6 +72,16 @@ describe('CaptureSettingsPanel', () => {
     expect(wrapper.get('[data-testid="speech-threshold-number"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="reset-speech-threshold"]').attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="speech-threshold-lock-message"]').text()).toContain('本次会话')
+    wrapper.unmount()
+  })
+
+  test('switches between adaptive and manual settings while preserving the fallback threshold', async () => {
+    const wrapper = mountPanel()
+
+    await wrapper.get('[data-testid="speech-mode-manual"]').trigger('click')
+
+    expect(wrapper.emitted('save')).toEqual([[{ mode: 'manual', rmsThresholdDbfs: -10 }]])
+    expect(wrapper.get('[data-testid="speech-threshold-range"]').attributes('disabled')).toBeUndefined()
     wrapper.unmount()
   })
 

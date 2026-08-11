@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import FlatSelect from '@/components/FlatSelect.vue'
 import type { CaptureProjection } from '@/types'
 
 const props = defineProps<{
@@ -28,6 +29,13 @@ const selectionNote = computed(() => {
   if (deviceSelectionDisabled.value) return '录音期间不可切换输入设备'
   return null
 })
+
+const deviceOptions = computed(() =>
+  props.capture.devices.map(device => ({
+    value: device.uid,
+    label: device.name,
+  }))
+)
 </script>
 
 <template>
@@ -35,21 +43,16 @@ const selectionNote = computed(() => {
     <div class="input-device-settings__control">
       <label class="input-device-settings__field">
         <span>麦克风输入</span>
-        <span class="input-device-settings__select-control">
-          <select
-            data-testid="input-device-select"
-            :value="capture.selectedDevice?.uid ?? ''"
-            :disabled="deviceSelectionDisabled || !capture.devices.length"
-            aria-label="输入设备"
-            @change="emit('select', ($event.target as HTMLSelectElement).value)"
-          >
-            <option value="" disabled>{{ capture.devices.length ? '选择输入设备' : '未检测到输入设备' }}</option>
-            <option v-for="device in capture.devices" :key="device.uid" :value="device.uid">
-              {{ device.name }}
-            </option>
-          </select>
-          <span class="input-device-settings__chevron i-mdi-chevron-down" aria-hidden="true" />
-        </span>
+        <FlatSelect
+          class="input-device-settings__select-control"
+          :model-value="capture.selectedDevice?.uid ?? ''"
+          :options="deviceOptions"
+          :placeholder="capture.devices.length ? '选择输入设备' : '未检测到输入设备'"
+          :disabled="deviceSelectionDisabled || !capture.devices.length"
+          label="输入设备"
+          test-id="input-device-select"
+          @update:model-value="emit('select', $event)"
+        />
       </label>
       <button
         class="icon-button input-device-settings__refresh"
@@ -61,7 +64,7 @@ const selectionNote = computed(() => {
         data-testid="refresh-input-devices"
         @click="emit('refresh')"
       >
-        <span class="i-mdi-refresh" aria-hidden="true" />
+        <span class="i-mdi-refresh" :class="{ 'is-spinning': refreshing }" aria-hidden="true" />
       </button>
     </div>
     <p

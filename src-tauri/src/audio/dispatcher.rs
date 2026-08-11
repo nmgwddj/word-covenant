@@ -228,6 +228,10 @@ impl AsrJobLease {
 /// The remaining variants report bounded delivery/backpressure state without
 /// manufacturing a transcript.
 #[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a claimed job remains stack-owned while it crosses the worker boundary"
+)]
 pub enum AsrJobClaim {
     Claimed(AsrJobLease),
     DeliveredHeldOutcome,
@@ -326,7 +330,7 @@ impl Default for DispatcherMeter {
 ///
 /// The structure contains neither raw audio nor transcript text, so it is
 /// safe for a compact application projection once the service layer wires it.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrQueueMetrics {
     pub ingress_packets_consumed: u64,
@@ -349,33 +353,6 @@ pub struct AsrQueueMetrics {
     pub worker_holds_outcome: bool,
     pub owned_outcome_lease_active: bool,
     pub closing: bool,
-}
-
-impl Default for AsrQueueMetrics {
-    fn default() -> Self {
-        Self {
-            ingress_packets_consumed: 0,
-            ingress_discontinuities: 0,
-            segmenter_failures: 0,
-            jobs_admitted: 0,
-            jobs_completed: 0,
-            job_queue_saturated: 0,
-            result_queue_saturated: 0,
-            unavailable_engine_outcomes: 0,
-            engine_failure_outcomes: 0,
-            shutdown_outcomes: 0,
-            outcome_claims_aborted: 0,
-            job_queue_high_watermark: 0,
-            result_queue_high_watermark: 0,
-            pending_event_high_watermark: 0,
-            job_queue_depth: 0,
-            result_queue_depth: 0,
-            pending_event_depth: 0,
-            worker_holds_outcome: false,
-            owned_outcome_lease_active: false,
-            closing: false,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1066,7 +1043,7 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
     }
 
     fn has_uncommitted_outcomes(&self) -> bool {
-        self.results.len() > 0
+        !self.results.is_empty()
             || self.retry_outcome.is_some()
             || self.active_owned_outcome_lease.is_some()
     }
@@ -1233,6 +1210,10 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
         Ok(())
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "queue saturation returns the owned outcome intact for bounded retry handling"
+    )]
     fn try_push_result(&mut self, outcome: AsrOutcome) -> Result<(), AsrOutcome> {
         match self.results.push(outcome) {
             Ok(()) => {

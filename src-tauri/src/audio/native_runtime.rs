@@ -48,20 +48,50 @@ type NativeDispatcher =
     CaptureDispatcher<SpeechSegmenter<EnergyGatedSpeechDetector<BoxedSpeechDetector>>>;
 type RuntimeControl = (Mutex<WorkerControl>, Condvar);
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechDetectionMode {
+    #[default]
+    Adaptive,
+    Manual,
+}
+
+impl SpeechDetectionMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 /// User-configurable local RMS threshold used to reject non-speech before it
 /// reaches the speech segmenter or ASR worker.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeechDetectionSettings {
+    pub mode: SpeechDetectionMode,
     pub rms_threshold_dbfs: i8,
 }
 
 impl SpeechDetectionSettings {
-    pub const MIN_RMS_THRESHOLD_DBFS: i8 = -60;
+    pub const MIN_RMS_THRESHOLD_DBFS: i8 = -42;
     pub const MAX_RMS_THRESHOLD_DBFS: i8 = 0;
 
     pub fn new(rms_threshold_dbfs: i8) -> Result<Self, String> {
-        let settings = Self { rms_threshold_dbfs };
+        let settings = Self {
+            mode: SpeechDetectionMode::Manual,
+            rms_threshold_dbfs,
+        };
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub fn adaptive(rms_threshold_dbfs: i8) -> Result<Self, String> {
+        let settings = Self {
+            mode: SpeechDetectionMode::Adaptive,
+            rms_threshold_dbfs,
+        };
         settings.validate()?;
         Ok(settings)
     }
@@ -85,17 +115,26 @@ impl SpeechDetectionSettings {
         10_f32.powf(self.rms_threshold_dbfs as f32 / 20.0)
     }
 
-    pub(crate) fn from_persisted_rms_threshold_dbfs(value: i64) -> Option<Self> {
-        value
-            .try_into()
-            .ok()
-            .and_then(|value| Self::new(value).ok())
+    pub(crate) fn from_persisted_values(mode: &str, value: i64) -> Option<Self> {
+        let mode = match mode {
+            "adaptive" => SpeechDetectionMode::Adaptive,
+            "manual" => SpeechDetectionMode::Manual,
+            _ => return None,
+        };
+        let rms_threshold_dbfs = value.try_into().ok()?;
+        let settings = Self {
+            mode,
+            rms_threshold_dbfs,
+        };
+        settings.validate().ok()?;
+        Some(settings)
     }
 }
 
 impl Default for SpeechDetectionSettings {
     fn default() -> Self {
         Self {
+            mode: SpeechDetectionMode::Adaptive,
             rms_threshold_dbfs: -10,
         }
     }
@@ -144,6 +183,7 @@ impl NativeInferenceEngines {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeCaptureRuntimeConfig {
     pub bridge: AsrBridgeConfig,
+    pub speech_detection_mode: SpeechDetectionMode,
     pub energy_threshold: f32,
     pub pipeline: SpeechPipelineConfig,
     pub idle_wait: Duration,
@@ -156,8 +196,9 @@ impl Default for NativeCaptureRuntimeConfig {
     fn default() -> Self {
         Self {
             bridge: AsrBridgeConfig::default(),
-            // The default speech threshold is -10 dBFS. It is intentionally
-            // conservative and can be tuned in local capture settings.
+            speech_detection_mode: SpeechDetectionMode::Adaptive,
+            // Retained as the user's manual fallback while adaptive gating is
+            // the product default.
             energy_threshold: SpeechDetectionSettings::default().normalized_rms_threshold(),
             pipeline: SpeechPipelineConfig::default(),
             idle_wait: DEFAULT_IDLE_WAIT,
@@ -172,6 +213,7 @@ impl NativeCaptureRuntimeConfig {
     ) -> Result<Self, String> {
         settings.validate()?;
         Ok(Self {
+            speech_detection_mode: settings.mode,
             energy_threshold: settings.normalized_rms_threshold(),
             ..Self::default()
         })
@@ -331,7 +373,11 @@ impl NativeCaptureRuntime {
         clock: CaptureClock,
         config: NativeCaptureRuntimeConfig,
     ) -> Result<Self, NativeCaptureRuntimeError> {
-        let detector = EnergySpeechDetector::new(config.energy_threshold)
+        let detector_threshold = match config.speech_detection_mode {
+            SpeechDetectionMode::Adaptive => 0.0,
+            SpeechDetectionMode::Manual => config.energy_threshold,
+        };
+        let detector = EnergySpeechDetector::new(detector_threshold)
             .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
         Self::new_with_engines(
             ingress,
@@ -365,13 +411,16 @@ impl NativeCaptureRuntime {
         // Apply the same local RMS floor to injected production VAD engines
         // that the no-engine fallback already receives. The wrapper calls the
         // VAD on every frame so stateful engines can observe silence.
-        let vad_detector = EnergyGatedSpeechDetector::new(
-            BoxedSpeechDetector {
-                inner: vad_detector,
-            },
-            config.energy_threshold,
-        )
-        .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
+        let boxed_detector = BoxedSpeechDetector {
+            inner: vad_detector,
+        };
+        let vad_detector = match config.speech_detection_mode {
+            SpeechDetectionMode::Adaptive => EnergyGatedSpeechDetector::adaptive(boxed_detector),
+            SpeechDetectionMode::Manual => {
+                EnergyGatedSpeechDetector::new(boxed_detector, config.energy_threshold)
+                    .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?
+            }
+        };
         let segmenter = SpeechSegmenter::new(
             runtime.session_id,
             clock.clone(),
@@ -1009,23 +1058,25 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn speech_detection_settings_default_to_minus_10_dbfs() {
-        assert_eq!(SpeechDetectionSettings::default().rms_threshold_dbfs, -10);
+    fn speech_detection_settings_default_to_adaptive_with_minus_10_manual_fallback() {
+        let settings = SpeechDetectionSettings::default();
+        assert_eq!(settings.mode, SpeechDetectionMode::Adaptive);
+        assert_eq!(settings.rms_threshold_dbfs, -10);
     }
 
     #[test]
     fn speech_detection_settings_accept_the_inclusive_dbfs_range() {
         assert_eq!(
-            SpeechDetectionSettings::new(-60)
+            SpeechDetectionSettings::new(-42)
                 .unwrap()
                 .rms_threshold_dbfs,
-            -60
+            -42
         );
         assert_eq!(
             SpeechDetectionSettings::new(0).unwrap().rms_threshold_dbfs,
             0
         );
-        assert!(SpeechDetectionSettings::new(-61).is_err());
+        assert!(SpeechDetectionSettings::new(-43).is_err());
         assert!(SpeechDetectionSettings::new(1).is_err());
     }
 
@@ -1036,6 +1087,11 @@ mod tests {
         let config = NativeCaptureRuntimeConfig::from_speech_detection_settings(settings).unwrap();
 
         assert!((settings.normalized_rms_threshold() - 0.316_227_76).abs() < 0.000_001);
+        assert_eq!(
+            default_config.speech_detection_mode,
+            SpeechDetectionMode::Adaptive
+        );
+        assert_eq!(config.speech_detection_mode, SpeechDetectionMode::Adaptive);
         assert!((default_config.energy_threshold - 0.316_227_76).abs() < 0.000_001);
         assert!((config.energy_threshold - 0.316_227_76).abs() < 0.000_001);
     }
@@ -1154,6 +1210,7 @@ mod tests {
                 job_queue_capacity: 2,
                 result_queue_capacity: 2,
             },
+            speech_detection_mode: SpeechDetectionMode::Manual,
             energy_threshold: 0.01,
             pipeline: SpeechPipelineConfig {
                 pre_roll_frames: 0,

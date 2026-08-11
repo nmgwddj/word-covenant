@@ -1,13 +1,14 @@
 //! Verified, local-only Whisper adapter backed by `whisper-rs` / whisper.cpp.
 //!
 //! A caller cannot create this engine from an arbitrary filesystem path. Model
-//! loading requires a [`VerifiedModelArtifact`] issued by the native
-//! [`ModelRegistry`], after the managed artifact's SHA-256 was rechecked.
+//! loading requires an [`AuthorizedModelArtifact`] issued by a native trust
+//! boundary. Imported files are hash-verified; bundled files rely on the signed
+//! application bundle.
 //! Neither raw PCM nor filesystem paths are serializable from this module.
 
 use super::{
     asr::{MAX_ASR_EMISSIONS_PER_REQUEST, MAX_TRANSCRIPT_TEXT_BYTES},
-    model_registry::{LocalModelKind, RegisteredModel, VerifiedModelArtifact},
+    model_registry::{AuthorizedModelArtifact, LocalModelKind, RegisteredModel},
     AsrEngine, AsrRequest, AsrResponse, InferenceEngine, InferenceError, ModelProvenance,
     TranscriptEmission, TranscriptEmissionKind,
 };
@@ -24,8 +25,11 @@ use whisper_rs::{
 pub const WHISPER_CPP_GGML_INPUT_FORMAT: &str = "whisper.cpp-ggml";
 pub const WHISPER_CPP_PROVIDER: &str = "whisper.cpp";
 const MAX_TOKENS_PER_SEGMENT: i32 = 256;
+const BEAM_SEARCH_WIDTH: i32 = 5;
 const MAX_INFERENCE_THREADS: usize = 4;
 const NANOSECONDS_PER_CENTISECOND: u64 = 10_000_000;
+const ACOUSTIC_GATE_FRAME_SAMPLES: usize = 160;
+const MINIMUM_ASR_FRAME_RMS_DBFS: f32 = -42.0;
 const NO_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.60;
 const LOW_AVERAGE_LOG_PROBABILITY_THRESHOLD: f32 = -1.0;
 
@@ -73,19 +77,18 @@ pub struct WhisperCppAsrEngine {
 impl WhisperCppAsrEngine {
     /// Loads a model from a native-only registry capability.
     ///
-    /// Every model provides the exact owned bytes that were SHA-256 checked
-    /// from a no-follow file descriptor, so Whisper is initialized from a
-    /// buffer and cannot reopen a substituted resource path. The bytes are
-    /// neither serializable nor exposed through application IPC.
+    /// Every model provides exact native-owned bytes authorized by either the
+    /// signed app bundle or the imported-model registry. The bytes are neither
+    /// serializable nor exposed through application IPC.
     pub fn from_registered_artifact(
-        artifact: VerifiedModelArtifact,
+        artifact: AuthorizedModelArtifact,
     ) -> Result<Self, InferenceError> {
         let model_provenance = whisper_cpp_model_provenance(artifact.model())?;
 
         // Avoid whisper.cpp's default stderr logging, which can expose native
         // model-load details outside the application's audited boundaries.
         whisper_rs::install_logging_hooks();
-        let bytes = artifact.into_verified_bytes();
+        let bytes = artifact.into_bytes();
         // whisper-rs exposes this as a borrowed slice and its Context has no
         // buffer lifetime, so whisper.cpp consumes the bytes synchronously
         // during initialization. `bytes` drops after this call returns.
@@ -123,6 +126,9 @@ impl AsrEngine for WhisperCppAsrEngine {
     fn transcribe(&mut self, request: &AsrRequest) -> Result<AsrResponse, InferenceError> {
         request.validate().map_err(InferenceError::invalid)?;
         whisper_language(request.language.as_deref())?;
+        if !has_minimum_acoustic_energy(request.audio.samples())? {
+            return Ok(AsrResponse::no_speech());
+        }
         let params = self.params_template.clone();
 
         self.state
@@ -218,6 +224,24 @@ fn average_token_log_probability(
     Ok(Some((total / f64::from(token_count)) as f32))
 }
 
+fn has_minimum_acoustic_energy(samples: &[f32]) -> Result<bool, InferenceError> {
+    let minimum_rms = 10_f32.powf(MINIMUM_ASR_FRAME_RMS_DBFS / 20.0);
+    for frame in samples.chunks(ACOUSTIC_GATE_FRAME_SAMPLES) {
+        let mean_square = frame.iter().try_fold(0.0_f64, |sum, sample| {
+            if !sample.is_finite() {
+                return Err(InferenceError::invalid(
+                    "local Whisper audio samples must be finite",
+                ));
+            }
+            Ok(sum + f64::from(*sample) * f64::from(*sample))
+        })? / frame.len() as f64;
+        if mean_square.sqrt() >= f64::from(minimum_rms) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn should_suppress_whisper_segment(segment: &WhisperSegmentOutput) -> bool {
     segment.no_speech_probability >= NO_SPEECH_PROBABILITY_THRESHOLD
         && segment
@@ -238,7 +262,10 @@ fn whisper_language(language: Option<&str>) -> Result<&str, InferenceError> {
 }
 
 fn transcription_params() -> FullParams<'static, 'static> {
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+        beam_size: BEAM_SEARCH_WIDTH,
+        patience: -1.0,
+    });
     let threads = std::thread::available_parallelism()
         .map(|parallelism| parallelism.get().min(MAX_INFERENCE_THREADS))
         .unwrap_or(1);
@@ -249,9 +276,12 @@ fn transcription_params() -> FullParams<'static, 'static> {
     params.set_language(Some("zh"));
     params.set_detect_language(false);
     params.set_translate(false);
+    // WebRTC VAD already provides one bounded utterance per request. Treat it
+    // independently so a confident hallucination cannot become the decoder
+    // prompt for later room audio.
     params.set_no_context(true);
     params.set_no_timestamps(false);
-    params.set_single_segment(false);
+    params.set_single_segment(true);
     params.set_token_timestamps(false);
     params.set_max_tokens(MAX_TOKENS_PER_SEGMENT);
     params.set_no_speech_thold(NO_SPEECH_PROBABILITY_THRESHOLD);
@@ -523,6 +553,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_sub_minus_42_dbfs_frames_before_whisper_decoding() {
+        let below_gate = 10_f32.powf(-43.0 / 20.0);
+        let above_gate = 10_f32.powf(-41.0 / 20.0);
+
+        assert!(!has_minimum_acoustic_energy(&vec![0.0; ACOUSTIC_GATE_FRAME_SAMPLES]).unwrap());
+        assert!(
+            !has_minimum_acoustic_energy(&vec![below_gate; ACOUSTIC_GATE_FRAME_SAMPLES]).unwrap()
+        );
+        assert!(
+            has_minimum_acoustic_energy(&vec![above_gate; ACOUSTIC_GATE_FRAME_SAMPLES]).unwrap()
+        );
+        assert!(
+            has_minimum_acoustic_energy(
+                &[
+                    vec![0.0; ACOUSTIC_GATE_FRAME_SAMPLES],
+                    vec![above_gate; ACOUSTIC_GATE_FRAME_SAMPLES],
+                ]
+                .concat(),
+            )
+            .unwrap(),
+            "one qualifying 10 ms frame must admit an utterance with quiet pre-roll"
+        );
+    }
+
+    #[test]
     fn filters_likely_silent_whisper_segments_without_text_blacklists() {
         let request = request();
         let model = registered_model(
@@ -609,5 +664,18 @@ mod tests {
         assert_eq!(whisper_language(Some("zh-CN")).unwrap(), "zh");
         assert!(whisper_language(Some("auto")).is_err());
         assert!(whisper_language(Some("not-a-language")).is_err());
+    }
+
+    #[test]
+    fn decodes_each_vad_utterance_without_prior_text_or_internal_resegmentation() {
+        assert_eq!(BEAM_SEARCH_WIDTH, 5);
+
+        let debug = format!("{:?}", transcription_params());
+        assert!(debug.contains("beam_search"));
+        assert!(debug.contains("no_context: true"));
+        assert!(debug.contains("single_segment: true"));
+        assert!(debug.contains("translate: false"));
+        assert!(debug.contains("detect_language: false"));
+        assert!(!debug.contains("准确会议记录"));
     }
 }

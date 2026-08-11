@@ -98,31 +98,34 @@ pub struct RegisteredModel {
     pub imported_at: DateTime<Utc>,
 }
 
-/// A model artifact that a native boundary has just verified.
+/// Model bytes authorized by a native trust boundary for local inference.
 ///
-/// This type intentionally has no Serde implementation. Native inference
-/// adapters consume the exact owned bytes that were hashed from one
-/// no-follow file descriptor. Model bytes must never reach Tauri IPC, audit
-/// payloads, or the WebView.
+/// Imported artifacts enter only after their SHA-256 is verified from one
+/// no-follow file descriptor. App-bundled artifacts may instead rely on the
+/// signed bundle boundary. This type intentionally has no Serde implementation;
+/// model bytes must never reach Tauri IPC, audit payloads, or the WebView.
 #[derive(Debug)]
-pub struct VerifiedModelArtifact {
+pub struct AuthorizedModelArtifact {
     model: RegisteredModel,
     bytes: Box<[u8]>,
 }
 
-impl VerifiedModelArtifact {
+impl AuthorizedModelArtifact {
     pub fn model(&self) -> &RegisteredModel {
         &self.model
     }
 
-    pub(crate) fn into_verified_bytes(self) -> Box<[u8]> {
+    pub(crate) fn into_bytes(self) -> Box<[u8]> {
         self.bytes
     }
 
-    /// Creates an artifact backed by owned, verified bytes. This is reserved
-    /// for native loaders that retain the same bytes they hashed, so an
-    /// inference adapter cannot reopen a substituted resource path.
-    pub(crate) fn from_verified_native_bytes(model: RegisteredModel, bytes: Box<[u8]>) -> Self {
+    /// Creates an artifact from bytes whose digest the registry just verified.
+    pub(crate) fn from_hash_verified_bytes(model: RegisteredModel, bytes: Box<[u8]>) -> Self {
+        Self { model, bytes }
+    }
+
+    /// Creates an artifact loaded from the app's signed resource bundle.
+    pub(crate) fn from_trusted_bundled_bytes(model: RegisteredModel, bytes: Box<[u8]>) -> Self {
         Self { model, bytes }
     }
 }
@@ -188,7 +191,10 @@ impl ModelRegistry {
     /// reading and hashing the exact managed bytes immediately before loading.
     /// The capability deliberately cannot be serialized, created from an
     /// arbitrary path, or made to reopen a substituted file.
-    pub fn verified_artifact(&self, id: Uuid) -> Result<VerifiedModelArtifact, ModelRegistryError> {
+    pub fn verified_artifact(
+        &self,
+        id: Uuid,
+    ) -> Result<AuthorizedModelArtifact, ModelRegistryError> {
         let model = self
             .get(id)
             .ok_or(ModelRegistryError::UnknownModelId { id })?;
@@ -197,7 +203,7 @@ impl ModelRegistry {
             .as_deref()
             .ok_or(ModelRegistryError::ManagedRootNotConfigured)?;
         let bytes = read_verified_persisted_artifact_bytes(managed_root, model)?;
-        Ok(VerifiedModelArtifact::from_verified_native_bytes(
+        Ok(AuthorizedModelArtifact::from_hash_verified_bytes(
             model.clone(),
             bytes,
         ))
@@ -808,14 +814,14 @@ fn resolve_existing_managed_root(root: &Path) -> Result<PathBuf, ModelRegistryEr
 
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ModelRegistryError::ManagedRootIsSymlink {
+            Err(ModelRegistryError::ManagedRootIsSymlink {
                 path: root.to_path_buf(),
-            });
+            })
         }
         Ok(metadata) if !metadata.file_type().is_dir() => {
-            return Err(ModelRegistryError::ManagedRootIsNotDirectory {
+            Err(ModelRegistryError::ManagedRootIsNotDirectory {
                 path: root.to_path_buf(),
-            });
+            })
         }
         Ok(_) => canonical_managed_root(root),
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -1457,7 +1463,7 @@ mod tests {
 
         assert_eq!(artifact.model(), &model);
         fs::write(managed_root.join(&model.file_path), b"replaced model").unwrap();
-        assert_eq!(&*artifact.into_verified_bytes(), original);
+        assert_eq!(&*artifact.into_bytes(), original);
         assert!(matches!(
             registry.verified_artifact(model.id),
             Err(ModelRegistryError::RegisteredArtifactSizeMismatch { .. })

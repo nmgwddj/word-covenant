@@ -5,7 +5,8 @@ use crate::audio::{
     capture_point_now, DispatcherRuntimeId, NativeCaptureRuntimeConfig, NativeInferenceEngines,
 };
 use crate::audio::{
-    AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime, SpeechDetectionSettings,
+    AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime, SpeechDetectionMode,
+    SpeechDetectionSettings,
 };
 #[cfg(target_os = "macos")]
 use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
@@ -24,9 +25,9 @@ use crate::domain::{
 };
 use crate::inference::asr::MAX_ASR_EMISSIONS_PER_REQUEST;
 #[cfg(all(target_os = "macos", not(test)))]
-use crate::inference::bundled_model::verified_bundled_model;
+use crate::inference::bundled_model::load_bundled_model;
 use crate::inference::bundled_model::{
-    verified_bundled_model_metadata, BundledAsrStatus, BUNDLED_ASR_MODEL_ID,
+    bundled_model_metadata, BundledAsrStatus, BUNDLED_ASR_MODEL_ID,
 };
 use crate::inference::model_registry::{
     LocalModelKind, ModelImportRequest, ModelRegistry, RegisteredModel,
@@ -71,6 +72,7 @@ struct CaptureInputStartedAuditPayload {
     sample_rate: u32,
     channels: u16,
     anchor: CapturePoint,
+    speech_detection_mode: SpeechDetectionMode,
     speech_rms_threshold_dbfs: i8,
 }
 
@@ -123,7 +125,7 @@ pub struct FinalTranscriptProjection {
 
 /// The explicitly chosen local speech-recognition model for this app run.
 ///
-/// This is intentionally not persisted: a verified bundled model becomes the
+/// This is intentionally not persisted: a trusted bundled model becomes the
 /// visible default on each launch, while a user-selected advanced local model
 /// only replaces it for the current run. It contains an opaque model ID only,
 /// never a file path, audio, or model artifact bytes.
@@ -160,7 +162,7 @@ impl Default for BundledAsrRuntime {
 
 impl BundledAsrRuntime {
     fn initialize(&mut self, resource_dir: PathBuf) -> BundledAsrStatus {
-        match verified_bundled_model_metadata(&resource_dir) {
+        match bundled_model_metadata(&resource_dir) {
             Ok(model) => {
                 self.model = Some(model);
                 self.resource_dir = Some(resource_dir);
@@ -180,15 +182,15 @@ impl BundledAsrRuntime {
     }
 
     #[cfg(all(target_os = "macos", not(test)))]
-    fn verified_artifact(
+    fn load_artifact(
         &mut self,
-    ) -> Result<crate::inference::model_registry::VerifiedModelArtifact, ()> {
+    ) -> Result<crate::inference::model_registry::AuthorizedModelArtifact, ()> {
         let Some(resource_dir) = self.resource_dir.as_deref() else {
             self.status = BundledAsrStatus::unavailable();
             self.model = None;
             return Err(());
         };
-        match verified_bundled_model(resource_dir) {
+        match load_bundled_model(resource_dir) {
             Ok(artifact) => {
                 self.model = Some(artifact.model().clone());
                 self.status = BundledAsrStatus::ready();
@@ -426,7 +428,7 @@ impl AppState {
     pub fn start_session(&self) -> Result<CaptureSession, String> {
         #[cfg(test)]
         {
-            return self.start_session_with_active(false);
+            self.start_session_with_active(false)
         }
 
         #[cfg(not(test))]
@@ -479,12 +481,12 @@ impl AppState {
                 .map_err(|_| "capture service lock poisoned".to_owned())?
                 .projection()
                 .status;
-            return Ok(session_is_live
+            Ok(session_is_live
                 || matches!(
                     status,
                     crate::audio::CaptureStatus::AwaitingPermission
                         | crate::audio::CaptureStatus::Recording
-                ));
+                ))
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -674,6 +676,7 @@ impl AppState {
             sample_rate: capture_start.sample_rate,
             channels: capture_start.channels,
             anchor: capture_start.anchor.clone(),
+            speech_detection_mode: speech_detection_settings.mode,
             speech_rms_threshold_dbfs: speech_detection_settings.rms_threshold_dbfs,
         };
 
@@ -2472,7 +2475,7 @@ impl AppState {
             self.bundled_asr_runtime
                 .lock()
                 .map_err(|_| "bundled ASR state lock poisoned".to_owned())?
-                .verified_artifact()
+                .load_artifact()
                 .map_err(|_| "内置离线转写模型不可用，请重新安装应用".to_owned())?
         } else {
             self.model_registry
@@ -2828,6 +2831,8 @@ fn policy_reason_message(reason: PolicyReason) -> String {
 }
 
 fn transcript_revision_projection(revision: &TranscriptRevision) -> TranscriptSpan {
+    let projected_text =
+        crate::inference::text_normalization::project_simplified_chinese(&revision.text);
     TranscriptSpan {
         // The timeline renders the latest value for a logical span. The
         // immutable physical revision ID remains in SQLite and the audit chain.
@@ -2837,7 +2842,9 @@ fn transcript_revision_projection(revision: &TranscriptRevision) -> TranscriptSp
         capture_end_ns: revision.capture_end_ns,
         wall_clock_start: Some(revision.wall_clock_start),
         speaker_cluster_id: revision.speaker_cluster_id.clone(),
-        text: revision.text.clone(),
+        text: projected_text.text,
+        original_text: projected_text.original_text,
+        normalization_profile: projected_text.normalization_profile,
         is_final: revision.is_final,
         revision: revision.revision,
         source: revision.source.clone(),
@@ -3142,7 +3149,8 @@ mod tests {
 
         assert!(state
             .set_speech_detection_settings(SpeechDetectionSettings {
-                rms_threshold_dbfs: -61,
+                mode: SpeechDetectionMode::Manual,
+                rms_threshold_dbfs: -43,
             })
             .is_err());
         assert_eq!(state.speech_detection_settings().unwrap(), configured);
@@ -3217,6 +3225,7 @@ mod tests {
             sample_rate: 48_000,
             channels: 2,
             anchor,
+            speech_detection_mode: SpeechDetectionMode::Manual,
             speech_rms_threshold_dbfs: -24,
         };
 
@@ -4292,13 +4301,27 @@ mod tests {
         .unwrap();
         let request = AsrRequest::new(window, Some("zh".to_owned()), true).unwrap();
         let mut fixture = FixtureAsr::default();
-        let output = fixture.transcribe(&request).unwrap();
+        let mut output = fixture.transcribe(&request).unwrap();
+        output
+            .emissions
+            .iter_mut()
+            .find(|emission| emission.kind == TranscriptEmissionKind::Final)
+            .expect("fixture ASR emits one final result")
+            .text = "本次記錄僅保存在本機，review API v2.0。".to_owned();
         let projections = state.append_local_asr_response(session.id, output).unwrap();
 
         let timeline = state.list_timeline(Some(session.id)).unwrap();
         assert_eq!(timeline.len(), 1);
         assert_eq!(projections, timeline);
-        assert_eq!(timeline[0].text, "本次记录仅保存在本机。");
+        assert_eq!(timeline[0].text, "本次记录仅保存在本机，review API v2.0。");
+        assert_eq!(
+            timeline[0].original_text.as_deref(),
+            Some("本次記錄僅保存在本機，review API v2.0。")
+        );
+        assert_eq!(
+            timeline[0].normalization_profile.as_deref(),
+            Some(crate::inference::text_normalization::SIMPLIFIED_CHINESE_PROFILE)
+        );
         assert_eq!(timeline[0].source, TranscriptSource::LocalInference);
 
         let store = state.audit_store.lock().unwrap();
@@ -4306,7 +4329,7 @@ mod tests {
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].logical_span_id, timeline[0].id);
         assert_eq!(revisions[0].revision, 1);
-        assert_eq!(revisions[0].text, "本次记录仅保存在本机。");
+        assert_eq!(revisions[0].text, "本次記錄僅保存在本機，review API v2.0。");
         assert!(store.verify().unwrap());
         drop(store);
         assert!(state.audit_is_valid().unwrap());
@@ -5157,7 +5180,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_a_verified_bundled_model_as_the_per_run_default() {
+    fn projects_a_trusted_bundled_model_as_the_per_run_default() {
         let state = AppState::in_memory();
         let bundled_model = RegisteredModel {
             id: BUNDLED_ASR_MODEL_ID,
@@ -5165,9 +5188,9 @@ mod tests {
             file_path: "bundled-fixture.model".into(),
             file_size_bytes: 1,
             sha256: "a".repeat(64),
-            version: "whisper.cpp-base-fixture".to_owned(),
+            version: "whisper.cpp-large-v3-turbo-fixture".to_owned(),
             input_format: WHISPER_CPP_GGML_INPUT_FORMAT.to_owned(),
-            model_card_id: "openai/whisper-base".to_owned(),
+            model_card_id: "openai/whisper-large-v3-turbo".to_owned(),
             license_id: "MIT".to_owned(),
             license_confirmed_at: DateTime::<Utc>::UNIX_EPOCH,
             imported_at: DateTime::<Utc>::UNIX_EPOCH,

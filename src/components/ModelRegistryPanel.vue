@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import FlatSelect from '@/components/FlatSelect.vue'
 import { isWhisperCppAsrModel, WHISPER_CPP_GGML_INPUT_FORMAT } from '@/stores/models'
 import type {
   ActiveLocalAsrProfile,
@@ -87,6 +88,13 @@ const activeAsrModel = computed(() => {
   if (!modelId) return null
   return selectableAsrModels.value.find(model => model.id === modelId) ?? null
 })
+
+const activeAsrOptions = computed(() =>
+  selectableAsrModels.value.map(model => ({
+    value: model.id,
+    label: asrOptionLabel(model),
+  }))
+)
 
 const bundledAsrModel = computed(() => {
   const bundledModelId = props.bundledAsrStatus?.modelId
@@ -201,11 +209,14 @@ function submitImport() {
   emit('import', { ...form })
 }
 
-function selectActiveAsrModel(event: Event) {
-  const modelId = (event.target as HTMLSelectElement).value
+function selectActiveAsrModel(modelId: string) {
   if (!modelId || activeAsrSelectorDisabled.value) return
   emit('clearActiveAsrError')
   emit('selectActiveAsrModel', modelId)
+}
+
+function selectModelKind(modelKind: string) {
+  form.modelKind = modelKind as LocalModelKind
 }
 </script>
 
@@ -214,18 +225,15 @@ function selectActiveAsrModel(event: Event) {
     <div class="model-registry__toolbar">
       <label class="model-registry__asr-selector">
         <span>当前转写模型</span>
-        <select
-          data-testid="active-asr-model-select"
-          :value="activeAsrModel?.id ?? ''"
+        <FlatSelect
+          :model-value="activeAsrModel?.id ?? ''"
+          :options="activeAsrOptions"
+          placeholder="选择兼容模型"
           :disabled="activeAsrSelectorDisabled"
-          aria-label="当前转写模型"
-          @change="selectActiveAsrModel"
-        >
-          <option value="" disabled>选择兼容模型</option>
-          <option v-for="model in selectableAsrModels" :key="model.id" :value="model.id">
-            {{ asrOptionLabel(model) }}
-          </option>
-        </select>
+          label="当前转写模型"
+          test-id="active-asr-model-select"
+          @update:model-value="selectActiveAsrModel"
+        />
       </label>
       <button
         class="model-registry__import-action"
@@ -330,9 +338,13 @@ function selectActiveAsrModel(event: Event) {
       </label>
       <label class="model-import__field">
         <span>模型类型</span>
-        <select v-model="form.modelKind" data-testid="model-kind">
-          <option v-for="kind in modelKinds" :key="kind.value" :value="kind.value">{{ kind.label }}</option>
-        </select>
+        <FlatSelect
+          :model-value="form.modelKind"
+          :options="modelKinds"
+          label="模型类型"
+          test-id="model-kind"
+          @update:model-value="selectModelKind"
+        />
       </label>
       <label class="model-import__field">
         <span>版本</span>

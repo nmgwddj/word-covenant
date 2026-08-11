@@ -130,11 +130,12 @@ describe('wordCovenantApi browser development mock', () => {
     vi.stubGlobal('fetch', fetchSpy)
     const { wordCovenantApi } = await loadBrowserApi()
 
-    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ rmsThresholdDbfs: -10 })
-    await expect(wordCovenantApi.setSpeechDetectionSettings({ rmsThresholdDbfs: -26 })).resolves.toEqual({
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ mode: 'adaptive', rmsThresholdDbfs: -10 })
+    await expect(wordCovenantApi.setSpeechDetectionSettings({ mode: 'manual', rmsThresholdDbfs: -26 })).resolves.toEqual({
+      mode: 'manual',
       rmsThresholdDbfs: -26,
     })
-    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ rmsThresholdDbfs: -26 })
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ mode: 'manual', rmsThresholdDbfs: -26 })
 
     expect(fetchSpy).not.toHaveBeenCalled()
   })
@@ -142,17 +143,20 @@ describe('wordCovenantApi browser development mock', () => {
   test('uses typed native commands for speech detection settings', async () => {
     vi.stubGlobal('__TAURI_INTERNALS__', {})
     const invokeMock = vi.mocked(invoke)
-    invokeMock.mockResolvedValueOnce({ rmsThresholdDbfs: -10 }).mockResolvedValueOnce({ rmsThresholdDbfs: -18 })
+    invokeMock
+      .mockResolvedValueOnce({ mode: 'adaptive', rmsThresholdDbfs: -10 })
+      .mockResolvedValueOnce({ mode: 'manual', rmsThresholdDbfs: -18 })
     const { wordCovenantApi } = await loadBrowserApi()
 
-    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ rmsThresholdDbfs: -10 })
-    await expect(wordCovenantApi.setSpeechDetectionSettings({ rmsThresholdDbfs: -18 })).resolves.toEqual({
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ mode: 'adaptive', rmsThresholdDbfs: -10 })
+    await expect(wordCovenantApi.setSpeechDetectionSettings({ mode: 'manual', rmsThresholdDbfs: -18 })).resolves.toEqual({
+      mode: 'manual',
       rmsThresholdDbfs: -18,
     })
 
     expect(invokeMock).toHaveBeenNthCalledWith(1, 'get_speech_detection_settings')
     expect(invokeMock).toHaveBeenNthCalledWith(2, 'set_speech_detection_settings', {
-      input: { rmsThresholdDbfs: -18 },
+      input: { mode: 'manual', rmsThresholdDbfs: -18 },
     })
   })
 

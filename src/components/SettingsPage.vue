@@ -1,12 +1,15 @@
 <script setup lang="ts">
+import CaptureSettingsPanel from '@/components/CaptureSettingsPanel.vue'
 import InputDeviceSettings from '@/components/InputDeviceSettings.vue'
 import ModelRegistryPanel from '@/components/ModelRegistryPanel.vue'
 import type {
   ActiveLocalAsrProfile,
   BundledAsrStatus,
+  CaptureMeter,
   CaptureProjection,
   LocalModelImportInput,
   RegisteredModel,
+  SpeechDetectionSettings,
 } from '@/types'
 
 withDefaults(
@@ -16,6 +19,12 @@ withDefaults(
     inputDeviceSelectionDisabled?: boolean
     refreshingInputDevices?: boolean
     inputDeviceRefreshError?: string | null
+    speechDetectionSettings?: SpeechDetectionSettings
+    captureMeter?: CaptureMeter | null
+    captureSettingsLocked?: boolean
+    loadingSpeechDetection?: boolean
+    savingSpeechDetection?: boolean
+    speechDetectionError?: string | null
     compatibleAsrModels?: RegisteredModel[]
     bundledAsrStatus?: BundledAsrStatus | null
     activeAsrProfile?: ActiveLocalAsrProfile | null
@@ -31,6 +40,12 @@ withDefaults(
     inputDeviceSelectionDisabled: false,
     refreshingInputDevices: false,
     inputDeviceRefreshError: null,
+    speechDetectionSettings: () => ({ mode: 'adaptive', rmsThresholdDbfs: -10 }),
+    captureMeter: null,
+    captureSettingsLocked: false,
+    loadingSpeechDetection: false,
+    savingSpeechDetection: false,
+    speechDetectionError: null,
     activeAsrProfile: null,
     importing: false,
     selectingActiveAsrModel: false,
@@ -49,6 +64,8 @@ const emit = defineEmits<{
   clearActiveAsrError: []
   selectInputDevice: [deviceUid: string]
   refreshInputDevices: []
+  saveSpeechDetection: [settings: SpeechDetectionSettings]
+  clearSpeechDetectionError: []
 }>()
 </script>
 
@@ -71,24 +88,37 @@ const emit = defineEmits<{
         </div>
       </header>
 
-      <section class="settings-page__section" aria-labelledby="input-device-settings-title">
+      <section class="settings-page__section" aria-labelledby="recording-settings-title">
         <header class="settings-page__section-heading">
           <span class="settings-page__section-icon i-mdi-microphone-outline" aria-hidden="true" />
           <div>
             <p>LOCAL CAPTURE</p>
-            <h3 id="input-device-settings-title">录音设备</h3>
+            <h3 id="recording-settings-title">录音与检测</h3>
           </div>
           <span class="settings-page__local-state">本机</span>
         </header>
 
-        <InputDeviceSettings
-          :capture="capture"
-          :disabled="inputDeviceSelectionDisabled"
-          :refreshing="refreshingInputDevices"
-          :refresh-error="inputDeviceRefreshError"
-          @select="emit('selectInputDevice', $event)"
-          @refresh="emit('refreshInputDevices')"
-        />
+        <div class="settings-page__capture-group">
+          <InputDeviceSettings
+            :capture="capture"
+            :disabled="inputDeviceSelectionDisabled"
+            :refreshing="refreshingInputDevices"
+            :refresh-error="inputDeviceRefreshError"
+            @select="emit('selectInputDevice', $event)"
+            @refresh="emit('refreshInputDevices')"
+          />
+          <CaptureSettingsPanel
+            embedded
+            :settings="speechDetectionSettings"
+            :meter="captureMeter"
+            :locked="captureSettingsLocked"
+            :loading="loadingSpeechDetection"
+            :saving="savingSpeechDetection"
+            :error="speechDetectionError"
+            @clear-error="emit('clearSpeechDetectionError')"
+            @save="emit('saveSpeechDetection', $event)"
+          />
+        </div>
       </section>
 
       <section class="settings-page__section" aria-labelledby="model-settings-title">

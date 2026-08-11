@@ -136,18 +136,18 @@ describe('ModelRegistryPanel', () => {
     expect(wrapper.find('[data-testid="active-asr-profile"]').exists()).toBe(false)
     expect(wrapper.find('.model-row__details:not([open])').exists()).toBe(true)
     const selector = wrapper.get('[data-testid="active-asr-model-select"]')
-    expect((selector.element as HTMLSelectElement).value).toBe(model.id)
-    expect(selector.findAll('option').map(option => option.text())).toEqual([
-      '选择兼容模型',
+    expect(selector.text()).toContain('fixture-v1')
+    await selector.trigger('click')
+    expect(wrapper.findAll('[role="option"]').map(option => option.text())).toEqual([
       `fixture-v1 · ${'a'.repeat(8)}`,
       `fixture-v2 · ${'b'.repeat(8)}`,
     ])
 
-    await selector.setValue(compatibleAlternative.id)
+    await wrapper.get(`[role="option"][data-value="${compatibleAlternative.id}"]`).trigger('click')
 
     expect(wrapper.emitted('selectActiveAsrModel')).toEqual([[compatibleAlternative.id]])
     expect(wrapper.text()).toContain('使用中')
-    expect(wrapper.text().match(/fixture-v1/g)).toHaveLength(2)
+    expect(wrapper.findAll('.model-row').filter(row => row.text().includes('fixture-v1'))).toHaveLength(1)
     expect(wrapper.text()).not.toContain('/local/')
   })
 
@@ -192,14 +192,14 @@ describe('ModelRegistryPanel', () => {
 
     expect(wrapper.findAll('.model-row')[0]?.text()).toContain('应用内置')
     const selector = wrapper.get('[data-testid="active-asr-model-select"]')
-    expect((selector.element as HTMLSelectElement).value).toBe(model.id)
-    expect(selector.findAll('option').map(option => option.text())).toEqual([
-      '选择兼容模型',
+    expect(selector.text()).toContain('内置默认 · fixture-v1')
+    await selector.trigger('click')
+    expect(wrapper.findAll('[role="option"]').map(option => option.text())).toEqual([
       `advanced-local-v1 · ${'b'.repeat(8)}`,
       '内置默认 · fixture-v1',
     ])
 
-    await selector.setValue(advancedModel.id)
+    await wrapper.get(`[role="option"][data-value="${advancedModel.id}"]`).trigger('click')
 
     expect(wrapper.emitted('selectActiveAsrModel')).toEqual([[advancedModel.id]])
     expect(wrapper.text()).toContain('本机导入')

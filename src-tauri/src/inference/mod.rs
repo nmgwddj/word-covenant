@@ -10,6 +10,7 @@ pub mod gap;
 pub mod mock;
 pub mod model_registry;
 pub mod pipeline;
+pub mod text_normalization;
 pub mod vad;
 pub mod webrtc_vad;
 pub mod whisper_cpp;

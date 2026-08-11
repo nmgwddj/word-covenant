@@ -26,7 +26,9 @@ tauri-build = { version = "2", features = [] }
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-queue = "0.3"
 libc = "0.2"
+ferrous-opencc = { version = "=0.4.0", default-features = false, features = ["t2s-conversion"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rubato = "=0.16.2"
 sha2 = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = { version = "2.7.2", default-features = false }

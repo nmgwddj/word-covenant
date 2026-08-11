@@ -142,7 +142,8 @@ impl CaptureIngress {
         samples: &[T],
         map_sample: impl Fn(T) -> f32,
     ) -> CaptureWriteResult {
-        if sample_rate == 0 || channels == 0 || samples.len() % usize::from(channels) != 0 {
+        if sample_rate == 0 || channels == 0 || !samples.len().is_multiple_of(usize::from(channels))
+        {
             self.record_drop();
             return CaptureWriteResult::Dropped;
         }

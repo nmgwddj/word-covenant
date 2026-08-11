@@ -21,19 +21,19 @@ async function createFixture(bytes, manifestOverrides = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'word-covenant-bundled-model-'))
   temporaryDirectories.push(directory)
 
-  const sourcePath = join(directory, 'source', 'ggml-base.bin')
-  const lockPath = join(directory, 'models', 'whisper-base.lock.json')
+  const sourcePath = join(directory, 'source', 'ggml-large-v3-turbo-q5_0.bin')
+  const lockPath = join(directory, 'models', 'whisper-large-v3-turbo-q5_0.lock.json')
   const manifestPath = join(directory, 'resources', 'models', 'manifest.json')
-  const destinationPath = join(directory, 'resources', 'models', 'ggml-base.bin')
+  const destinationPath = join(directory, 'resources', 'models', 'ggml-large-v3-turbo-q5_0.bin')
   const sha256 = createHash('sha256').update(bytes).digest('hex')
   const metadata = {
     schemaVersion: 1,
-    modelId: '32ce7670-d303-4566-9cc3-123a380befe9',
+    modelId: 'e061b65d-e3a6-4700-86ad-9a8ea6df3626',
     modelKind: 'speech_recognition',
     inputFormat: 'whisper.cpp-ggml',
-    variant: 'base',
+    variant: 'large-v3-turbo-q5_0',
     multilingual: true,
-    artifactFileName: 'ggml-base.bin',
+    artifactFileName: 'ggml-large-v3-turbo-q5_0.bin',
     sizeBytes: bytes.byteLength,
     sha256,
     version: 'fixture-v1',
@@ -43,7 +43,7 @@ async function createFixture(bytes, manifestOverrides = {}) {
     source: {
       repository: 'word-covenant/test-models',
       revision: '0123456789abcdef0123456789abcdef01234567',
-      url: 'https://example.invalid/0123456789abcdef0123456789abcdef01234567/ggml-base.bin',
+      url: 'https://example.invalid/0123456789abcdef0123456789abcdef01234567/ggml-large-v3-turbo-q5_0.bin',
     },
   }
 
@@ -63,11 +63,23 @@ async function createFixture(bytes, manifestOverrides = {}) {
 
 describe('stageBundledModel', () => {
   test('keeps the committed lock, bundled manifest, license notice, and Tauri resource mapping aligned', async () => {
-    const lockPath = join(PROJECT_ROOT, 'models', 'whisper-base.lock.json')
+    const lockPath = join(PROJECT_ROOT, 'models', 'whisper-large-v3-turbo-q5_0.lock.json')
     const manifestPath = join(PROJECT_ROOT, 'src-tauri', 'resources', 'models', 'manifest.json')
     const tauriConfigPath = join(PROJECT_ROOT, 'src-tauri', 'tauri.conf.json')
-    const licensePath = join(PROJECT_ROOT, 'src-tauri', 'resources', 'third-party', 'whisper-base-model-MIT.txt')
-    const modelCardPath = join(PROJECT_ROOT, 'src-tauri', 'resources', 'third-party', 'whisper-base-model-card.txt')
+    const licensePath = join(
+      PROJECT_ROOT,
+      'src-tauri',
+      'resources',
+      'third-party',
+      'whisper-large-v3-turbo-model-MIT.txt'
+    )
+    const modelCardPath = join(
+      PROJECT_ROOT,
+      'src-tauri',
+      'resources',
+      'third-party',
+      'whisper-large-v3-turbo-model-card.txt'
+    )
     const [metadata, tauriConfigText, licenseText, modelCardText] = await Promise.all([
       loadBundledModelMetadata({ lockPath, manifestPath }),
       readFile(tauriConfigPath, 'utf8'),
@@ -76,30 +88,32 @@ describe('stageBundledModel', () => {
     ])
     const tauriConfig = JSON.parse(tauriConfigText)
 
-    assert.equal(metadata.modelId, '32ce7670-d303-4566-9cc3-123a380befe9')
+    assert.equal(metadata.modelId, 'e061b65d-e3a6-4700-86ad-9a8ea6df3626')
     assert.equal(metadata.modelKind, 'speech_recognition')
     assert.equal(metadata.inputFormat, 'whisper.cpp-ggml')
-    assert.equal(metadata.variant, 'base')
+    assert.equal(metadata.variant, 'large-v3-turbo-q5_0')
     assert.equal(metadata.multilingual, true)
-    assert.equal(metadata.sha256, '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe')
-    assert.equal(metadata.sizeBytes, 147951465)
-    assert.equal(metadata.modelCardId, 'openai/whisper-base')
+    assert.equal(metadata.sha256, '394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2')
+    assert.equal(metadata.sizeBytes, 574041195)
+    assert.equal(metadata.modelCardId, 'openai/whisper-large-v3-turbo')
     assert.equal(metadata.licenseId, 'MIT')
     assert.equal(metadata.source.repository, 'ggerganov/whisper.cpp')
     assert.equal(metadata.source.revision, '5359861c739e955e79d9a303bcbc70fb988958b1')
     assert.equal(
       metadata.source.url,
-      'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin'
+      'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin'
     )
     assert.equal(tauriConfig.bundle.targets, 'dmg')
     assert.deepEqual(tauriConfig.bundle.resources, {
-      'resources/models/ggml-base.bin': 'models/ggml-base.bin',
+      'resources/models/ggml-large-v3-turbo-q5_0.bin': 'models/ggml-large-v3-turbo-q5_0.bin',
       'resources/models/manifest.json': 'models/manifest.json',
-      'resources/third-party/whisper-base-model-card.txt': 'third-party/whisper-base-model-card.txt',
-      'resources/third-party/whisper-base-model-MIT.txt': 'third-party/whisper-base-model-MIT.txt',
+      'resources/third-party/whisper-large-v3-turbo-model-card.txt':
+        'third-party/whisper-large-v3-turbo-model-card.txt',
+      'resources/third-party/whisper-large-v3-turbo-model-MIT.txt':
+        'third-party/whisper-large-v3-turbo-model-MIT.txt',
     })
     assert.match(licenseText, /MIT License/)
-    assert.match(modelCardText, /Model card ID: openai\/whisper-base/)
+    assert.match(modelCardText, /Model card ID: openai\/whisper-large-v3-turbo/)
   })
 
   test('copies only a source whose byte count and SHA-256 match the mirrored manifest', async () => {

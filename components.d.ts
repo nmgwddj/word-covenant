@@ -15,6 +15,7 @@ declare module 'vue' {
     CaptureSettingsPanel: typeof import('./src/components/CaptureSettingsPanel.vue')['default']
     CaptureStatus: typeof import('./src/components/CaptureStatus.vue')['default']
     DevelopmentCaptureControl: typeof import('./src/components/DevelopmentCaptureControl.vue')['default']
+    FlatSelect: typeof import('./src/components/FlatSelect.vue')['default']
     GreetComponent: typeof import('./src/components/GreetComponent.vue')['default']
     InputDeviceSettings: typeof import('./src/components/InputDeviceSettings.vue')['default']
     LiveAudioMeter: typeof import('./src/components/LiveAudioMeter.vue')['default']

@@ -119,7 +119,11 @@ impl MacOsInputCallback {
                 "channel count must be greater than zero".to_owned(),
             ));
         }
-        if self.samples.len() % usize::from(self.channels) != 0 {
+        if !self
+            .samples
+            .len()
+            .is_multiple_of(usize::from(self.channels))
+        {
             return Err(MacOsCaptureError::InvalidCallback(
                 "sample buffer must contain complete interleaved frames".to_owned(),
             ));

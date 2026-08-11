@@ -176,6 +176,10 @@ impl AuditTrail {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hash material mirrors the immutable audit event fields explicitly"
+)]
 fn hash_event(
     id: Uuid,
     run_id: Option<Uuid>,

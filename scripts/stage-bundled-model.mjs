@@ -9,6 +9,7 @@ const PROJECT_ROOT = resolve(SCRIPT_DIRECTORY, '..')
 const SHA256_PATTERN = /^[a-f0-9]{64}$/
 const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/
 const REVISION_PATTERN = /^[a-f0-9]{40}$/
+const VARIANT_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/
 const COPY_BUFFER_BYTES = 64 * 1024
 
 function fail(message) {
@@ -38,8 +39,8 @@ function assertModelMetadata(metadata, label) {
   if (metadata.inputFormat !== 'whisper.cpp-ggml') {
     fail(`${label}.inputFormat must be whisper.cpp-ggml`)
   }
-  if (metadata.variant !== 'base') {
-    fail(`${label}.variant must be base`)
+  if (!VARIANT_PATTERN.test(requireString(metadata.variant, `${label}.variant`))) {
+    fail(`${label}.variant must be a safe reviewed variant identifier`)
   }
   if (metadata.multilingual !== true) {
     fail(`${label}.multilingual must be true`)
@@ -244,10 +245,10 @@ export async function stageBundledModel({ lockPath, manifestPath, sourcePath, de
 
 function parseArguments(argv) {
   const options = {
-    lockPath: resolve(PROJECT_ROOT, 'models/whisper-base.lock.json'),
+    lockPath: resolve(PROJECT_ROOT, 'models/whisper-large-v3-turbo-q5_0.lock.json'),
     manifestPath: resolve(PROJECT_ROOT, 'src-tauri/resources/models/manifest.json'),
     sourcePath: process.env.WORD_COVENANT_MODEL_OVERLAY,
-    destinationPath: resolve(PROJECT_ROOT, 'src-tauri/resources/models/ggml-base.bin'),
+    destinationPath: resolve(PROJECT_ROOT, 'src-tauri/resources/models/ggml-large-v3-turbo-q5_0.bin'),
     verify: false,
   }
   for (let index = 0; index < argv.length; index += 1) {

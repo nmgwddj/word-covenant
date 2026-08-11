@@ -1,8 +1,8 @@
-Whisper base model distribution notice
+Whisper large-v3-turbo model distribution notice
 
-Model card ID: openai/whisper-base
-Canonical model card: https://huggingface.co/openai/whisper-base
-Bundled artifact: ggml-base.bin, multilingual whisper.cpp GGML conversion
+Model card ID: openai/whisper-large-v3-turbo
+Canonical model card: https://huggingface.co/openai/whisper-large-v3-turbo
+Bundled artifact: ggml-large-v3-turbo-q5_0.bin, multilingual whisper.cpp GGML Q5_0 conversion
 
 This bundled model is used only for local speech recognition in WordCovenant.
 It can produce inaccurate, incomplete, or fabricated text, especially for

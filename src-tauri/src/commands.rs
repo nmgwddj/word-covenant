@@ -411,14 +411,16 @@ mod tests {
     #[test]
     fn speech_detection_settings_use_the_camel_case_bridge_contract() {
         let settings: SpeechDetectionSettings = serde_json::from_value(json!({
+            "mode": "manual",
             "rmsThresholdDbfs": -24,
         }))
         .unwrap();
 
+        assert_eq!(settings.mode, crate::audio::SpeechDetectionMode::Manual);
         assert_eq!(settings.rms_threshold_dbfs, -24);
         assert_eq!(
             serde_json::to_value(settings).unwrap(),
-            json!({ "rmsThresholdDbfs": -24 })
+            json!({ "mode": "manual", "rmsThresholdDbfs": -24 })
         );
     }
 }

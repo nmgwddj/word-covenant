@@ -3,14 +3,19 @@ import { wordCovenantApi } from '@/lib/wordCovenantApi'
 import type { SpeechDetectionSettings } from '@/types'
 
 export const defaultSpeechDetectionSettings: SpeechDetectionSettings = {
+  mode: 'adaptive',
   rmsThresholdDbfs: -10,
 }
 
-const minimumRmsThresholdDbfs = -60
+const minimumRmsThresholdDbfs = -42
 const maximumRmsThresholdDbfs = 0
 
 function isValidThreshold(value: number): boolean {
   return Number.isInteger(value) && value >= minimumRmsThresholdDbfs && value <= maximumRmsThresholdDbfs
+}
+
+function isValidMode(value: string): value is SpeechDetectionSettings['mode'] {
+  return value === 'adaptive' || value === 'manual'
 }
 
 export const useSettingsStore = defineStore('settings', {
@@ -38,9 +43,9 @@ export const useSettingsStore = defineStore('settings', {
       }
     },
 
-    async setRmsThresholdDbfs(rmsThresholdDbfs: number) {
-      if (!isValidThreshold(rmsThresholdDbfs)) {
-        this.speechDetectionError = '门限必须是 -60 到 0 之间的整数 dBFS'
+    async setSpeechDetection(settings: SpeechDetectionSettings) {
+      if (!isValidMode(settings.mode) || !isValidThreshold(settings.rmsThresholdDbfs)) {
+        this.speechDetectionError = '门限必须是 -42 到 0 之间的整数 dBFS'
         return null
       }
       if (this.isSavingSpeechDetection) return null
@@ -48,7 +53,7 @@ export const useSettingsStore = defineStore('settings', {
       this.isSavingSpeechDetection = true
       this.clearSpeechDetectionError()
       try {
-        const saved = await wordCovenantApi.setSpeechDetectionSettings({ rmsThresholdDbfs })
+        const saved = await wordCovenantApi.setSpeechDetectionSettings(settings)
         this.speechDetection = saved
         return saved
       } catch {
@@ -57,6 +62,10 @@ export const useSettingsStore = defineStore('settings', {
       } finally {
         this.isSavingSpeechDetection = false
       }
+    },
+
+    async setRmsThresholdDbfs(rmsThresholdDbfs: number) {
+      return this.setSpeechDetection({ mode: 'manual', rmsThresholdDbfs })
     },
   },
 })

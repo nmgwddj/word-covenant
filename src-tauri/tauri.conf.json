@@ -36,10 +36,10 @@
     "category": "Productivity",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     "resources": {
-      "resources/models/ggml-base.bin": "models/ggml-base.bin",
+      "resources/models/ggml-large-v3-turbo-q5_0.bin": "models/ggml-large-v3-turbo-q5_0.bin",
       "resources/models/manifest.json": "models/manifest.json",
-      "resources/third-party/whisper-base-model-card.txt": "third-party/whisper-base-model-card.txt",
-      "resources/third-party/whisper-base-model-MIT.txt": "third-party/whisper-base-model-MIT.txt"
+      "resources/third-party/whisper-large-v3-turbo-model-card.txt": "third-party/whisper-large-v3-turbo-model-card.txt",
+      "resources/third-party/whisper-large-v3-turbo-model-MIT.txt": "third-party/whisper-large-v3-turbo-model-MIT.txt"
     },
     "macOS": {
       "infoPlist": "Info.plist",

@@ -9,11 +9,14 @@ use super::{
     VadRequest, INFERENCE_CHANNELS, INFERENCE_SAMPLE_RATE_HZ, MAX_INFERENCE_WINDOW_SAMPLES,
 };
 use crate::audio::{CaptureClock, CapturePacket, CapturePoint, MAX_CAPTURE_SAMPLES_PER_PACKET};
+use rubato::{FftFixedInOut, Resampler};
 use std::collections::VecDeque;
 use std::fmt;
 use uuid::Uuid;
 
 pub const PIPELINE_FRAME_SAMPLES: usize = 160;
+const RESAMPLER_INPUT_SAMPLES: usize = 480;
+const RESAMPLER_OUTPUT_SAMPLES: usize = PIPELINE_FRAME_SAMPLES;
 const MAX_PIPELINE_WINDOW_FRAMES: usize = MAX_INFERENCE_WINDOW_SAMPLES / PIPELINE_FRAME_SAMPLES;
 const MAX_PIPELINE_EVENTS_PER_PACKET: usize =
     2 + MAX_CAPTURE_SAMPLES_PER_PACKET / PIPELINE_FRAME_SAMPLES;
@@ -161,7 +164,12 @@ impl SpeechActivityDetector for EnergySpeechDetector {
 /// stale speech decision alive across room noise.
 pub struct EnergyGatedSpeechDetector<D> {
     detector: D,
-    minimum_rms: f32,
+    gate: SpeechEnergyGate,
+}
+
+enum SpeechEnergyGate {
+    Manual { minimum_rms: f32 },
+    Adaptive { noise_floor_dbfs: Option<f32> },
 }
 
 impl<D> EnergyGatedSpeechDetector<D> {
@@ -171,23 +179,65 @@ impl<D> EnergyGatedSpeechDetector<D> {
         }
         Ok(Self {
             detector,
-            minimum_rms,
+            gate: SpeechEnergyGate::Manual { minimum_rms },
         })
+    }
+
+    pub fn adaptive(detector: D) -> Self {
+        Self {
+            detector,
+            gate: SpeechEnergyGate::Adaptive {
+                noise_floor_dbfs: None,
+            },
+        }
     }
 
     pub fn into_inner(self) -> D {
         self.detector
+    }
+
+    fn effective_minimum_rms(&self) -> f32 {
+        match self.gate {
+            SpeechEnergyGate::Manual { minimum_rms } => minimum_rms,
+            SpeechEnergyGate::Adaptive { noise_floor_dbfs } => {
+                let threshold_dbfs = (noise_floor_dbfs.unwrap_or(-54.0) + 12.0).clamp(-42.0, -24.0);
+                10_f32.powf(threshold_dbfs / 20.0)
+            }
+        }
+    }
+
+    fn observe_non_speech_rms(&mut self, rms: f32) {
+        let SpeechEnergyGate::Adaptive { noise_floor_dbfs } = &mut self.gate else {
+            return;
+        };
+        let observed_dbfs = if rms > 0.0 {
+            (20.0 * rms.log10()).max(-96.0)
+        } else {
+            -96.0
+        };
+        *noise_floor_dbfs = Some(match *noise_floor_dbfs {
+            Some(previous) => previous * 0.95 + observed_dbfs * 0.05,
+            None => observed_dbfs,
+        });
     }
 }
 
 impl<D: SpeechActivityDetector> SpeechActivityDetector for EnergyGatedSpeechDetector<D> {
     fn is_speech(&mut self, frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
         let detector_reports_speech = self.detector.is_speech(frame)?;
-        Ok(detector_reports_speech && root_mean_square(frame.samples())? >= self.minimum_rms)
+        let rms = root_mean_square(frame.samples())?;
+        if !detector_reports_speech {
+            self.observe_non_speech_rms(rms);
+            return Ok(false);
+        }
+        Ok(rms >= self.effective_minimum_rms())
     }
 
     fn reset(&mut self) {
         self.detector.reset();
+        if let SpeechEnergyGate::Adaptive { noise_floor_dbfs } = &mut self.gate {
+            *noise_floor_dbfs = None;
+        }
     }
 }
 
@@ -319,6 +369,146 @@ struct ActiveUtterance {
     longest_speech_run_frames: usize,
 }
 
+struct ResampledSamples {
+    starting_source_offset: u64,
+    samples: Vec<f32>,
+}
+
+/// Stateful mono 48 kHz to 16 kHz conversion owned by the dispatcher-side
+/// segmenter. The FFT overlap adds half a target frame of delay; the first
+/// half-frame is removed and the matching tail is drained at a known boundary.
+struct Mono48KhzResampler {
+    resampler: FftFixedInOut<f32>,
+    input: Vec<f32>,
+    output: Vec<f32>,
+    stream_start_source_offset: Option<u64>,
+    next_output_source_offset: Option<u64>,
+    processed_source_samples: usize,
+    emitted_output_samples: usize,
+    delay_samples_remaining: usize,
+}
+
+impl Mono48KhzResampler {
+    fn new() -> Result<Self, String> {
+        let resampler = FftFixedInOut::<f32>::new(
+            48_000,
+            INFERENCE_SAMPLE_RATE_HZ as usize,
+            RESAMPLER_INPUT_SAMPLES,
+            1,
+        )
+        .map_err(|error| format!("could not initialize local PCM resampler: {error}"))?;
+        let delay_samples_remaining = resampler.output_delay();
+        Ok(Self {
+            resampler,
+            input: Vec::with_capacity(RESAMPLER_INPUT_SAMPLES),
+            output: vec![0.0; RESAMPLER_OUTPUT_SAMPLES],
+            stream_start_source_offset: None,
+            next_output_source_offset: None,
+            processed_source_samples: 0,
+            emitted_output_samples: 0,
+            delay_samples_remaining,
+        })
+    }
+
+    fn push_sample(
+        &mut self,
+        source_offset: u64,
+        sample: f32,
+    ) -> Result<Option<ResampledSamples>, String> {
+        if self.stream_start_source_offset.is_none() {
+            self.stream_start_source_offset = Some(source_offset);
+            self.next_output_source_offset = Some(source_offset);
+        }
+        self.input.push(sample);
+        if self.input.len() < RESAMPLER_INPUT_SAMPLES {
+            return Ok(None);
+        }
+
+        self.processed_source_samples = self
+            .processed_source_samples
+            .checked_add(RESAMPLER_INPUT_SAMPLES)
+            .ok_or_else(|| "resampler source sample count overflowed".to_owned())?;
+        let written = self.process_current_input()?;
+        let skipped = self.delay_samples_remaining.min(written);
+        self.delay_samples_remaining -= skipped;
+        self.take_output(skipped, written)
+    }
+
+    fn drain(&mut self) -> Result<Option<ResampledSamples>, String> {
+        let target_output_samples = self.processed_source_samples / 3;
+        let remaining = target_output_samples
+            .checked_sub(self.emitted_output_samples)
+            .ok_or_else(|| "resampler emitted more PCM than its source duration".to_owned())?;
+        if remaining == 0 {
+            return Ok(None);
+        }
+
+        self.input.clear();
+        self.input.resize(RESAMPLER_INPUT_SAMPLES, 0.0);
+        let written = self.process_current_input()?;
+        self.take_output(0, remaining.min(written))
+    }
+
+    fn process_current_input(&mut self) -> Result<usize, String> {
+        let (consumed, written) = self
+            .resampler
+            .process_into_buffer(
+                std::slice::from_ref(&self.input),
+                std::slice::from_mut(&mut self.output),
+                None,
+            )
+            .map_err(|error| format!("local PCM resampling failed: {error}"))?;
+        if consumed != RESAMPLER_INPUT_SAMPLES || written != RESAMPLER_OUTPUT_SAMPLES {
+            return Err(format!(
+                "local PCM resampler returned an unexpected {consumed}:{written} frame ratio"
+            ));
+        }
+        self.input.clear();
+        Ok(written)
+    }
+
+    fn take_output(
+        &mut self,
+        start: usize,
+        end: usize,
+    ) -> Result<Option<ResampledSamples>, String> {
+        if start >= end {
+            return Ok(None);
+        }
+        let starting_source_offset = self
+            .next_output_source_offset
+            .ok_or_else(|| "resampler output is missing its capture offset".to_owned())?;
+        let samples = self.output[start..end].to_vec();
+        let source_duration = u64::try_from(samples.len())
+            .map_err(|_| "resampler output length cannot fit the capture clock".to_owned())?
+            .checked_mul(3)
+            .ok_or_else(|| "resampler output capture duration overflowed".to_owned())?;
+        self.next_output_source_offset = Some(
+            starting_source_offset
+                .checked_add(source_duration)
+                .ok_or_else(|| "resampler output capture offset overflowed".to_owned())?,
+        );
+        self.emitted_output_samples = self
+            .emitted_output_samples
+            .checked_add(samples.len())
+            .ok_or_else(|| "resampler output sample count overflowed".to_owned())?;
+        Ok(Some(ResampledSamples {
+            starting_source_offset,
+            samples,
+        }))
+    }
+
+    fn reset(&mut self) {
+        self.resampler.reset();
+        self.input.clear();
+        self.stream_start_source_offset = None;
+        self.next_output_source_offset = None;
+        self.processed_source_samples = 0;
+        self.emitted_output_samples = 0;
+        self.delay_samples_remaining = self.resampler.output_delay();
+    }
+}
+
 impl ActiveUtterance {
     fn from_frame(frame: BufferedFrame, is_speech: bool) -> Self {
         let BufferedFrame { started_at, frame } = frame;
@@ -377,6 +567,7 @@ pub struct SpeechSegmenter<D> {
     detector: D,
     config: SpeechPipelineConfig,
     source_channels: Option<u16>,
+    resampler: Option<Mono48KhzResampler>,
     expected_source_offset: Option<u64>,
     last_normalized_source_offset: Option<u64>,
     pending_frame_start_offset: Option<u64>,
@@ -403,12 +594,19 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
             }
         }
 
+        let resampler = if clock.sample_rate() == 48_000 {
+            Some(Mono48KhzResampler::new()?)
+        } else {
+            None
+        };
+
         Ok(Self {
             session_id,
             clock,
             detector,
             config,
             source_channels: None,
+            resampler,
             expected_source_offset: None,
             last_normalized_source_offset: None,
             pending_frame_start_offset: None,
@@ -513,6 +711,14 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
         if let Some(expected_source_offset) =
             expected_source_offset.filter(|expected| packet.starting_sample_offset > *expected)
         {
+            if let Err(message) = self.drain_resampler(&mut events) {
+                return Err(self.abort_packet(
+                    unfinished_started_at,
+                    packet.starting_sample_offset,
+                    packet_end_offset,
+                    message,
+                ));
+            }
             let request = match self.finalize_active() {
                 Ok(request) => request,
                 Err(message) => {
@@ -580,13 +786,40 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
                 .sum::<f64>()
                 / channels as f64;
 
-            // 48 kHz is an exact integer multiple of the 16 kHz inference
-            // rate. This deterministic decimator is deliberately limited to
-            // fixture work; a production CPAL bridge will use a vetted filter.
-            if packet.sample_rate_hz == INFERENCE_SAMPLE_RATE_HZ || source_offset % 3 == 0 {
+            if packet.sample_rate_hz == INFERENCE_SAMPLE_RATE_HZ {
                 if let Err(message) =
                     self.push_normalized_sample(source_offset, mono as f32, &mut events)
                 {
+                    return Err(self.abort_packet(
+                        unfinished_started_at,
+                        packet.starting_sample_offset,
+                        packet_end_offset,
+                        message,
+                    ));
+                }
+                continue;
+            }
+
+            let normalized = {
+                match self
+                    .resampler
+                    .as_mut()
+                    .expect("48 kHz capture initializes its resampler")
+                    .push_sample(source_offset, mono as f32)
+                {
+                    Ok(normalized) => normalized,
+                    Err(message) => {
+                        return Err(self.abort_packet(
+                            unfinished_started_at,
+                            packet.starting_sample_offset,
+                            packet_end_offset,
+                            message,
+                        ));
+                    }
+                }
+            };
+            if let Some(normalized) = normalized {
+                if let Err(message) = self.push_resampled_samples(normalized, &mut events) {
                     return Err(self.abort_packet(
                         unfinished_started_at,
                         packet.starting_sample_offset,
@@ -610,6 +843,9 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
     pub fn finish(&mut self) -> Result<Vec<SpeechWindowEvent>, SpeechSegmenterError> {
         let unfinished_started_at = self.unfinished_started_at();
         let mut events = Vec::new();
+        if let Err(message) = self.drain_resampler(&mut events) {
+            return Err(self.abort_finish(unfinished_started_at, message));
+        }
         let request = match self.finalize_active() {
             Ok(request) => request,
             Err(message) => return Err(self.abort_finish(unfinished_started_at, message)),
@@ -770,6 +1006,34 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
         Ok(())
     }
 
+    fn push_resampled_samples(
+        &mut self,
+        resampled: ResampledSamples,
+        events: &mut Vec<SpeechWindowEvent>,
+    ) -> Result<(), String> {
+        for (index, sample) in resampled.samples.into_iter().enumerate() {
+            let source_offset = u64::try_from(index)
+                .map_err(|_| "resampler output index cannot fit the capture clock".to_owned())?
+                .checked_mul(self.source_stride())
+                .and_then(|offset| resampled.starting_source_offset.checked_add(offset))
+                .ok_or_else(|| "resampler output source offset overflowed".to_owned())?;
+            self.push_normalized_sample(source_offset, sample, events)?;
+        }
+        Ok(())
+    }
+
+    fn drain_resampler(&mut self, events: &mut Vec<SpeechWindowEvent>) -> Result<(), String> {
+        let drained = self
+            .resampler
+            .as_mut()
+            .map(Mono48KhzResampler::drain)
+            .transpose()?;
+        if let Some(Some(drained)) = drained {
+            self.push_resampled_samples(drained, events)?;
+        }
+        Ok(())
+    }
+
     fn process_frame(&mut self, frame: BufferedFrame) -> Result<Option<AsrRequest>, String> {
         let speech = self
             .detector
@@ -866,6 +1130,9 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
         self.active = None;
         self.trailing_silence_frames = 0;
         self.detector.reset();
+        if let Some(resampler) = self.resampler.as_mut() {
+            resampler.reset();
+        }
     }
 
     fn request_event(&self, request: AsrRequest) -> SpeechWindowEvent {
@@ -1254,6 +1521,77 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_energy_gate_learns_only_from_vad_negative_frames() {
+        let mut detector =
+            EnergyGatedSpeechDetector::adaptive(ScriptedSpeechDetector::new([Ok(true), Ok(true)]));
+        let frame = |amplitude: f32| {
+            InferenceAudioWindow::new(
+                Uuid::nil(),
+                0,
+                10_000_000,
+                INFERENCE_SAMPLE_RATE_HZ,
+                INFERENCE_CHANNELS,
+                vec![amplitude; PIPELINE_FRAME_SAMPLES],
+            )
+            .unwrap()
+        };
+
+        assert!(detector.is_speech(&frame(0.2)).unwrap());
+        assert!(
+            detector.is_speech(&frame(0.01)).unwrap(),
+            "VAD-positive audio must not raise the adaptive noise floor"
+        );
+    }
+
+    #[test]
+    fn adaptive_energy_gate_uses_noise_margin_and_clamped_thresholds() {
+        let frame = |amplitude: f32| {
+            InferenceAudioWindow::new(
+                Uuid::nil(),
+                0,
+                10_000_000,
+                INFERENCE_SAMPLE_RATE_HZ,
+                INFERENCE_CHANNELS,
+                vec![amplitude; PIPELINE_FRAME_SAMPLES],
+            )
+            .unwrap()
+        };
+        let mut quiet_room =
+            EnergyGatedSpeechDetector::adaptive(ScriptedSpeechDetector::new([Ok(false), Ok(true)]));
+        assert!(!quiet_room.is_speech(&frame(0.001)).unwrap());
+        assert!(quiet_room.is_speech(&frame(0.01)).unwrap());
+
+        let mut noisy_room =
+            EnergyGatedSpeechDetector::adaptive(ScriptedSpeechDetector::new([Ok(false), Ok(true)]));
+        assert!(!noisy_room.is_speech(&frame(0.1)).unwrap());
+        assert!(
+            !noisy_room.is_speech(&frame(0.05)).unwrap(),
+            "the upper -24 dBFS clamp must still reject sub-threshold VAD positives"
+        );
+    }
+
+    #[test]
+    fn adaptive_energy_gate_resets_its_noise_estimate_after_a_discontinuity() {
+        let mut detector =
+            EnergyGatedSpeechDetector::adaptive(ScriptedSpeechDetector::new([Ok(false), Ok(true)]));
+        let frame = |amplitude: f32| {
+            InferenceAudioWindow::new(
+                Uuid::nil(),
+                0,
+                10_000_000,
+                INFERENCE_SAMPLE_RATE_HZ,
+                INFERENCE_CHANNELS,
+                vec![amplitude; PIPELINE_FRAME_SAMPLES],
+            )
+            .unwrap()
+        };
+
+        assert!(!detector.is_speech(&frame(0.1)).unwrap());
+        detector.reset();
+        assert!(detector.is_speech(&frame(0.01)).unwrap());
+    }
+
+    #[test]
     fn segmenter_discards_a_brief_vad_positive_run_at_finish() {
         let decisions = (0..19).map(|_| Ok(true));
         let mut segmenter = SpeechSegmenter::new(
@@ -1462,17 +1800,21 @@ mod tests {
     }
 
     #[test]
-    fn segmenter_downmixes_and_decimates_48khz_pcm_across_packet_boundaries() {
+    fn segmenter_downmixes_and_resamples_48khz_pcm_across_packet_boundaries() {
         let session_id = Uuid::new_v4();
         let mut segmenter =
             SpeechSegmenter::new(session_id, clock(48_000), AlwaysSpeech, config()).unwrap();
-        let stereo = |start: usize, length: usize| {
+        let stereo_tone = |start: usize, length: usize| {
             (start..start + length)
-                .flat_map(|frame| [frame as f32 / 480.0, 0.2])
+                .flat_map(|frame| {
+                    let phase = 2.0 * std::f32::consts::PI * 1_000.0 * frame as f32 / 48_000.0;
+                    let sample = phase.sin() * 0.8;
+                    [sample, sample]
+                })
                 .collect::<Vec<_>>()
         };
-        let first = packet(0, 48_000, 2, stereo(0, 200));
-        let second = packet(200, 48_000, 2, stereo(200, 280));
+        let first = packet(0, 48_000, 2, stereo_tone(0, 1_997));
+        let second = packet(1_997, 48_000, 2, stereo_tone(1_997, 2_803));
 
         assert!(segmenter
             .push_packet(NativePcmPacket::from(&first))
@@ -1487,11 +1829,43 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let audio = &requests[0].audio;
         assert_eq!(audio.session_id(), session_id);
-        assert_eq!(audio.frame_count(), PIPELINE_FRAME_SAMPLES);
-        assert!((audio.samples()[0] - 0.1).abs() < f32::EPSILON);
-        assert!((audio.samples()[1] - 0.103_125).abs() < f32::EPSILON);
+        assert_eq!(audio.frame_count(), PIPELINE_FRAME_SAMPLES * 10);
+        let retained_rms = root_mean_square(&audio.samples()[PIPELINE_FRAME_SAMPLES..]).unwrap();
+        assert!(
+            (0.45..=0.65).contains(&retained_rms),
+            "speech-band tone RMS must survive resampling, observed {retained_rms}"
+        );
         assert_eq!(audio.capture_start_ns(), 1_000);
-        assert_eq!(audio.capture_end_ns(), 10_001_000);
+        assert_eq!(audio.capture_end_ns(), 100_001_000);
+    }
+
+    #[test]
+    fn segmenter_attenuates_above_nyquist_audio_when_resampling_48khz_pcm() {
+        let mut segmenter =
+            SpeechSegmenter::new(Uuid::new_v4(), clock(48_000), AlwaysSpeech, config()).unwrap();
+        let samples = (0..4_800)
+            .map(|frame| {
+                let phase = 2.0 * std::f32::consts::PI * 12_000.0 * frame as f32 / 48_000.0;
+                phase.sin() * 0.8
+            })
+            .collect::<Vec<_>>();
+
+        assert!(segmenter
+            .push_packet(NativePcmPacket::from(&packet(0, 48_000, 1, samples)))
+            .unwrap()
+            .is_empty());
+        let requests = requests(segmenter.finish().unwrap());
+
+        assert_eq!(requests.len(), 1);
+        let audio = &requests[0].audio;
+        assert_eq!(audio.frame_count(), PIPELINE_FRAME_SAMPLES * 10);
+        let aliased_rms = root_mean_square(&audio.samples()[PIPELINE_FRAME_SAMPLES..]).unwrap();
+        assert!(
+            aliased_rms < 0.03,
+            "out-of-band tone must be filtered before downsampling, observed RMS {aliased_rms}"
+        );
+        assert_eq!(audio.capture_start_ns(), 1_000);
+        assert_eq!(audio.capture_end_ns(), 100_001_000);
     }
 
     #[test]
@@ -1679,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn downmixes_and_decimates_48khz_pcm_across_packet_boundaries() {
+    fn downmixes_and_resamples_48khz_pcm_across_packet_boundaries() {
         let windows = Arc::new(Mutex::new(Vec::new()));
         let session_id = Uuid::new_v4();
         let mut pipeline = SpeechPipeline::new(
@@ -1690,13 +2064,17 @@ mod tests {
             config(),
         )
         .unwrap();
-        let stereo = |start: usize, length: usize| {
+        let stereo_tone = |start: usize, length: usize| {
             (start..start + length)
-                .flat_map(|frame| [frame as f32 / 480.0, 0.2])
+                .flat_map(|frame| {
+                    let phase = 2.0 * std::f32::consts::PI * 1_000.0 * frame as f32 / 48_000.0;
+                    let sample = phase.sin() * 0.8;
+                    [sample, sample]
+                })
                 .collect::<Vec<_>>()
         };
-        let first = packet(0, 48_000, 2, stereo(0, 200));
-        let second = packet(200, 48_000, 2, stereo(200, 280));
+        let first = packet(0, 48_000, 2, stereo_tone(0, 200));
+        let second = packet(200, 48_000, 2, stereo_tone(200, 280));
 
         assert!(pipeline
             .push_packet(NativePcmPacket::from(&first))
@@ -1711,29 +2089,25 @@ mod tests {
         let windows = windows.lock().unwrap();
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].frame_count(), PIPELINE_FRAME_SAMPLES);
-        assert!((windows[0].samples()[0] - 0.1).abs() < f32::EPSILON);
-        assert!((windows[0].samples()[1] - 0.103_125).abs() < f32::EPSILON);
+        let retained_rms = root_mean_square(windows[0].samples()).unwrap();
+        assert!((0.45..=0.65).contains(&retained_rms));
         assert_eq!(windows[0].capture_start_ns(), 1_000);
         assert_eq!(windows[0].capture_end_ns(), 10_001_000);
     }
 
     #[test]
-    fn decimates_a_48khz_packet_that_starts_between_decimation_ticks() {
+    fn resamples_a_48khz_packet_from_its_actual_capture_offset() {
         let windows = Arc::new(Mutex::new(Vec::new()));
+        let capture_clock = clock(48_000);
         let mut pipeline = SpeechPipeline::new(
             Uuid::new_v4(),
-            clock(48_000),
+            capture_clock.clone(),
             AlwaysSpeech,
             RecordingAsr::new(Arc::clone(&windows)),
             config(),
         )
         .unwrap();
-        let input = packet(
-            1,
-            48_000,
-            1,
-            (1..=480).map(|offset| offset as f32).collect(),
-        );
+        let input = packet(1, 48_000, 1, vec![0.25; RESAMPLER_INPUT_SAMPLES]);
 
         assert!(pipeline
             .push_packet(NativePcmPacket::from(&input))
@@ -1744,10 +2118,15 @@ mod tests {
         let windows = windows.lock().unwrap();
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].frame_count(), PIPELINE_FRAME_SAMPLES);
-        assert_eq!(windows[0].samples()[0], 3.0);
-        assert_eq!(windows[0].samples()[PIPELINE_FRAME_SAMPLES - 1], 480.0);
-        assert_eq!(windows[0].capture_start_ns(), 63_500);
-        assert_eq!(windows[0].capture_end_ns(), 10_063_500);
+        assert!(windows[0].samples().iter().all(|sample| sample.is_finite()));
+        assert_eq!(
+            windows[0].capture_start_ns(),
+            capture_clock.point_at_sample_offset(1).monotonic_ns
+        );
+        assert_eq!(
+            windows[0].capture_end_ns(),
+            capture_clock.point_at_sample_offset(481).monotonic_ns
+        );
     }
 
     #[test]

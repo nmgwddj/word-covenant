@@ -365,7 +365,7 @@ impl CaptureService {
         self.active_queue_overrun_gap = None;
         self.touch();
 
-        self.permission = CpalInput::request_permission().map_err(|error| {
+        self.permission = CpalInput::request_permission().inspect_err(|_| {
             let _ = self.lifecycle.fail_with_code(
                 requested_at.clone(),
                 CaptureFailureCode::External,
@@ -376,7 +376,6 @@ impl CaptureService {
                 device_name: None,
             });
             self.touch();
-            error
         })?;
         if self.permission == MicrophonePermission::Denied {
             self.fail_permission(requested_at, CaptureFailureCode::PermissionDenied);
@@ -1240,12 +1239,9 @@ mod tests {
 
         assert_eq!(projection.status, CaptureStatus::Idle);
         assert!(projection.meter.is_none());
-        assert!(
-            serde_json::to_string(&projection)
-                .unwrap()
-                .contains("rmsDbfs")
-                == false
-        );
+        assert!(!serde_json::to_string(&projection)
+            .unwrap()
+            .contains("rmsDbfs"));
     }
 
     #[test]
