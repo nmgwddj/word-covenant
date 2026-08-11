@@ -21,7 +21,7 @@ describe('ModelRegistryPanel', () => {
       props: { models: [model] },
     })
 
-    expect(wrapper.text()).toContain('本地模型')
+    expect(wrapper.text()).toContain('当前转写模型')
     expect(wrapper.text()).toContain('语音识别')
     expect(wrapper.text()).toContain('fixture-v1')
     expect(wrapper.find('[data-testid="model-source-path"]').exists()).toBe(false)
@@ -104,7 +104,7 @@ describe('ModelRegistryPanel', () => {
     expect(wrapper.get('[data-testid="model-source-path"]').text()).toBe('尚未选择文件')
   })
 
-  test('shows the active local ASR profile and only exposes whisper.cpp-ggml ASR models for selection', async () => {
+  test('shows one active model control and only exposes whisper.cpp-ggml ASR models for selection', async () => {
     const compatibleAlternative = {
       ...model,
       id: 'model-002',
@@ -133,9 +133,10 @@ describe('ModelRegistryPanel', () => {
       },
     })
 
-    expect(wrapper.get('[data-testid="active-asr-profile"]').text()).toContain('fixture-v1')
-    expect(wrapper.get('[data-testid="active-asr-profile"]').text()).toContain('whisper.cpp-ggml')
+    expect(wrapper.find('[data-testid="active-asr-profile"]').exists()).toBe(false)
+    expect(wrapper.find('.model-row__details:not([open])').exists()).toBe(true)
     const selector = wrapper.get('[data-testid="active-asr-model-select"]')
+    expect((selector.element as HTMLSelectElement).value).toBe(model.id)
     expect(selector.findAll('option').map(option => option.text())).toEqual([
       '选择兼容模型',
       `fixture-v1 · ${'a'.repeat(8)}`,
@@ -145,8 +146,28 @@ describe('ModelRegistryPanel', () => {
     await selector.setValue(compatibleAlternative.id)
 
     expect(wrapper.emitted('selectActiveAsrModel')).toEqual([[compatibleAlternative.id]])
-    expect(wrapper.text()).toContain('当前转写')
+    expect(wrapper.text()).toContain('使用中')
+    expect(wrapper.text().match(/fixture-v1/g)).toHaveLength(2)
     expect(wrapper.text()).not.toContain('/local/')
+  })
+
+  test('keeps model integrity metadata available through a progressive disclosure', async () => {
+    const wrapper = mount(ModelRegistryPanel, {
+      props: { models: [model] },
+    })
+
+    const details = wrapper.get('.model-row__details')
+    expect((details.element as HTMLDetailsElement).open).toBe(false)
+    expect(details.text()).toContain('详情')
+
+    await details.get('summary').trigger('click')
+
+    expect((details.element as HTMLDetailsElement).open).toBe(true)
+    expect(details.text()).toContain('输入格式')
+    expect(details.text()).toContain('SHA-256')
+    expect(details.text()).toContain(model.sha256)
+    expect(details.text()).toContain(model.modelCardId)
+    expect(details.text()).toContain(model.licenseId)
   })
 
   test('shows a verified bundled model as the selected local default while retaining advanced choices', async () => {
@@ -169,10 +190,9 @@ describe('ModelRegistryPanel', () => {
       },
     })
 
-    expect(wrapper.get('[data-testid="active-asr-profile"]').text()).toContain('fixture-v1')
-    expect(wrapper.get('[data-testid="active-asr-source"]').text()).toBe('内置默认 · 已启用')
-    expect(wrapper.findAll('.model-row')[0]?.text()).toContain('内置默认')
+    expect(wrapper.findAll('.model-row')[0]?.text()).toContain('应用内置')
     const selector = wrapper.get('[data-testid="active-asr-model-select"]')
+    expect((selector.element as HTMLSelectElement).value).toBe(model.id)
     expect(selector.findAll('option').map(option => option.text())).toEqual([
       '选择兼容模型',
       `advanced-local-v1 · ${'b'.repeat(8)}`,
@@ -182,7 +202,7 @@ describe('ModelRegistryPanel', () => {
     await selector.setValue(advancedModel.id)
 
     expect(wrapper.emitted('selectActiveAsrModel')).toEqual([[advancedModel.id]])
-    expect(wrapper.text()).toContain('高级本地模型')
+    expect(wrapper.text()).toContain('本机导入')
   })
 
   test('shows a safe local bundled-model error without a download path and keeps imported models selectable', () => {
@@ -200,7 +220,7 @@ describe('ModelRegistryPanel', () => {
     })
 
     expect(wrapper.get('[data-testid="bundled-asr-status"]').text()).toBe('内置离线转写模型不可用，请重新安装应用')
-    expect(wrapper.get('[data-testid="active-asr-source"]').text()).toBe('高级本地模型 · 已启用')
+    expect(wrapper.get('.model-row--active').text()).toContain('使用中')
     expect(wrapper.get('[data-testid="active-asr-model-select"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.find('[data-testid="open-model-import"]').exists()).toBe(true)
     expect(wrapper.text()).not.toContain('下载')

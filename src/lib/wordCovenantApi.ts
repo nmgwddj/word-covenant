@@ -11,6 +11,7 @@ import type {
   LocalModelImportInput,
   PrivacyStatus,
   RegisteredModel,
+  SpeechDetectionSettings,
   SpeakerCluster,
   SpeakerOperationResult,
   TranscriptSpan,
@@ -24,6 +25,9 @@ let demoSession: CaptureSession | null = null
 let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
 let browserActiveLocalAsrProfile: ActiveLocalAsrProfile | null = null
+let browserSpeechDetectionSettings: SpeechDetectionSettings = {
+  rmsThresholdDbfs: -10,
+}
 const browserBundledAsrStatus: BundledAsrStatus = {
   available: false,
   modelId: null,
@@ -293,6 +297,23 @@ export const wordCovenantApi = {
     return getDemoPrivacyStatus()
   },
 
+  async getSpeechDetectionSettings(): Promise<SpeechDetectionSettings> {
+    if (isTauriRuntime()) {
+      return invoke<SpeechDetectionSettings>('get_speech_detection_settings')
+    }
+
+    return { ...browserSpeechDetectionSettings }
+  },
+
+  async setSpeechDetectionSettings(input: SpeechDetectionSettings): Promise<SpeechDetectionSettings> {
+    if (isTauriRuntime()) {
+      return invoke<SpeechDetectionSettings>('set_speech_detection_settings', { input })
+    }
+
+    browserSpeechDetectionSettings = { ...input }
+    return { ...browserSpeechDetectionSettings }
+  },
+
   async startSession(): Promise<CaptureSession> {
     if (isTauriRuntime()) {
       return invoke<CaptureSession>('start_session')
@@ -325,9 +346,7 @@ export const wordCovenantApi = {
     return () => {}
   },
 
-  async onFinalTranscriptProjection(
-    listener: (projection: FinalTranscriptProjection) => void
-  ): Promise<UnlistenFn> {
+  async onFinalTranscriptProjection(listener: (projection: FinalTranscriptProjection) => void): Promise<UnlistenFn> {
     if (isTauriRuntime()) {
       return listen<FinalTranscriptProjection>('final-transcript-projection', event => listener(event.payload))
     }

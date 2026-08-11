@@ -149,14 +149,64 @@ impl EnergySpeechDetector {
 
 impl SpeechActivityDetector for EnergySpeechDetector {
     fn is_speech(&mut self, frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
-        let samples = frame.samples();
-        let energy = samples
-            .iter()
-            .map(|sample| f64::from(*sample) * f64::from(*sample))
-            .sum::<f64>();
-        let rms = (energy / samples.len() as f64).sqrt() as f32;
-        Ok(rms >= self.minimum_rms)
+        Ok(root_mean_square(frame.samples())? >= self.minimum_rms)
     }
+}
+
+/// Combines a stateful speech detector with a local RMS admission floor.
+///
+/// The wrapped detector is deliberately evaluated before the RMS result is
+/// applied. WebRTC VAD keeps a short signal history, so quiet frames must
+/// still reach it in order to clear that native state rather than leaving a
+/// stale speech decision alive across room noise.
+pub struct EnergyGatedSpeechDetector<D> {
+    detector: D,
+    minimum_rms: f32,
+}
+
+impl<D> EnergyGatedSpeechDetector<D> {
+    pub fn new(detector: D, minimum_rms: f32) -> Result<Self, String> {
+        if !minimum_rms.is_finite() || minimum_rms < 0.0 {
+            return Err("speech energy threshold must be a finite non-negative value".to_owned());
+        }
+        Ok(Self {
+            detector,
+            minimum_rms,
+        })
+    }
+
+    pub fn into_inner(self) -> D {
+        self.detector
+    }
+}
+
+impl<D: SpeechActivityDetector> SpeechActivityDetector for EnergyGatedSpeechDetector<D> {
+    fn is_speech(&mut self, frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
+        let detector_reports_speech = self.detector.is_speech(frame)?;
+        Ok(detector_reports_speech && root_mean_square(frame.samples())? >= self.minimum_rms)
+    }
+
+    fn reset(&mut self) {
+        self.detector.reset();
+    }
+}
+
+fn root_mean_square(samples: &[f32]) -> Result<f32, InferenceError> {
+    if samples.is_empty() {
+        return Err(InferenceError::invalid(
+            "speech energy evaluation requires at least one sample",
+        ));
+    }
+
+    let energy = samples.iter().try_fold(0_f64, |total, sample| {
+        if !sample.is_finite() {
+            return Err(InferenceError::invalid(
+                "speech energy samples must be finite",
+            ));
+        }
+        Ok(total + f64::from(*sample) * f64::from(*sample))
+    })?;
+    Ok((energy / samples.len() as f64).sqrt() as f32)
 }
 
 /// Adapts an existing local VAD engine to the frame-level pipeline contract.
@@ -198,6 +248,10 @@ pub struct SpeechPipelineConfig {
     pub pre_roll_frames: usize,
     pub hangover_frames: usize,
     pub maximum_window_frames: usize,
+    /// The longest contiguous run of VAD-positive 10 ms frames required
+    /// before an utterance can enter ASR. Pre-roll and hangover audio remain
+    /// attached but do not count toward this admission threshold.
+    pub minimum_speech_frames: usize,
     pub language: Option<String>,
     pub emit_partials: bool,
 }
@@ -208,6 +262,7 @@ impl Default for SpeechPipelineConfig {
             pre_roll_frames: 20,
             hangover_frames: 50,
             maximum_window_frames: MAX_PIPELINE_WINDOW_FRAMES,
+            minimum_speech_frames: 20,
             language: Some("zh".to_owned()),
             emit_partials: true,
         }
@@ -231,6 +286,14 @@ impl SpeechPipelineConfig {
         if self.hangover_frames > self.maximum_window_frames {
             return Err("speech pipeline hangover exceeds its maximum window".to_owned());
         }
+        if self.minimum_speech_frames == 0
+            || self.minimum_speech_frames > self.maximum_window_frames
+        {
+            return Err(
+                "speech pipeline minimum speech frames must fit inside its maximum window"
+                    .to_owned(),
+            );
+        }
         if self
             .language
             .as_deref()
@@ -252,20 +315,24 @@ struct ActiveUtterance {
     capture_start_ns: u64,
     capture_end_ns: u64,
     samples: Vec<f32>,
+    consecutive_speech_frames: usize,
+    longest_speech_run_frames: usize,
 }
 
 impl ActiveUtterance {
-    fn from_frame(frame: BufferedFrame) -> Self {
+    fn from_frame(frame: BufferedFrame, is_speech: bool) -> Self {
         let BufferedFrame { started_at, frame } = frame;
         Self {
             started_at,
             capture_start_ns: frame.capture_start_ns(),
             capture_end_ns: frame.capture_end_ns(),
             samples: frame.samples().to_vec(),
+            consecutive_speech_frames: usize::from(is_speech),
+            longest_speech_run_frames: usize::from(is_speech),
         }
     }
 
-    fn append(&mut self, frame: &InferenceAudioWindow) -> Result<(), String> {
+    fn append(&mut self, frame: &InferenceAudioWindow, is_speech: bool) -> Result<(), String> {
         if frame.capture_start_ns() != self.capture_end_ns {
             return Err("speech pipeline frames must remain contiguous".to_owned());
         }
@@ -279,6 +346,17 @@ impl ActiveUtterance {
         }
         self.samples.extend_from_slice(frame.samples());
         self.capture_end_ns = frame.capture_end_ns();
+        if is_speech {
+            self.consecutive_speech_frames = self
+                .consecutive_speech_frames
+                .checked_add(1)
+                .ok_or_else(|| "speech pipeline speech frame count overflowed".to_owned())?;
+            self.longest_speech_run_frames = self
+                .longest_speech_run_frames
+                .max(self.consecutive_speech_frames);
+        } else {
+            self.consecutive_speech_frames = 0;
+        }
         Ok(())
     }
 
@@ -705,7 +783,7 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
         }
 
         if let Some(active) = self.active.as_mut() {
-            active.append(&frame.frame)?;
+            active.append(&frame.frame, speech)?;
             self.trailing_silence_frames = if speech {
                 0
             } else {
@@ -724,16 +802,18 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
             return Ok(None);
         }
 
-        let mut frames = std::mem::take(&mut self.pre_roll);
-        frames.push_back(frame);
-        let mut frames = frames.into_iter();
-        let first = frames
-            .next()
-            .expect("a speech start always includes its current frame");
-        let mut active = ActiveUtterance::from_frame(first);
-        for previous in frames {
-            active.append(&previous.frame)?;
-        }
+        let mut pre_roll = std::mem::take(&mut self.pre_roll);
+        let active = match pre_roll.pop_front() {
+            Some(first) => {
+                let mut active = ActiveUtterance::from_frame(first, false);
+                for previous in pre_roll {
+                    active.append(&previous.frame, false)?;
+                }
+                active.append(&frame.frame, true)?;
+                active
+            }
+            None => ActiveUtterance::from_frame(frame, true),
+        };
         self.trailing_silence_frames = 0;
         let should_finalize = active.frame_count() >= self.config.maximum_window_frames;
         self.active = Some(active);
@@ -759,6 +839,9 @@ impl<D: SpeechActivityDetector> SpeechSegmenter<D> {
             return Ok(None);
         };
         self.trailing_silence_frames = 0;
+        if active.longest_speech_run_frames < self.config.minimum_speech_frames {
+            return Ok(None);
+        }
         let window = InferenceAudioWindow::new(
             self.session_id,
             active.capture_start_ns,
@@ -924,7 +1007,8 @@ mod tests {
     use super::*;
     use crate::audio::CapturePoint;
     use crate::inference::{
-        InferenceEngine, ModelProvenance, TranscriptEmission, TranscriptEmissionKind,
+        AsrResponseDisposition, InferenceEngine, ModelProvenance, TranscriptEmission,
+        TranscriptEmissionKind,
     };
     use chrono::{DateTime, Duration, Utc};
     use std::sync::{
@@ -1004,6 +1088,7 @@ mod tests {
                     )
                     .expect("fixture model provenance is valid"),
                 }],
+                disposition: AsrResponseDisposition::Transcript,
             })
         }
     }
@@ -1032,6 +1117,17 @@ mod tests {
     impl SpeechActivityDetector for ScriptedSpeechDetector {
         fn is_speech(&mut self, _frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
             self.decisions.pop_front().unwrap_or(Ok(true))
+        }
+    }
+
+    struct CountingSpeechDetector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SpeechActivityDetector for CountingSpeechDetector {
+        fn is_speech(&mut self, _frame: &InferenceAudioWindow) -> Result<bool, InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
         }
     }
 
@@ -1086,6 +1182,7 @@ mod tests {
             pre_roll_frames: 0,
             hangover_frames: 1,
             maximum_window_frames: 16,
+            minimum_speech_frames: 1,
             language: Some("zh".to_owned()),
             emit_partials: true,
         }
@@ -1120,6 +1217,130 @@ mod tests {
                 SpeechWindowEvent::Discontinuity { .. } => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn energy_gate_observes_quiet_frames_before_rejecting_them() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut detector = EnergyGatedSpeechDetector::new(
+            CountingSpeechDetector {
+                calls: Arc::clone(&calls),
+            },
+            0.05,
+        )
+        .unwrap();
+        let quiet = InferenceAudioWindow::new(
+            Uuid::nil(),
+            0,
+            10_000_000,
+            INFERENCE_SAMPLE_RATE_HZ,
+            INFERENCE_CHANNELS,
+            vec![0.01; PIPELINE_FRAME_SAMPLES],
+        )
+        .unwrap();
+        let audible = InferenceAudioWindow::new(
+            Uuid::nil(),
+            10_000_000,
+            20_000_000,
+            INFERENCE_SAMPLE_RATE_HZ,
+            INFERENCE_CHANNELS,
+            vec![0.2; PIPELINE_FRAME_SAMPLES],
+        )
+        .unwrap();
+
+        assert!(!detector.is_speech(&quiet).unwrap());
+        assert!(detector.is_speech(&audible).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn segmenter_discards_a_brief_vad_positive_run_at_finish() {
+        let decisions = (0..19).map(|_| Ok(true));
+        let mut segmenter = SpeechSegmenter::new(
+            Uuid::new_v4(),
+            clock(INFERENCE_SAMPLE_RATE_HZ),
+            ScriptedSpeechDetector::new(decisions),
+            SpeechPipelineConfig {
+                minimum_speech_frames: 20,
+                maximum_window_frames: 24,
+                ..config()
+            },
+        )
+        .unwrap();
+
+        assert!(segmenter
+            .push_packet(NativePcmPacket::from(&packet(
+                0,
+                INFERENCE_SAMPLE_RATE_HZ,
+                INFERENCE_CHANNELS,
+                vec![0.2; PIPELINE_FRAME_SAMPLES * 19],
+            )))
+            .unwrap()
+            .is_empty());
+        assert!(segmenter.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn segmenter_does_not_accumulate_intermittent_vad_noise_into_speech() {
+        let decisions = (0..20).flat_map(|_| [Ok(true), Ok(false)]);
+        let mut segmenter = SpeechSegmenter::new(
+            Uuid::new_v4(),
+            clock(INFERENCE_SAMPLE_RATE_HZ),
+            ScriptedSpeechDetector::new(decisions),
+            SpeechPipelineConfig {
+                hangover_frames: 50,
+                minimum_speech_frames: 20,
+                maximum_window_frames: 80,
+                ..config()
+            },
+        )
+        .unwrap();
+
+        assert!(segmenter
+            .push_packet(NativePcmPacket::from(&packet(
+                0,
+                INFERENCE_SAMPLE_RATE_HZ,
+                INFERENCE_CHANNELS,
+                vec![0.2; PIPELINE_FRAME_SAMPLES * 40],
+            )))
+            .unwrap()
+            .is_empty());
+        assert!(segmenter.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn segmenter_admits_qualified_speech_without_counting_pre_roll_or_hangover() {
+        let decisions = std::iter::repeat_n(Ok(true), 20).chain(std::iter::once(Ok(false)));
+        let mut segmenter = SpeechSegmenter::new(
+            Uuid::new_v4(),
+            clock(INFERENCE_SAMPLE_RATE_HZ),
+            ScriptedSpeechDetector::new(std::iter::repeat_n(Ok(false), 2).chain(decisions)),
+            SpeechPipelineConfig {
+                pre_roll_frames: 2,
+                hangover_frames: 1,
+                minimum_speech_frames: 20,
+                maximum_window_frames: 24,
+                ..config()
+            },
+        )
+        .unwrap();
+        let mut samples = vec![0.0; PIPELINE_FRAME_SAMPLES * 2];
+        samples.extend(std::iter::repeat_n(0.2, PIPELINE_FRAME_SAMPLES * 20));
+        samples.extend(std::iter::repeat_n(0.0, PIPELINE_FRAME_SAMPLES));
+
+        let requests = requests(
+            segmenter
+                .push_packet(NativePcmPacket::from(&packet(
+                    0,
+                    INFERENCE_SAMPLE_RATE_HZ,
+                    INFERENCE_CHANNELS,
+                    samples,
+                )))
+                .unwrap(),
+        );
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].audio.frame_count(), PIPELINE_FRAME_SAMPLES * 23);
     }
 
     #[test]

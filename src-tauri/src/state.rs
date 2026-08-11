@@ -1,6 +1,12 @@
+#[cfg(target_os = "macos")]
+use crate::audio::CaptureStart;
 #[cfg(all(target_os = "macos", not(test)))]
-use crate::audio::{capture_point_now, CaptureStart, DispatcherRuntimeId, NativeInferenceEngines};
-use crate::audio::{AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime};
+use crate::audio::{
+    capture_point_now, DispatcherRuntimeId, NativeCaptureRuntimeConfig, NativeInferenceEngines,
+};
+use crate::audio::{
+    AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime, SpeechDetectionSettings,
+};
 #[cfg(target_os = "macos")]
 use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
 #[cfg(any(test, debug_assertions))]
@@ -25,6 +31,8 @@ use crate::inference::bundled_model::{
 use crate::inference::model_registry::{
     LocalModelKind, ModelImportRequest, ModelRegistry, RegisteredModel,
 };
+#[cfg(test)]
+use crate::inference::AsrResponseDisposition;
 use crate::inference::{
     is_whisper_cpp_compatible_input_format, AsrResponse, InferenceGap, InferenceGapReason,
     InferenceGapStage, MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionKind,
@@ -48,6 +56,22 @@ pub struct PrivacyStatus {
     pub egress_enabled: bool,
     pub active_egress_approvals: usize,
     pub recording_session_id: Option<Uuid>,
+}
+
+/// Immutable facts recorded with the native capture-start audit event. The
+/// applied threshold is a session snapshot, not a mutable preference lookup.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureInputStartedAuditPayload {
+    session_id: Uuid,
+    runtime_id: Uuid,
+    capture_segment_id: Uuid,
+    device_uid: String,
+    device_name: String,
+    sample_rate: u32,
+    channels: u16,
+    anchor: CapturePoint,
+    speech_rms_threshold_dbfs: i8,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -214,6 +238,7 @@ pub struct AppState {
     policy: Mutex<EgressPolicy>,
     audit_trail: Mutex<AuditTrail>,
     audit_store: Mutex<AuditStore>,
+    speech_detection_settings: Mutex<SpeechDetectionSettings>,
     model_registry: Mutex<ModelRegistry>,
     bundled_asr_runtime: Mutex<BundledAsrRuntime>,
     active_local_asr_profile: Mutex<Option<ActiveLocalAsrProfile>>,
@@ -263,6 +288,7 @@ impl AppState {
         model_root: Option<PathBuf>,
     ) -> Result<Self, AuditStoreError> {
         let timelines = timeline_projections(audit_store.list_all_transcript_revisions()?);
+        let speech_detection_settings = audit_store.speech_detection_settings()?;
         let persisted_models = audit_store.list_local_models()?;
         let model_registry = if let Some(model_root) = model_root.as_deref() {
             ModelRegistry::from_persisted(model_root, persisted_models)
@@ -283,6 +309,7 @@ impl AppState {
             policy: Mutex::new(EgressPolicy::default()),
             audit_trail: Mutex::new(audit_trail),
             audit_store: Mutex::new(audit_store),
+            speech_detection_settings: Mutex::new(speech_detection_settings),
             model_registry: Mutex::new(model_registry),
             bundled_asr_runtime: Mutex::new(BundledAsrRuntime::default()),
             active_local_asr_profile: Mutex::new(None),
@@ -352,6 +379,50 @@ impl AppState {
         self.privacy_status()
     }
 
+    pub fn speech_detection_settings(&self) -> Result<SpeechDetectionSettings, String> {
+        self.speech_detection_settings
+            .lock()
+            .map_err(|_| "speech detection settings lock poisoned".to_owned())
+            .map(|settings| *settings)
+    }
+
+    pub fn set_speech_detection_settings(
+        &self,
+        settings: SpeechDetectionSettings,
+    ) -> Result<SpeechDetectionSettings, String> {
+        settings.validate()?;
+
+        // Start/stop and settings writes use this same transition lock so a
+        // threshold cannot slip between preparation and runtime construction.
+        #[cfg(target_os = "macos")]
+        let _native_lifecycle = self
+            .native_capture_lifecycle
+            .lock()
+            .map_err(|_| "native capture lifecycle lock poisoned".to_owned())?;
+
+        if self.capture_settings_are_locked()? {
+            return Err(
+                "cannot change speech detection settings while microphone capture is preparing or recording"
+                    .to_owned(),
+            );
+        }
+
+        let mut active_settings = self
+            .speech_detection_settings
+            .lock()
+            .map_err(|_| "speech detection settings lock poisoned".to_owned())?;
+        if *active_settings == settings {
+            return Ok(settings);
+        }
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .set_speech_detection_settings(settings)
+            .map_err(|error| format!("could not persist speech detection settings: {error}"))?;
+        *active_settings = settings;
+        Ok(settings)
+    }
+
     pub fn start_session(&self) -> Result<CaptureSession, String> {
         #[cfg(test)]
         {
@@ -397,6 +468,29 @@ impl AppState {
             .select_input_device(device_uid)
     }
 
+    fn capture_settings_are_locked(&self) -> Result<bool, String> {
+        let session_is_live = self.active_live_session()?.is_some();
+
+        #[cfg(target_os = "macos")]
+        {
+            let status = self
+                .capture_service
+                .lock()
+                .map_err(|_| "capture service lock poisoned".to_owned())?
+                .projection()
+                .status;
+            return Ok(session_is_live
+                || matches!(
+                    status,
+                    crate::audio::CaptureStatus::AwaitingPermission
+                        | crate::audio::CaptureStatus::Recording
+                ));
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        Ok(session_is_live)
+    }
+
     #[cfg(target_os = "macos")]
     #[cfg(not(test))]
     fn start_microphone_session(&self) -> Result<CaptureSession, String> {
@@ -428,6 +522,11 @@ impl AppState {
             .lock()
             .map_err(|_| "capture service lock poisoned".to_owned())?
             .prepare()?;
+        // Preparation makes the settings non-editable. Snapshot after that
+        // boundary so this session has one explainable, stable threshold.
+        let speech_detection_settings = self.speech_detection_settings()?;
+        let runtime_config =
+            NativeCaptureRuntimeConfig::from_speech_detection_settings(speech_detection_settings)?;
         let session_id = Uuid::new_v4();
         let runtime = DispatcherRuntime::new(
             DispatcherRuntimeId::generate(),
@@ -439,7 +538,7 @@ impl AppState {
             .capture_service
             .lock()
             .map_err(|_| "capture service lock poisoned".to_owned())?
-            .activate_with_runtime_and_engines(runtime.clone(), inference_engines)
+            .activate_with_runtime_and_engines(runtime.clone(), runtime_config, inference_engines)
         {
             Ok(capture_start) => capture_start,
             Err(error) => {
@@ -457,7 +556,11 @@ impl AppState {
             ));
         }
 
-        let _staged_session = match self.commit_native_capture_start(session_id, &capture_start) {
+        let _staged_session = match self.commit_native_capture_start(
+            session_id,
+            &capture_start,
+            speech_detection_settings,
+        ) {
             Ok(session) => session,
             Err(error) => {
                 return Err(with_staged_capture_cleanup(
@@ -529,11 +632,12 @@ impl AppState {
             })
     }
 
-    #[cfg(all(target_os = "macos", not(test)))]
+    #[cfg(target_os = "macos")]
     fn commit_native_capture_start(
         &self,
         session_id: Uuid,
         capture_start: &CaptureStart,
+        speech_detection_settings: SpeechDetectionSettings,
     ) -> Result<CaptureSession, String> {
         if capture_start.runtime.session_id != session_id {
             return Err(
@@ -561,16 +665,17 @@ impl AppState {
             capture_start.anchor.monotonic_ns,
             capture_start.anchor.wall_clock,
         )?;
-        let input_started_payload = serde_json::json!({
-            "sessionId": session.id,
-            "runtimeId": capture_start.runtime.id.as_uuid(),
-            "captureSegmentId": segment.id,
-            "deviceUid": capture_start.device.uid(),
-            "deviceName": capture_start.device.name(),
-            "sampleRate": capture_start.sample_rate,
-            "channels": capture_start.channels,
-            "anchor": capture_start.anchor,
-        });
+        let input_started_payload = CaptureInputStartedAuditPayload {
+            session_id: session.id,
+            runtime_id: capture_start.runtime.id.as_uuid(),
+            capture_segment_id: segment.id,
+            device_uid: capture_start.device.uid().to_owned(),
+            device_name: capture_start.device.name().to_owned(),
+            sample_rate: capture_start.sample_rate,
+            channels: capture_start.channels,
+            anchor: capture_start.anchor.clone(),
+            speech_rms_threshold_dbfs: speech_detection_settings.rms_threshold_dbfs,
+        };
 
         // Acquire every fallible projection lock before committing the audit
         // bundle. A failed staged start then leaves neither an active in-memory
@@ -1419,6 +1524,10 @@ impl AppState {
                         }
                         Ok(projections)
                     }
+                    // Silence suppressed by the local ASR adapter is a
+                    // successful completion. It must release the worker lease
+                    // without creating a misleading engine-failure gap.
+                    Ok(false) if response.is_no_speech() => Ok(Vec::new()),
                     // A completed worker result that contains no final, or
                     // whose emissions violate the local contract, has no
                     // recoverable transcript. Account for the captured range
@@ -2823,6 +2932,9 @@ fn validate_native_asr_response(
             "native ASR response exceeds {MAX_ASR_EMISSIONS_PER_REQUEST} emissions"
         ));
     }
+    if response.is_no_speech() && !response.emissions.is_empty() {
+        return Err("native no-speech ASR response cannot include transcript emissions".to_owned());
+    }
 
     let mut revisions = BTreeMap::<String, (u32, bool)>::new();
     let mut has_final = false;
@@ -2992,6 +3104,131 @@ mod tests {
         assert!(state.audit_is_valid().unwrap());
     }
 
+    #[test]
+    fn speech_detection_settings_are_default_and_persist_through_app_state_reopen() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-state-speech-detection-settings-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+
+        {
+            let state = AppState::open(&database).unwrap();
+            assert_eq!(
+                state.speech_detection_settings().unwrap(),
+                SpeechDetectionSettings::default()
+            );
+            assert_eq!(
+                state
+                    .set_speech_detection_settings(SpeechDetectionSettings::new(-24).unwrap())
+                    .unwrap(),
+                SpeechDetectionSettings::new(-24).unwrap()
+            );
+        }
+
+        let reopened = AppState::open(&database).unwrap();
+        assert_eq!(
+            reopened.speech_detection_settings().unwrap(),
+            SpeechDetectionSettings::new(-24).unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn speech_detection_settings_reject_invalid_values_without_changing_the_active_value() {
+        let state = AppState::in_memory();
+        let configured = SpeechDetectionSettings::new(-24).unwrap();
+        state.set_speech_detection_settings(configured).unwrap();
+
+        assert!(state
+            .set_speech_detection_settings(SpeechDetectionSettings {
+                rms_threshold_dbfs: -61,
+            })
+            .is_err());
+        assert_eq!(state.speech_detection_settings().unwrap(), configured);
+    }
+
+    #[test]
+    fn speech_detection_settings_reject_changes_while_a_session_is_starting_or_recording() {
+        let starting_state = AppState::in_memory();
+        install_starting_native_session(&starting_state);
+        assert_eq!(
+            starting_state
+                .set_speech_detection_settings(SpeechDetectionSettings::new(-24).unwrap())
+                .unwrap_err(),
+            "cannot change speech detection settings while microphone capture is preparing or recording"
+        );
+
+        let recording_state = AppState::in_memory();
+        recording_state.start_session().unwrap();
+        assert_eq!(
+            recording_state
+                .set_speech_detection_settings(SpeechDetectionSettings::new(-24).unwrap())
+                .unwrap_err(),
+            "cannot change speech detection settings while microphone capture is preparing or recording"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_start_audit_payload_records_the_applied_speech_threshold() {
+        let state = AppState::in_memory();
+        let session_id = Uuid::new_v4();
+        let capture_segment_id = Uuid::new_v4();
+        let anchor = CapturePoint {
+            monotonic_ns: 1_000,
+            wall_clock: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        let runtime = DispatcherRuntime::new(
+            DispatcherRuntimeId::generate(),
+            session_id,
+            capture_segment_id,
+            anchor.clone(),
+        )
+        .unwrap();
+        let capture_start = crate::audio::CaptureStart {
+            anchor: anchor.clone(),
+            device: crate::audio::MacOsInputDevice::new("built-in-mic", "Built-in Microphone")
+                .unwrap(),
+            sample_rate: 48_000,
+            channels: 2,
+            runtime: runtime.clone(),
+        };
+        let settings = SpeechDetectionSettings::new(-24).unwrap();
+
+        let session = state
+            .commit_native_capture_start(session_id, &capture_start, settings)
+            .unwrap();
+        let input_started = state
+            .audit_trail
+            .lock()
+            .unwrap()
+            .events()
+            .iter()
+            .find(|event| event.kind == AuditKind::CaptureInputStarted)
+            .cloned()
+            .expect("capture input start is audited");
+        let expected_payload = CaptureInputStartedAuditPayload {
+            session_id: session.id,
+            runtime_id: runtime.id.as_uuid(),
+            capture_segment_id,
+            device_uid: "built-in-mic".to_owned(),
+            device_name: "Built-in Microphone".to_owned(),
+            sample_rate: 48_000,
+            channels: 2,
+            anchor,
+            speech_rms_threshold_dbfs: -24,
+        };
+
+        assert!(input_started.matches_payload(&expected_payload).unwrap());
+        assert!(!input_started
+            .matches_payload(&CaptureInputStartedAuditPayload {
+                speech_rms_threshold_dbfs: -10,
+                ..expected_payload
+            })
+            .unwrap());
+    }
+
     fn native_runtime_for(session: &CaptureSession, capture_segment_id: Uuid) -> DispatcherRuntime {
         let anchor_offset_ns = 1_000_000;
         DispatcherRuntime::new(
@@ -3070,6 +3307,7 @@ mod tests {
         let job = native_job(&runtime, Uuid::new_v4());
         let response = AsrResponse {
             emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
+            disposition: AsrResponseDisposition::Transcript,
         };
 
         let projections = state
@@ -3304,6 +3542,7 @@ mod tests {
         let job = native_job(&runtime, Uuid::new_v4());
         let response = AsrResponse {
             emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
+            disposition: AsrResponseDisposition::Transcript,
         };
         let projections = state
             .persist_native_outcome(&runtime, &AsrOutcome::Response { job, response })
@@ -3333,6 +3572,69 @@ mod tests {
     }
 
     #[test]
+    fn acknowledges_a_declared_no_speech_response_without_a_transcript_or_gap() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+
+        let projections = state
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job: native_job(&runtime, Uuid::new_v4()),
+                    response: AsrResponse::no_speech(),
+                },
+            )
+            .unwrap();
+
+        assert!(projections.is_empty());
+        assert!(state.list_timeline(Some(session.id)).unwrap().is_empty());
+        assert!(state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_inference_gaps(session.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(state.final_transcript_projection(), None);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn turns_an_undeclared_empty_native_response_into_a_durable_gap() {
+        let state = AppState::in_memory();
+        let session = state.start_session().unwrap();
+        let runtime = native_runtime_for(&session, Uuid::new_v4());
+        state.activate_native_runtime(runtime.clone()).unwrap();
+        let job = native_job(&runtime, Uuid::new_v4());
+
+        let projections = state
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job: job.clone(),
+                    response: AsrResponse {
+                        emissions: Vec::new(),
+                        disposition: AsrResponseDisposition::Transcript,
+                    },
+                },
+            )
+            .unwrap();
+
+        assert!(projections.is_empty());
+        let gaps = state
+            .audit_store
+            .lock()
+            .unwrap()
+            .list_inference_gaps(session.id)
+            .unwrap();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].job_id, Some(job.id));
+        assert_eq!(gaps[0].reason, InferenceGapReason::EngineFailed);
+    }
+
+    #[test]
     fn turns_an_asr_response_without_a_final_into_a_durable_gap() {
         let state = AppState::in_memory();
         let session = state.start_session().unwrap();
@@ -3346,6 +3648,7 @@ mod tests {
                 TranscriptEmissionKind::Partial,
                 1,
             )],
+            disposition: AsrResponseDisposition::Transcript,
         };
         let projections = state
             .persist_native_outcome(
@@ -3379,6 +3682,7 @@ mod tests {
                             TranscriptEmissionKind::Final,
                             1,
                         )],
+                        disposition: AsrResponseDisposition::Transcript,
                     },
                 },
             )
@@ -3399,6 +3703,7 @@ mod tests {
                 native_emission(&runtime, TranscriptEmissionKind::Final, 1),
                 native_emission(&runtime, TranscriptEmissionKind::Partial, 2),
             ],
+            disposition: AsrResponseDisposition::Transcript,
         };
         let projections = state
             .persist_native_outcome(
@@ -3510,6 +3815,7 @@ mod tests {
             job: native_job(&runtime, Uuid::new_v4()),
             response: AsrResponse {
                 emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
+                disposition: AsrResponseDisposition::Transcript,
             },
         };
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4081,6 +4387,7 @@ mod tests {
                 .last()
                 .cloned()
                 .expect("fixture emits one final result")],
+            disposition: AsrResponseDisposition::Transcript,
         };
 
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

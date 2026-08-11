@@ -26,6 +26,8 @@ pub const WHISPER_CPP_PROVIDER: &str = "whisper.cpp";
 const MAX_TOKENS_PER_SEGMENT: i32 = 256;
 const MAX_INFERENCE_THREADS: usize = 4;
 const NANOSECONDS_PER_CENTISECOND: u64 = 10_000_000;
+const NO_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.60;
+const LOW_AVERAGE_LOG_PROBABILITY_THRESHOLD: f32 = -1.0;
 
 /// Checks the explicit import declaration required by this adapter.
 ///
@@ -138,6 +140,13 @@ impl AsrEngine for WhisperCppAsrEngine {
 
         let mut segments = Vec::new();
         for segment in self.state.as_iter() {
+            let no_speech_probability = segment.no_speech_probability();
+            if !no_speech_probability.is_finite() {
+                return Err(InferenceError::failed(
+                    "local Whisper returned a non-finite no-speech probability",
+                ));
+            }
+            let average_log_probability = average_token_log_probability(&segment)?;
             let text = segment
                 .to_str()
                 .map_err(|_| {
@@ -162,6 +171,8 @@ impl AsrEngine for WhisperCppAsrEngine {
                 start_centiseconds: segment.start_timestamp(),
                 end_centiseconds: segment.end_timestamp(),
                 text: text.to_owned(),
+                no_speech_probability,
+                average_log_probability,
             });
         }
 
@@ -169,11 +180,49 @@ impl AsrEngine for WhisperCppAsrEngine {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct WhisperSegmentOutput {
     start_centiseconds: i64,
     end_centiseconds: i64,
     text: String,
+    no_speech_probability: f32,
+    average_log_probability: Option<f32>,
+}
+
+fn average_token_log_probability(
+    segment: &whisper_rs::WhisperSegment<'_>,
+) -> Result<Option<f32>, InferenceError> {
+    let token_count = segment.n_tokens();
+    if token_count < 0 {
+        return Err(InferenceError::failed(
+            "local Whisper returned a negative token count",
+        ));
+    }
+    if token_count == 0 {
+        return Ok(None);
+    }
+
+    let total = (0..token_count).try_fold(0_f64, |total, index| {
+        let token = segment.get_token(index).ok_or_else(|| {
+            InferenceError::failed("local Whisper returned an invalid token index")
+        })?;
+        let log_probability = token.token_data().plog;
+        if !log_probability.is_finite() {
+            return Err(InferenceError::failed(
+                "local Whisper returned a non-finite token log probability",
+            ));
+        }
+        Ok(total + f64::from(log_probability))
+    })?;
+
+    Ok(Some((total / f64::from(token_count)) as f32))
+}
+
+fn should_suppress_whisper_segment(segment: &WhisperSegmentOutput) -> bool {
+    segment.no_speech_probability >= NO_SPEECH_PROBABILITY_THRESHOLD
+        && segment
+            .average_log_probability
+            .is_some_and(|probability| probability <= LOW_AVERAGE_LOG_PROBABILITY_THRESHOLD)
 }
 
 fn whisper_language(language: Option<&str>) -> Result<&str, InferenceError> {
@@ -205,6 +254,8 @@ fn transcription_params() -> FullParams<'static, 'static> {
     params.set_single_segment(false);
     params.set_token_timestamps(false);
     params.set_max_tokens(MAX_TOKENS_PER_SEGMENT);
+    params.set_no_speech_thold(NO_SPEECH_PROBABILITY_THRESHOLD);
+    params.set_logprob_thold(LOW_AVERAGE_LOG_PROBABILITY_THRESHOLD);
     params.set_suppress_blank(true);
     params.set_suppress_nst(true);
     params.set_tdrz_enable(false);
@@ -222,6 +273,17 @@ fn response_from_whisper_segments(
 ) -> Result<AsrResponse, InferenceError> {
     let mut emissions = Vec::new();
     for (index, segment) in segments.into_iter().enumerate() {
+        // Validate every native segment before judging its text or confidence.
+        // A malformed timestamp must remain an auditable engine failure, even
+        // when the segment would otherwise be classified as likely silence.
+        let (capture_start_ns, capture_end_ns) = capture_range_for_whisper_segment(
+            request,
+            segment.start_centiseconds,
+            segment.end_centiseconds,
+        )?;
+        if should_suppress_whisper_segment(&segment) {
+            continue;
+        }
         let text = segment.text.trim();
         if text.is_empty() {
             continue;
@@ -237,11 +299,6 @@ fn response_from_whisper_segments(
             )));
         }
 
-        let (capture_start_ns, capture_end_ns) = capture_range_for_whisper_segment(
-            request,
-            segment.start_centiseconds,
-            segment.end_centiseconds,
-        )?;
         emissions.push(TranscriptEmission {
             utterance_key: whisper_utterance_key(request, index, capture_start_ns, capture_end_ns),
             capture_start_ns,
@@ -252,6 +309,10 @@ fn response_from_whisper_segments(
             word_timings: Vec::new(),
             model_provenance: model_provenance.clone(),
         });
+    }
+
+    if emissions.is_empty() {
+        return Ok(AsrResponse::no_speech());
     }
 
     AsrResponse::new(request, model_provenance, emissions).map_err(InferenceError::failed)
@@ -405,11 +466,15 @@ mod tests {
                     start_centiseconds: 0,
                     end_centiseconds: 40,
                     text: "  本机记录  ".to_owned(),
+                    no_speech_probability: 0.05,
+                    average_log_probability: Some(-0.1),
                 },
                 WhisperSegmentOutput {
                     start_centiseconds: 40,
                     end_centiseconds: 100,
                     text: "无需出网。".to_owned(),
+                    no_speech_probability: 0.05,
+                    average_log_probability: Some(-0.1),
                 },
             ],
         )
@@ -454,10 +519,54 @@ mod tests {
         let response = response_from_whisper_segments(&request, &provenance, []).unwrap();
 
         assert!(response.emissions.is_empty());
+        assert!(response.is_no_speech());
     }
 
     #[test]
-    fn rejects_invalid_or_out_of_window_native_segment_timing() {
+    fn filters_likely_silent_whisper_segments_without_text_blacklists() {
+        let request = request();
+        let model = registered_model(
+            LocalModelKind::SpeechRecognition,
+            WHISPER_CPP_GGML_INPUT_FORMAT,
+        );
+        let provenance = whisper_cpp_model_provenance(&model).unwrap();
+
+        let response = response_from_whisper_segments(
+            &request,
+            &provenance,
+            [
+                WhisperSegmentOutput {
+                    start_centiseconds: 0,
+                    end_centiseconds: 20,
+                    text: "高置信短句".to_owned(),
+                    no_speech_probability: 0.81,
+                    average_log_probability: Some(-0.1),
+                },
+                WhisperSegmentOutput {
+                    start_centiseconds: 20,
+                    end_centiseconds: 40,
+                    text: "弱置信幻觉".to_owned(),
+                    no_speech_probability: 0.62,
+                    average_log_probability: Some(-1.1),
+                },
+                WhisperSegmentOutput {
+                    start_centiseconds: 40,
+                    end_centiseconds: 100,
+                    text: "真实的口述内容".to_owned(),
+                    no_speech_probability: 0.62,
+                    average_log_probability: Some(-0.2),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(response.emissions.len(), 2);
+        assert_eq!(response.emissions[0].text, "高置信短句");
+        assert_eq!(response.emissions[1].text, "真实的口述内容");
+    }
+
+    #[test]
+    fn rejects_invalid_native_segment_timing_before_silence_filtering() {
         let request = request();
         let model = registered_model(
             LocalModelKind::SpeechRecognition,
@@ -472,6 +581,8 @@ mod tests {
                 start_centiseconds: -1,
                 end_centiseconds: 10,
                 text: "错误".to_owned(),
+                no_speech_probability: 0.62,
+                average_log_probability: Some(-1.1),
             }],
         )
         .unwrap_err();
@@ -482,6 +593,8 @@ mod tests {
                 start_centiseconds: 110,
                 end_centiseconds: 120,
                 text: "错误".to_owned(),
+                no_speech_probability: 0.05,
+                average_log_probability: Some(-0.1),
             }],
         )
         .unwrap_err();

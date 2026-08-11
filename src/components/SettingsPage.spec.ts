@@ -1,0 +1,55 @@
+import { mount } from '@vue/test-utils'
+import { describe, expect, test } from 'vitest'
+import SettingsPage from './SettingsPage.vue'
+
+const model = {
+  id: 'model-001',
+  modelKind: 'speech_recognition' as const,
+  fileSizeBytes: 2_048_000,
+  sha256: 'a'.repeat(64),
+  version: 'fixture-v1',
+  inputFormat: 'whisper.cpp-ggml',
+  modelCardId: 'word-covenant/fixture',
+  licenseId: 'test-license',
+  licenseConfirmedAt: '2026-08-08T00:00:00.000Z',
+  importedAt: '2026-08-08T00:00:00.000Z',
+}
+
+const capture = {
+  revision: 1,
+  status: 'idle' as const,
+  permission: 'granted' as const,
+  selectedDevice: { uid: 'coreaudio:built-in', name: 'MacBook 麦克风' },
+  devices: [{ uid: 'coreaudio:built-in', name: 'MacBook 麦克风' }],
+  meter: null,
+  lastIssue: null,
+}
+
+describe('SettingsPage', () => {
+  test('keeps local model maintenance in a dedicated settings view', async () => {
+    const wrapper = mount(SettingsPage, {
+      props: {
+        models: [model],
+        capture,
+        compatibleAsrModels: [model],
+        activeAsrProfile: { modelId: model.id },
+      },
+    })
+
+    expect(wrapper.get('#settings-page-title').text()).toBe('设置')
+    expect(wrapper.get('#input-device-settings-title').text()).toBe('录音设备')
+    expect(wrapper.get('#model-settings-title').text()).toBe('模型与转写')
+    expect(wrapper.find('[data-testid="input-device-select"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="active-asr-model-select"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="open-model-import"]').exists()).toBe(true)
+    expect(wrapper.text()).not.toContain('当前会话')
+
+    await wrapper.get('[data-testid="input-device-select"]').setValue('coreaudio:built-in')
+    await wrapper.get('[data-testid="refresh-input-devices"]').trigger('click')
+    await wrapper.get('[aria-label="返回工作台"]').trigger('click')
+
+    expect(wrapper.emitted('selectInputDevice')).toEqual([['coreaudio:built-in']])
+    expect(wrapper.emitted('refreshInputDevices')).toEqual([[]])
+    expect(wrapper.emitted('close')).toEqual([[]])
+  })
+})

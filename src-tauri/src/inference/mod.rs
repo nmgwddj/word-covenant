@@ -15,9 +15,9 @@ pub mod webrtc_vad;
 pub mod whisper_cpp;
 
 pub use asr::{
-    AsrEngine, AsrFinalIdempotencyKey, AsrRequest, AsrResponse, FinalTranscriptEmission,
-    MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionKind, TranscriptEmissionMapper,
-    TranscriptWordTiming, TransientTranscriptEmission,
+    AsrEngine, AsrFinalIdempotencyKey, AsrRequest, AsrResponse, AsrResponseDisposition,
+    FinalTranscriptEmission, MappedTranscriptEmission, TranscriptEmission, TranscriptEmissionKind,
+    TranscriptEmissionMapper, TranscriptWordTiming, TransientTranscriptEmission,
 };
 pub use gap::{InferenceGap, InferenceGapReason, InferenceGapStage};
 pub use mock::{FixtureAsr, FixtureAsrCue, FixtureVad, FixtureVadCue};

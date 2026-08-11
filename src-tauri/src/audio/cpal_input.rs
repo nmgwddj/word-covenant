@@ -106,23 +106,22 @@ impl CaptureTelemetryAtomic {
 impl CpalInput {
     pub fn list_input_devices() -> Result<InputDeviceList, String> {
         let host = cpal::default_host();
-        let default_uid = host
+        let default_device = host
             .default_input_device()
-            .map(|device| device_uid(&device))
-            .transpose()?;
-        let devices = host
-            .input_devices()
-            .map_err(|error| format!("could not enumerate input devices: {error}"))?
-            .map(|device| {
-                let uid = device_uid(&device)?;
-                MacOsInputDevice::new(uid, device.to_string()).map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(InputDeviceList {
-            devices,
-            default_uid,
-        })
+            .and_then(|device| input_device_metadata(&device).ok());
+        match host.input_devices() {
+            Ok(devices) => Ok(input_device_list_from_candidates(
+                default_device,
+                devices.map(|device| input_device_metadata(&device)),
+            )),
+            // CoreAudio's full directory can briefly fail during route changes
+            // while a readable default device is still available. Keep that
+            // device visible instead of presenting an empty selector.
+            Err(_error) if default_device.is_some() => {
+                Ok(input_device_list_from_candidates(default_device, []))
+            }
+            Err(error) => Err(format!("could not enumerate input devices: {error}")),
+        }
     }
 
     pub fn permission_status() -> Result<MicrophonePermission, String> {
@@ -184,11 +183,12 @@ impl CpalInput {
         }
 
         let host = cpal::default_host();
-        let device = select_input_device(&host, selected_device_uid)?;
-        let device_uid = device_uid(&device)?;
-        let device = MacOsInputDevice::new(device_uid, device.to_string())
-            .map_err(|error| error.to_string())?;
-        let supported_config = device_config(&host, selected_device_uid)?;
+        // Resolve the hardware handle once. Re-enumerating separately for
+        // metadata, configuration, and stream creation races unplug/replug
+        // events and can bind configuration to a different route.
+        let stream_device = select_input_device(&host, selected_device_uid)?;
+        let device = input_device_metadata(&stream_device)?;
+        let supported_config = device_config(&stream_device)?;
         let sample_format = supported_config.sample_format();
         let config = supported_config.config();
         let sample_rate = config.sample_rate;
@@ -197,8 +197,7 @@ impl CpalInput {
         let telemetry = Arc::new(CaptureTelemetryAtomic::new());
         let next_sample_offset = Arc::new(AtomicU64::new(0));
         let stream = build_stream(
-            &host,
-            selected_device_uid,
+            stream_device,
             config,
             sample_format,
             Arc::clone(&ingress),
@@ -276,15 +275,13 @@ fn release_stream<T>(stream: &mut Option<T>) {
 }
 
 fn build_stream(
-    host: &cpal::Host,
-    selected_device_uid: Option<&str>,
+    device: cpal::Device,
     config: StreamConfig,
     sample_format: SampleFormat,
     ingress: Arc<CaptureIngress>,
     telemetry: Arc<CaptureTelemetryAtomic>,
     next_sample_offset: Arc<AtomicU64>,
 ) -> Result<Stream, String> {
-    let device = select_input_device(host, selected_device_uid)?;
     match sample_format {
         SampleFormat::I8 => {
             build_typed_stream::<i8>(device, config, ingress, telemetry, next_sample_offset)
@@ -374,27 +371,64 @@ fn select_input_device(
             .ok_or_else(|| "no default microphone is available".to_owned());
     };
 
-    host.input_devices()
+    for device in host
+        .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?
-        .find_map(|device| match device_uid(&device) {
-            Ok(uid) if uid == selected_device_uid => Some(Ok(device)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .unwrap_or_else(|| {
-            Err(format!(
-                "selected input device {selected_device_uid:?} is unavailable"
-            ))
-        })
+    {
+        if let Ok(uid) = device_uid(&device) {
+            if uid == selected_device_uid {
+                return Ok(device);
+            }
+        }
+    }
+
+    Err(format!(
+        "selected input device {selected_device_uid:?} is unavailable"
+    ))
 }
 
-fn device_config(
-    host: &cpal::Host,
-    selected_device_uid: Option<&str>,
-) -> Result<cpal::SupportedStreamConfig, String> {
-    select_input_device(host, selected_device_uid)?
+fn device_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+    device
         .default_input_config()
         .map_err(|error| format!("could not get default input stream configuration: {error}"))
+}
+
+fn input_device_metadata(device: &cpal::Device) -> Result<MacOsInputDevice, String> {
+    let uid = device_uid(device)?;
+    let name = device
+        .description()
+        .map(|description| description.name().to_owned())
+        .map_err(|error| format!("could not read input device name: {error}"))?;
+    MacOsInputDevice::new(uid, name).map_err(|error| error.to_string())
+}
+
+fn input_device_list_from_candidates(
+    default_device: Option<MacOsInputDevice>,
+    candidates: impl IntoIterator<Item = Result<MacOsInputDevice, String>>,
+) -> InputDeviceList {
+    let default_uid = default_device
+        .as_ref()
+        .map(|device| device.uid().to_owned());
+    let mut devices: Vec<MacOsInputDevice> = Vec::new();
+
+    for device in candidates.into_iter().flatten() {
+        if !devices.iter().any(|known| known.uid() == device.uid()) {
+            devices.push(device);
+        }
+    }
+    if let Some(default_device) = default_device {
+        if !devices
+            .iter()
+            .any(|known| known.uid() == default_device.uid())
+        {
+            devices.push(default_device);
+        }
+    }
+
+    InputDeviceList {
+        devices,
+        default_uid,
+    }
 }
 
 fn device_uid(device: &cpal::Device) -> Result<String, String> {
@@ -478,5 +512,33 @@ mod tests {
         let first = continuous_time_ns();
         let second = continuous_time_ns();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn device_directory_skips_individually_unreadable_devices() {
+        let default = MacOsInputDevice::new("built-in", "MacBook microphone").unwrap();
+        let usb = MacOsInputDevice::new("usb", "USB microphone").unwrap();
+
+        let directory = input_device_list_from_candidates(
+            Some(default.clone()),
+            vec![
+                Ok(default.clone()),
+                Err("could not read transient device identity".to_owned()),
+                Ok(usb.clone()),
+            ],
+        );
+
+        assert_eq!(directory.default_uid.as_deref(), Some(default.uid()));
+        assert_eq!(directory.devices, vec![default, usb]);
+    }
+
+    #[test]
+    fn device_directory_retains_a_readable_default_when_enumeration_is_empty() {
+        let default = MacOsInputDevice::new("built-in", "MacBook microphone").unwrap();
+
+        let directory = input_device_list_from_candidates(Some(default.clone()), Vec::new());
+
+        assert_eq!(directory.default_uid.as_deref(), Some(default.uid()));
+        assert_eq!(directory.devices, vec![default]);
     }
 }

@@ -45,7 +45,8 @@ pub use macos::{
 pub use native_runtime::{
     NativeCaptureRuntime, NativeCaptureRuntimeConfig, NativeCaptureRuntimeError,
     NativeCaptureRuntimeSnapshot, NativeCaptureRuntimeStatus, NativeInferenceEngines,
-    DEFAULT_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT, MAX_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT,
+    SpeechDetectionSettings, DEFAULT_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT,
+    MAX_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT,
 };
 #[cfg(target_os = "macos")]
 pub use service::{

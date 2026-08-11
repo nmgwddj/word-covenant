@@ -42,6 +42,15 @@ export interface CaptureMeter {
   droppedPackets: number
 }
 
+/**
+ * Local-only speech gate preferences. The native runtime snapshots these
+ * settings when a microphone session begins, so an active recording cannot
+ * change its detection threshold midway through a session.
+ */
+export interface SpeechDetectionSettings {
+  rmsThresholdDbfs: number
+}
+
 export interface CaptureIssue {
   code: CaptureIssueCode
   deviceName: string | null

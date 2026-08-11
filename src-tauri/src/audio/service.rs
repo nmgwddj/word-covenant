@@ -6,7 +6,7 @@
 use super::{
     capture_point_now, AsrQueueMetrics, CaptureClock, CaptureFailureCode, CaptureGap,
     CaptureGapReason, CaptureLifecycle, CapturePoint, CaptureStatus, CpalInput, CpalInputFailure,
-    DispatcherRuntime, MacOsCaptureEvent, MacOsInputDevice, MicrophonePermission,
+    DispatcherRuntime, InputDeviceList, MacOsCaptureEvent, MacOsInputDevice, MicrophonePermission,
     NativeCaptureRuntime, NativeCaptureRuntimeConfig, NativeCaptureRuntimeSnapshot,
     NativeCaptureRuntimeStatus, NativeInferenceEngines, OwnedOutcomeLease,
 };
@@ -190,7 +190,7 @@ impl CaptureService {
             revision: self.revision,
             status: self.lifecycle.status(),
             permission: self.permission,
-            selected_device: self.lifecycle.selected_device().cloned(),
+            selected_device: self.selected_device_for_projection(),
             devices: self.devices.clone(),
             meter: self.meter.clone(),
             bridge: self.bridge.clone(),
@@ -365,11 +365,11 @@ impl CaptureService {
         self.active_queue_overrun_gap = None;
         self.touch();
 
-        self.permission = CpalInput::permission_status().map_err(|error| {
+        self.permission = CpalInput::request_permission().map_err(|error| {
             let _ = self.lifecycle.fail_with_code(
                 requested_at.clone(),
                 CaptureFailureCode::External,
-                "could not inspect microphone permission",
+                "could not request microphone permission",
             );
             self.last_issue = Some(CaptureIssue {
                 code: CaptureIssueCode::StreamStartFailed,
@@ -386,6 +386,10 @@ impl CaptureService {
             self.fail_permission(requested_at, CaptureFailureCode::PermissionRestricted);
             return Err("microphone permission is restricted by macOS".to_owned());
         }
+
+        // macOS can reveal a device only after permission is granted. Refresh
+        // once more at the permission boundary before we validate and open it.
+        self.refresh_input_device_directory();
 
         if self.devices.is_empty() {
             self.fail(
@@ -461,7 +465,11 @@ impl CaptureService {
         &mut self,
         dispatcher_runtime: DispatcherRuntime,
     ) -> Result<CaptureStart, String> {
-        self.activate_with_runtime_inner(dispatcher_runtime, None)
+        self.activate_with_runtime_inner(
+            dispatcher_runtime,
+            NativeCaptureRuntimeConfig::default(),
+            None,
+        )
     }
 
     /// Activate prepared microphone capture with native-only local VAD and
@@ -470,14 +478,16 @@ impl CaptureService {
     pub fn activate_with_runtime_and_engines(
         &mut self,
         dispatcher_runtime: DispatcherRuntime,
+        runtime_config: NativeCaptureRuntimeConfig,
         engines: NativeInferenceEngines,
     ) -> Result<CaptureStart, String> {
-        self.activate_with_runtime_inner(dispatcher_runtime, Some(engines))
+        self.activate_with_runtime_inner(dispatcher_runtime, runtime_config, Some(engines))
     }
 
     fn activate_with_runtime_inner(
         &mut self,
         dispatcher_runtime: DispatcherRuntime,
+        runtime_config: NativeCaptureRuntimeConfig,
         engines: Option<NativeInferenceEngines>,
     ) -> Result<CaptureStart, String> {
         let prepared = self
@@ -525,14 +535,14 @@ impl CaptureService {
                 ingress,
                 dispatcher_runtime.clone(),
                 clock,
-                NativeCaptureRuntimeConfig::default(),
+                runtime_config,
                 engines,
             ),
             None => NativeCaptureRuntime::new(
                 ingress,
                 dispatcher_runtime.clone(),
                 clock,
-                NativeCaptureRuntimeConfig::default(),
+                runtime_config,
             ),
         };
         let native_runtime = match runtime_result {
@@ -798,15 +808,7 @@ impl CaptureService {
                     self.touch();
                 }
             }
-            if let Ok(devices) = CpalInput::list_input_devices() {
-                if self.devices != devices.devices {
-                    self.devices = devices.devices;
-                    self.touch();
-                }
-                if self.selected_device_uid.is_none() {
-                    self.selected_device_uid = devices.default_uid;
-                }
-            }
+            self.refresh_input_device_directory();
         }
 
         let runtime_snapshot = match self.runtime.as_ref() {
@@ -894,6 +896,68 @@ impl CaptureService {
                 CaptureFailureCode::StreamStartFailed,
                 CaptureIssueCode::StreamStartFailed,
             ),
+        }
+    }
+
+    /// The lifecycle is the source of truth only for a capture that has
+    /// actually started. Before and after recording, the selectable directory
+    /// owns the intended device, which lets an idle UI immediately reflect a
+    /// successful user selection.
+    fn selected_device_for_projection(&self) -> Option<MacOsInputDevice> {
+        if self.lifecycle.status() == CaptureStatus::Recording {
+            return self.lifecycle.selected_device().cloned();
+        }
+
+        let selected_uid = self.selected_device_uid.as_deref()?;
+        self.devices
+            .iter()
+            .find(|device| device.uid() == selected_uid)
+            .cloned()
+    }
+
+    /// Apply one complete successful CoreAudio directory scan. A failed scan
+    /// deliberately does not call this method, preserving the last known-good
+    /// directory and its current visible selection.
+    fn apply_input_device_directory(&mut self, directory: InputDeviceList) {
+        let next_selected_device_uid = self
+            .selected_device_uid
+            .as_deref()
+            .filter(|selected_uid| {
+                directory
+                    .devices
+                    .iter()
+                    .any(|device| device.uid() == *selected_uid)
+            })
+            .map(str::to_owned)
+            .or_else(|| {
+                directory.default_uid.filter(|default_uid| {
+                    directory
+                        .devices
+                        .iter()
+                        .any(|device| device.uid() == default_uid)
+                })
+            });
+        let directory_changed = self.devices != directory.devices;
+        let selection_changed = self.selected_device_uid != next_selected_device_uid;
+
+        if directory_changed {
+            self.devices = directory.devices;
+        }
+        if selection_changed {
+            self.selected_device_uid = next_selected_device_uid;
+        }
+        if directory_changed || selection_changed {
+            self.touch();
+        }
+    }
+
+    fn refresh_input_device_directory(&mut self) {
+        self.apply_input_device_directory_result(CpalInput::list_input_devices());
+    }
+
+    fn apply_input_device_directory_result(&mut self, directory: Result<InputDeviceList, String>) {
+        if let Ok(directory) = directory {
+            self.apply_input_device_directory(directory);
         }
     }
 
@@ -1141,6 +1205,20 @@ mod tests {
         MacOsInputDevice::new("test-input", "Test microphone").unwrap()
     }
 
+    fn input_device(uid: &str, name: &str) -> MacOsInputDevice {
+        MacOsInputDevice::new(uid, name).unwrap()
+    }
+
+    fn input_device_list(
+        default_uid: Option<&str>,
+        devices: Vec<MacOsInputDevice>,
+    ) -> InputDeviceList {
+        InputDeviceList {
+            devices,
+            default_uid: default_uid.map(str::to_owned),
+        }
+    }
+
     fn wait_for_drained_runtime(service: &mut CaptureService) -> NativeCaptureRuntime {
         let deadline = Instant::now() + StdDuration::from_secs(1);
         loop {
@@ -1168,6 +1246,108 @@ mod tests {
                 .contains("rmsDbfs")
                 == false
         );
+    }
+
+    #[test]
+    fn idle_projection_resolves_the_configured_device_from_the_directory() {
+        let mut service = CaptureService::new();
+        let built_in = input_device("built-in", "MacBook microphone");
+        let usb = input_device("usb", "USB microphone");
+        let built_in_uid = built_in.uid().to_owned();
+        service.apply_input_device_directory(input_device_list(
+            Some(&built_in_uid),
+            vec![built_in, usb.clone()],
+        ));
+        service.selected_device_uid = Some(usb.uid().to_owned());
+
+        assert_eq!(service.selected_device_for_projection(), Some(usb));
+    }
+
+    #[test]
+    fn active_capture_keeps_the_lifecycle_device_authoritative() {
+        let mut service = CaptureService::new();
+        let built_in = input_device("built-in", "MacBook microphone");
+        let usb = input_device("usb", "USB microphone");
+        service.apply_input_device_directory(input_device_list(
+            Some(built_in.uid()),
+            vec![built_in.clone(), usb.clone()],
+        ));
+        service.selected_device_uid = Some(usb.uid().to_owned());
+        service
+            .lifecycle
+            .apply(MacOsCaptureEvent::CaptureStarted {
+                device: built_in.clone(),
+                at: point(1, 1),
+            })
+            .unwrap();
+
+        assert_eq!(service.selected_device_for_projection(), Some(built_in));
+    }
+
+    #[test]
+    fn stale_idle_selection_falls_back_to_the_current_default_and_touches_revision() {
+        let mut service = CaptureService::new();
+        let built_in = input_device("built-in", "MacBook microphone");
+        let usb = input_device("usb", "USB microphone");
+        service.devices = vec![built_in.clone(), usb];
+        service.selected_device_uid = Some("unplugged".to_owned());
+        service.revision = 7;
+
+        service.apply_input_device_directory(input_device_list(
+            Some(built_in.uid()),
+            vec![built_in.clone()],
+        ));
+
+        assert_eq!(service.selected_device_uid.as_deref(), Some(built_in.uid()));
+        assert_eq!(service.selected_device_for_projection(), Some(built_in));
+        assert_eq!(service.revision, 8);
+    }
+
+    #[test]
+    fn stale_selection_change_touches_revision_even_when_the_directory_is_unchanged() {
+        let mut service = CaptureService::new();
+        let built_in = input_device("built-in", "MacBook microphone");
+        let usb = input_device("usb", "USB microphone");
+        let built_in_uid = built_in.uid().to_owned();
+        let usb_uid = usb.uid().to_owned();
+        service.devices = vec![built_in.clone(), usb.clone()];
+        service.selected_device_uid = Some(usb_uid.clone());
+        service.revision = 7;
+
+        service.apply_input_device_directory(input_device_list(
+            Some(&built_in_uid),
+            vec![built_in.clone(), usb.clone()],
+        ));
+
+        assert_eq!(
+            service.selected_device_uid.as_deref(),
+            Some(usb_uid.as_str())
+        );
+        assert_eq!(service.revision, 7);
+
+        service.selected_device_uid = Some("unplugged".to_owned());
+        service.apply_input_device_directory(input_device_list(
+            Some(&built_in_uid),
+            vec![built_in, usb],
+        ));
+
+        assert_eq!(service.revision, 8);
+    }
+
+    #[test]
+    fn failed_directory_refresh_preserves_the_last_good_devices_and_selection() {
+        let mut service = CaptureService::new();
+        let built_in = input_device("built-in", "MacBook microphone");
+        let usb = input_device("usb", "USB microphone");
+        service.devices = vec![built_in, usb.clone()];
+        service.selected_device_uid = Some(usb.uid().to_owned());
+        service.revision = 7;
+
+        service.apply_input_device_directory_result(Err("CoreAudio is reconfiguring".to_owned()));
+
+        assert_eq!(service.devices.len(), 2);
+        assert_eq!(service.selected_device_for_projection(), Some(usb));
+        assert_eq!(service.revision, 7);
     }
 
     #[test]

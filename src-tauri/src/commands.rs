@@ -1,3 +1,4 @@
+use crate::audio::SpeechDetectionSettings;
 use crate::domain::{DataCategory, SpeakerCluster, TranscriptSpan};
 use crate::inference::bundled_model::BundledAsrStatus;
 use crate::inference::model_registry::{
@@ -99,6 +100,21 @@ pub fn set_egress_enabled(
     enabled: bool,
 ) -> Result<PrivacyStatus, String> {
     state.set_egress_enabled(enabled)
+}
+
+#[tauri::command]
+pub fn get_speech_detection_settings(
+    state: State<'_, AppState>,
+) -> Result<SpeechDetectionSettings, String> {
+    state.speech_detection_settings()
+}
+
+#[tauri::command]
+pub fn set_speech_detection_settings(
+    state: State<'_, AppState>,
+    input: SpeechDetectionSettings,
+) -> Result<SpeechDetectionSettings, String> {
+    state.set_speech_detection_settings(input)
 }
 
 #[tauri::command]
@@ -325,6 +341,7 @@ mod tests {
         selected_local_model_path, CreateSpeakerClusterInput, ReassignTranscriptSpeakerInput,
         RenameSpeakerClusterInput, SelectActiveLocalAsrModelInput,
     };
+    use crate::audio::SpeechDetectionSettings;
     use serde_json::json;
     use std::path::PathBuf;
     use uuid::Uuid;
@@ -389,5 +406,19 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(select.model_id, session_id);
+    }
+
+    #[test]
+    fn speech_detection_settings_use_the_camel_case_bridge_contract() {
+        let settings: SpeechDetectionSettings = serde_json::from_value(json!({
+            "rmsThresholdDbfs": -24,
+        }))
+        .unwrap();
+
+        assert_eq!(settings.rms_threshold_dbfs, -24);
+        assert_eq!(
+            serde_json::to_value(settings).unwrap(),
+            json!({ "rmsThresholdDbfs": -24 })
+        );
     }
 }

@@ -4,17 +4,14 @@ import type { CaptureProjection } from '@/types'
 
 const props = defineProps<{
   capture: CaptureProjection
-  disabled?: boolean
   asrModelReady?: boolean
-}>()
-
-defineEmits<{
-  select: [deviceUid: string]
+  developmentMockActive?: boolean
 }>()
 
 const bridge = computed(() => props.capture.bridge ?? null)
 
 const statusLabel = computed(() => {
+  if (props.developmentMockActive) return '模拟记录中'
   if (bridge.value?.status === 'parked') return '正在启动本地记录'
   if (bridge.value?.status === 'closing') return '正在完成本地记录'
   if (props.capture.status === 'awaiting_permission') return '正在请求麦克风权限'
@@ -30,24 +27,6 @@ const statusLabel = computed(() => {
   if (props.asrModelReady === false) return '请选择本地转写模型'
   return '麦克风待命'
 })
-
-const meterWidth = computed(() => {
-  const peak = props.capture.meter?.peakDbfs ?? -96
-  return `${Math.max(0, Math.min(100, ((peak + 96) / 96) * 100))}%`
-})
-
-const meterLabel = computed(() => {
-  if (!props.capture.meter) return '当前没有输入电平'
-  return `输入电平 ${Math.round(props.capture.meter.peakDbfs)} dBFS`
-})
-
-const deviceSelectionDisabled = computed(
-  () =>
-    Boolean(props.disabled) ||
-    Boolean(bridge.value) ||
-    props.capture.status === 'recording' ||
-    props.capture.status === 'awaiting_permission'
-)
 
 const bridgeStatusLabel = computed(() => {
   switch (bridge.value?.status) {
@@ -123,25 +102,12 @@ const bridgeAriaLabel = computed(() => {
   <div
     class="capture-status"
     :class="[`capture-status--${capture.status}`, capture.bridge && `capture-status--bridge-${capture.bridge.status}`]"
-    aria-live="polite"
+    data-testid="capture-status"
   >
     <span class="capture-status__signal" aria-hidden="true" />
-    <select
-      class="capture-status__device"
-      :value="capture.selectedDevice?.uid ?? ''"
-      :disabled="deviceSelectionDisabled"
-      aria-label="输入设备"
-      @change="$emit('select', ($event.target as HTMLSelectElement).value)"
-    >
-      <option value="" disabled>{{ capture.devices.length ? '选择输入设备' : '未检测到输入设备' }}</option>
-      <option v-for="device in capture.devices" :key="device.uid" :value="device.uid">
-        {{ device.name }}
-      </option>
-    </select>
-    <span class="capture-status__meter" :aria-label="meterLabel" role="meter">
-      <span :style="{ width: meterWidth }" />
-    </span>
-    <span class="capture-status__label" :title="statusLabel">{{ statusLabel }}</span>
+    <span class="capture-status__label" :title="statusLabel" aria-atomic="true" aria-live="polite">{{
+      statusLabel
+    }}</span>
     <span
       v-if="bridge"
       class="capture-status__bridge"

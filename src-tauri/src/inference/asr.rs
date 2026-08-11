@@ -137,11 +137,22 @@ impl TranscriptEmission {
     }
 }
 
+/// Declares whether an empty local ASR response is intentional no-speech.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrResponseDisposition {
+    #[default]
+    Transcript,
+    NoSpeech,
+}
+
 /// Bounded emissions produced from a single local ASR request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AsrResponse {
     pub emissions: Vec<TranscriptEmission>,
+    #[serde(default)]
+    pub disposition: AsrResponseDisposition,
 }
 
 impl AsrResponse {
@@ -150,9 +161,26 @@ impl AsrResponse {
         expected_model: &ModelProvenance,
         emissions: Vec<TranscriptEmission>,
     ) -> Result<Self, String> {
-        let response = Self { emissions };
+        let response = Self {
+            emissions,
+            disposition: AsrResponseDisposition::Transcript,
+        };
         response.validate_against(request, expected_model)?;
         Ok(response)
+    }
+
+    /// Marks a verified local adapter result as an intentional no-speech
+    /// completion. Generic empty responses remain normal responses and are
+    /// treated as a recoverable inference failure by the state layer.
+    pub fn no_speech() -> Self {
+        Self {
+            emissions: Vec::new(),
+            disposition: AsrResponseDisposition::NoSpeech,
+        }
+    }
+
+    pub fn is_no_speech(&self) -> bool {
+        self.disposition == AsrResponseDisposition::NoSpeech
     }
 
     /// Validates an adapter response even when the adapter constructed this
@@ -168,6 +196,9 @@ impl AsrResponse {
             return Err(format!(
                 "ASR response exceeds {MAX_ASR_EMISSIONS_PER_REQUEST} emissions"
             ));
+        }
+        if self.is_no_speech() && !self.emissions.is_empty() {
+            return Err("a no-speech ASR response cannot include transcript emissions".to_owned());
         }
 
         let mut revisions = BTreeMap::<String, (u32, bool)>::new();

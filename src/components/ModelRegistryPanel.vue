@@ -94,8 +94,6 @@ const bundledAsrModel = computed(() => {
   return selectableAsrModels.value.find(model => model.id === bundledModelId) ?? null
 })
 
-const displayedAsrModel = computed(() => activeAsrModel.value ?? bundledAsrModel.value)
-
 const hasStaleActiveAsrProfile = computed(() => Boolean(props.activeAsrProfile && !activeAsrModel.value))
 
 const bundledAsrIssue = computed(() => {
@@ -104,15 +102,6 @@ const bundledAsrIssue = computed(() => {
   if (!status.available) return safeBundledAsrMessage(status.message)
   if (!status.modelId || !bundledAsrModel.value) return bundledAsrUnavailableMessage
   return null
-})
-
-const asrProfileState = computed(() => {
-  if (activeAsrModel.value) {
-    return isBundledAsrModel(activeAsrModel.value) ? '内置默认 · 已启用' : '高级本地模型 · 已启用'
-  }
-  if (bundledAsrModel.value) return '内置默认 · 就绪'
-  if (bundledAsrIssue.value) return '内置模型不可用'
-  return hasStaleActiveAsrProfile.value ? '当前选择不可用' : '未选择'
 })
 
 const emptyAsrModelNote = computed(() =>
@@ -162,8 +151,8 @@ function asrOptionLabel(model: RegisteredModel): string {
 }
 
 function modelOriginLabel(model: RegisteredModel): string | null {
-  if (isBundledAsrModel(model)) return '内置默认'
-  return isWhisperCppAsrModel(model) ? '高级本地模型' : null
+  if (isBundledAsrModel(model)) return '应用内置'
+  return isWhisperCppAsrModel(model) ? '本机导入' : null
 }
 
 function safeBundledAsrMessage(_message: string | null): string {
@@ -222,72 +211,95 @@ function selectActiveAsrModel(event: Event) {
 
 <template>
   <section class="model-registry" aria-label="本地模型">
-    <div class="model-registry__heading">
-      <div>
-        <p class="session-rail__label">LOCAL MODELS</p>
-        <h2>本地模型</h2>
-      </div>
+    <div class="model-registry__toolbar">
+      <label class="model-registry__asr-selector">
+        <span>当前转写模型</span>
+        <select
+          data-testid="active-asr-model-select"
+          :value="activeAsrModel?.id ?? ''"
+          :disabled="activeAsrSelectorDisabled"
+          aria-label="当前转写模型"
+          @change="selectActiveAsrModel"
+        >
+          <option value="" disabled>选择兼容模型</option>
+          <option v-for="model in selectableAsrModels" :key="model.id" :value="model.id">
+            {{ asrOptionLabel(model) }}
+          </option>
+        </select>
+      </label>
       <button
-        class="icon-button model-registry__add"
+        class="model-registry__import-action"
         type="button"
         title="导入本地模型"
         data-testid="open-model-import"
         @click="openForm"
       >
         <span class="i-mdi-plus" aria-hidden="true" />
+        <span>导入模型</span>
       </button>
-    </div>
-
-    <div
-      class="model-registry__asr-profile"
-      :class="{ 'model-registry__asr-profile--unavailable': bundledAsrIssue }"
-      data-testid="active-asr-profile"
-    >
-      <div class="model-registry__asr-profile-heading">
-        <span class="i-mdi-waveform" aria-hidden="true" />
-        <span>本地转写模型</span>
-      </div>
-      <strong v-if="displayedAsrModel">{{ displayedAsrModel.version }}</strong>
-      <span v-else>{{ asrProfileState }}</span>
-      <span v-if="displayedAsrModel" class="model-registry__asr-profile-state" data-testid="active-asr-source">
-        {{ asrProfileState }}
-      </span>
-      <code v-if="displayedAsrModel">{{ displayedAsrModel.inputFormat }}</code>
     </div>
     <p v-if="bundledAsrIssue" class="model-registry__bundled-error" data-testid="bundled-asr-status" role="alert">
       {{ bundledAsrIssue }}
     </p>
-    <label class="model-registry__asr-selector">
-      <span>本次使用的模型</span>
-      <select
-        data-testid="active-asr-model-select"
-        :value="activeAsrModel?.id ?? ''"
-        :disabled="activeAsrSelectorDisabled"
-        aria-label="本地转写模型"
-        @change="selectActiveAsrModel"
-      >
-        <option value="" disabled>选择兼容模型</option>
-        <option v-for="model in selectableAsrModels" :key="model.id" :value="model.id">
-          {{ asrOptionLabel(model) }}
-        </option>
-      </select>
-    </label>
     <p v-if="!selectableAsrModels.length" class="model-registry__asr-note">
       {{ emptyAsrModelNote }}
     </p>
     <p v-else-if="activeAsrSelectionDisabled" class="model-registry__asr-note">记录中不可更换本地转写模型</p>
+    <p v-else-if="selectingActiveAsrModel" class="model-registry__asr-note" role="status">正在切换模型</p>
+    <p v-else-if="hasStaleActiveAsrProfile" class="model-registry__asr-error" role="alert">
+      当前选择不可用，请重新选择模型
+    </p>
     <p v-if="activeAsrError" class="model-registry__asr-error" role="alert">{{ activeAsrError }}</p>
 
+    <div class="model-registry__list-heading">
+      <h4>已安装模型</h4>
+      <span>{{ models.length }} 个</span>
+    </div>
     <ul v-if="models.length" class="model-registry__list" aria-label="本地模型">
-      <li v-for="model in listedModels" :key="model.id" class="model-row">
+      <li
+        v-for="model in listedModels"
+        :key="model.id"
+        class="model-row"
+        :class="{ 'model-row--active': activeAsrModel?.id === model.id }"
+      >
         <span class="model-row__icon i-mdi-chip" aria-hidden="true" />
-        <div class="model-row__body">
-          <strong>{{ isBundledAsrModel(model) ? '内置默认 · 语音识别' : kindLabel(model.modelKind) }}</strong>
-          <span>{{ model.version }} · {{ formatSize(model.fileSizeBytes) }}</span>
-          <code>{{ model.sha256.slice(0, 12) }}</code>
-          <span v-if="modelOriginLabel(model)" class="model-row__origin">{{ modelOriginLabel(model) }}</span>
-          <span v-if="activeAsrModel?.id === model.id" class="model-row__active">当前转写</span>
+        <div class="model-row__identity">
+          <strong>{{ model.version }}</strong>
+          <span>
+            {{ kindLabel(model.modelKind)
+            }}<template v-if="modelOriginLabel(model)"> · {{ modelOriginLabel(model) }}</template>
+          </span>
         </div>
+        <span class="model-row__size">{{ formatSize(model.fileSizeBytes) }}</span>
+        <span v-if="activeAsrModel?.id === model.id" class="model-row__active">使用中</span>
+        <details class="model-row__details">
+          <summary>
+            <span class="i-mdi-information-outline" aria-hidden="true" />
+            <span>详情</span>
+          </summary>
+          <dl>
+            <div>
+              <dt>输入格式</dt>
+              <dd>
+                <code>{{ model.inputFormat }}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>SHA-256</dt>
+              <dd>
+                <code>{{ model.sha256 }}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>模型卡</dt>
+              <dd>{{ model.modelCardId }}</dd>
+            </div>
+            <div>
+              <dt>许可证</dt>
+              <dd>{{ model.licenseId }}</dd>
+            </div>
+          </dl>
+        </details>
       </li>
     </ul>
     <p v-else class="model-registry__empty">暂无模型</p>

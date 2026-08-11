@@ -46,15 +46,7 @@ const bridge: CaptureBridgeProjection = {
 }
 
 describe('CaptureStatus', () => {
-  test('emits a stable input device UID when idle', async () => {
-    const wrapper = mount(CaptureStatus, { props: { capture } })
-
-    await wrapper.get('select').setValue('coreaudio:usb')
-
-    expect(wrapper.emitted('select')).toEqual([['coreaudio:usb']])
-  })
-
-  test('locks device selection and exposes meter state while recording', () => {
+  test('reports recording state without exposing a device selector in the header', () => {
     const wrapper = mount(CaptureStatus, {
       props: {
         capture: {
@@ -65,9 +57,22 @@ describe('CaptureStatus', () => {
       },
     })
 
-    expect(wrapper.get('select').attributes('disabled')).toBeDefined()
-    expect(wrapper.get('[role="meter"]').attributes('aria-label')).toContain('-6 dBFS')
+    expect(wrapper.find('select').exists()).toBe(false)
     expect(wrapper.text()).toContain('麦克风记录中')
+    expect(wrapper.get('.capture-status__label').attributes('aria-live')).toBe('polite')
+    expect(wrapper.find('[role="meter"]').exists()).toBe(false)
+  })
+
+  test('labels a development recording without claiming microphone capture', () => {
+    const wrapper = mount(CaptureStatus, {
+      props: {
+        capture,
+        developmentMockActive: true,
+      },
+    })
+
+    expect(wrapper.get('.capture-status__label').text()).toBe('模拟记录中')
+    expect(wrapper.text()).not.toContain('麦克风记录中')
   })
 
   test('states a permission denial without claiming that recording continues', () => {
@@ -150,7 +155,7 @@ describe('CaptureStatus', () => {
 
     expect(starting.text()).toContain('正在启动本地记录')
     expect(starting.get('[role="status"]').text()).toContain('桥接 启动中')
-    expect(starting.get('select').attributes('disabled')).toBeDefined()
+    expect(starting.find('select').exists()).toBe(false)
 
     const closing = mount(CaptureStatus, {
       props: {

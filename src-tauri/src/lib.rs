@@ -107,6 +107,8 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         commands::get_privacy_status,
         commands::set_egress_enabled,
+        commands::get_speech_detection_settings,
+        commands::set_speech_detection_settings,
         commands::start_session,
         commands::get_capture_projection,
         commands::select_input_device,
@@ -135,6 +137,8 @@ pub fn run() {
     let builder = builder.invoke_handler(tauri::generate_handler![
         commands::get_privacy_status,
         commands::set_egress_enabled,
+        commands::get_speech_detection_settings,
+        commands::set_speech_detection_settings,
         commands::start_session,
         commands::get_capture_projection,
         commands::select_input_device,

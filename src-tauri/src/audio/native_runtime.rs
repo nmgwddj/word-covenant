@@ -12,9 +12,11 @@ use super::{
     ShutdownDrainResult, ShutdownPreparationResult, WorkerPumpResult,
 };
 use crate::inference::pipeline::{
-    EnergySpeechDetector, SpeechActivityDetector, SpeechPipelineConfig, SpeechSegmenter,
+    EnergyGatedSpeechDetector, EnergySpeechDetector, SpeechActivityDetector, SpeechPipelineConfig,
+    SpeechSegmenter,
 };
 use crate::inference::{AsrEngine, InferenceError};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -36,10 +38,68 @@ impl SpeechActivityDetector for BoxedSpeechDetector {
     ) -> Result<bool, InferenceError> {
         self.inner.is_speech(frame)
     }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
 }
 
-type NativeDispatcher = CaptureDispatcher<SpeechSegmenter<BoxedSpeechDetector>>;
+type NativeDispatcher =
+    CaptureDispatcher<SpeechSegmenter<EnergyGatedSpeechDetector<BoxedSpeechDetector>>>;
 type RuntimeControl = (Mutex<WorkerControl>, Condvar);
+
+/// User-configurable local RMS threshold used to reject non-speech before it
+/// reaches the speech segmenter or ASR worker.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeechDetectionSettings {
+    pub rms_threshold_dbfs: i8,
+}
+
+impl SpeechDetectionSettings {
+    pub const MIN_RMS_THRESHOLD_DBFS: i8 = -60;
+    pub const MAX_RMS_THRESHOLD_DBFS: i8 = 0;
+
+    pub fn new(rms_threshold_dbfs: i8) -> Result<Self, String> {
+        let settings = Self { rms_threshold_dbfs };
+        settings.validate()?;
+        Ok(settings)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(Self::MIN_RMS_THRESHOLD_DBFS..=Self::MAX_RMS_THRESHOLD_DBFS)
+            .contains(&self.rms_threshold_dbfs)
+        {
+            return Err(format!(
+                "speech RMS threshold must be between {} dBFS and {} dBFS",
+                Self::MIN_RMS_THRESHOLD_DBFS,
+                Self::MAX_RMS_THRESHOLD_DBFS
+            ));
+        }
+        Ok(())
+    }
+
+    /// Convert a full-scale dB threshold to the normalized RMS value used by
+    /// the native audio pipeline.
+    pub fn normalized_rms_threshold(self) -> f32 {
+        10_f32.powf(self.rms_threshold_dbfs as f32 / 20.0)
+    }
+
+    pub(crate) fn from_persisted_rms_threshold_dbfs(value: i64) -> Option<Self> {
+        value
+            .try_into()
+            .ok()
+            .and_then(|value| Self::new(value).ok())
+    }
+}
+
+impl Default for SpeechDetectionSettings {
+    fn default() -> Self {
+        Self {
+            rms_threshold_dbfs: -10,
+        }
+    }
+}
 
 /// Native-only VAD and ASR instances transferred into one capture runtime.
 ///
@@ -96,7 +156,9 @@ impl Default for NativeCaptureRuntimeConfig {
     fn default() -> Self {
         Self {
             bridge: AsrBridgeConfig::default(),
-            energy_threshold: 0.015,
+            // The default speech threshold is -10 dBFS. It is intentionally
+            // conservative and can be tuned in local capture settings.
+            energy_threshold: SpeechDetectionSettings::default().normalized_rms_threshold(),
             pipeline: SpeechPipelineConfig::default(),
             idle_wait: DEFAULT_IDLE_WAIT,
             shutdown_inference_attempt_limit: DEFAULT_SHUTDOWN_INFERENCE_ATTEMPT_LIMIT,
@@ -105,6 +167,16 @@ impl Default for NativeCaptureRuntimeConfig {
 }
 
 impl NativeCaptureRuntimeConfig {
+    pub fn from_speech_detection_settings(
+        settings: SpeechDetectionSettings,
+    ) -> Result<Self, String> {
+        settings.validate()?;
+        Ok(Self {
+            energy_threshold: settings.normalized_rms_threshold(),
+            ..Self::default()
+        })
+    }
+
     fn validate(&self) -> Result<(), String> {
         self.bridge.validate()?;
         if !self.energy_threshold.is_finite() || self.energy_threshold < 0.0 {
@@ -290,12 +362,20 @@ impl NativeCaptureRuntime {
             vad_detector,
             asr_engine,
         } = engines;
-        let segmenter = SpeechSegmenter::new(
-            runtime.session_id,
-            clock.clone(),
+        // Apply the same local RMS floor to injected production VAD engines
+        // that the no-engine fallback already receives. The wrapper calls the
+        // VAD on every frame so stateful engines can observe silence.
+        let vad_detector = EnergyGatedSpeechDetector::new(
             BoxedSpeechDetector {
                 inner: vad_detector,
             },
+            config.energy_threshold,
+        )
+        .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
+        let segmenter = SpeechSegmenter::new(
+            runtime.session_id,
+            clock.clone(),
+            vad_detector,
             config.pipeline,
         )
         .map_err(NativeCaptureRuntimeError::InvalidConfiguration)?;
@@ -921,13 +1001,65 @@ mod tests {
         ModelProvenance, TranscriptEmission, TranscriptEmissionKind, INFERENCE_SAMPLE_RATE_HZ,
     };
     use chrono::{DateTime, Duration as ChronoDuration, Utc};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+    };
     use std::time::Instant;
     use uuid::Uuid;
+
+    #[test]
+    fn speech_detection_settings_default_to_minus_10_dbfs() {
+        assert_eq!(SpeechDetectionSettings::default().rms_threshold_dbfs, -10);
+    }
+
+    #[test]
+    fn speech_detection_settings_accept_the_inclusive_dbfs_range() {
+        assert_eq!(
+            SpeechDetectionSettings::new(-60)
+                .unwrap()
+                .rms_threshold_dbfs,
+            -60
+        );
+        assert_eq!(
+            SpeechDetectionSettings::new(0).unwrap().rms_threshold_dbfs,
+            0
+        );
+        assert!(SpeechDetectionSettings::new(-61).is_err());
+        assert!(SpeechDetectionSettings::new(1).is_err());
+    }
+
+    #[test]
+    fn speech_detection_settings_convert_minus_10_dbfs_to_normalized_rms() {
+        let settings = SpeechDetectionSettings::default();
+        let default_config = NativeCaptureRuntimeConfig::default();
+        let config = NativeCaptureRuntimeConfig::from_speech_detection_settings(settings).unwrap();
+
+        assert!((settings.normalized_rms_threshold() - 0.316_227_76).abs() < 0.000_001);
+        assert!((default_config.energy_threshold - 0.316_227_76).abs() < 0.000_001);
+        assert!((config.energy_threshold - 0.316_227_76).abs() < 0.000_001);
+    }
 
     struct BlockingAsr {
         model: ModelProvenance,
         gate: Arc<(Mutex<BlockingAsrState>, Condvar)>,
+    }
+
+    struct ResetCountingDetector {
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl SpeechActivityDetector for ResetCountingDetector {
+        fn is_speech(
+            &mut self,
+            _frame: &crate::inference::InferenceAudioWindow,
+        ) -> Result<bool, InferenceError> {
+            Ok(false)
+        }
+
+        fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[derive(Default)]
@@ -1027,6 +1159,7 @@ mod tests {
                 pre_roll_frames: 0,
                 hangover_frames: 0,
                 maximum_window_frames: 4,
+                minimum_speech_frames: 1,
                 language: Some("zh".to_owned()),
                 emit_partials: false,
             },
@@ -1134,6 +1267,20 @@ mod tests {
         let mut state = recover_mutex(mutex);
         state.released = true;
         condition.notify_all();
+    }
+
+    #[test]
+    fn boxed_detector_forwards_a_discontinuity_reset_to_the_native_vad() {
+        let resets = Arc::new(AtomicUsize::new(0));
+        let mut detector = BoxedSpeechDetector {
+            inner: Box::new(ResetCountingDetector {
+                resets: Arc::clone(&resets),
+            }),
+        };
+
+        detector.reset();
+
+        assert_eq!(resets.load(Ordering::SeqCst), 1);
     }
 
     #[test]

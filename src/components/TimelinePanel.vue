@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import type { SpeakerCluster, TranscriptSpan } from '@/types'
 
 const props = withDefaults(
@@ -18,6 +19,19 @@ const props = withDefaults(
 const emit = defineEmits<{
   openSpeakerManager: [spanId: string]
 }>()
+
+const displayedSpans = computed(() =>
+  props.spans
+    .map((span, index) => ({ span, index }))
+    .sort(
+      (left, right) =>
+        right.span.captureStartNs - left.span.captureStartNs ||
+        right.span.captureEndNs - left.span.captureEndNs ||
+        right.span.revision - left.span.revision ||
+        right.index - left.index
+    )
+    .map(item => item.span)
+)
 
 function timestamp(ns: number): string {
   const totalSeconds = Math.floor(ns / 1_000_000_000)
@@ -62,8 +76,8 @@ function speakerLabel(speakerClusterId: string | null): string {
       <span class="section-heading__meta">{{ props.spans.length }} 条</span>
     </div>
 
-    <ol v-if="props.spans.length" class="timeline-list">
-      <li v-for="span in props.spans" :key="span.id" class="timeline-entry">
+    <ol v-if="displayedSpans.length" class="timeline-list">
+      <li v-for="span in displayedSpans" :key="span.id" class="timeline-entry">
         <time :datetime="span.wallClockStart ?? String(span.captureStartNs)">{{ captureTimestamp(span) }}</time>
         <div class="timeline-entry__rail" aria-hidden="true"><span /></div>
         <article class="timeline-entry__body">

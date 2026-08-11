@@ -3,6 +3,66 @@ import { describe, expect, test } from 'vitest'
 import TimelinePanel from './TimelinePanel.vue'
 
 describe('TimelinePanel', () => {
+  test('renders the newest speech first without mutating the session timeline', () => {
+    const spans = [
+      {
+        id: 'oldest',
+        sessionId: 'session-one',
+        captureStartNs: 1_000_000_000,
+        captureEndNs: 2_000_000_000,
+        speakerClusterId: null,
+        text: '最早内容',
+        isFinal: true,
+        revision: 1,
+        source: 'local_inference' as const,
+      },
+      {
+        id: 'latest-short',
+        sessionId: 'session-one',
+        captureStartNs: 5_000_000_000,
+        captureEndNs: 6_000_000_000,
+        speakerClusterId: null,
+        text: '同一时刻较短内容',
+        isFinal: true,
+        revision: 1,
+        source: 'local_inference' as const,
+      },
+      {
+        id: 'middle',
+        sessionId: 'session-one',
+        captureStartNs: 3_000_000_000,
+        captureEndNs: 4_000_000_000,
+        speakerClusterId: null,
+        text: '中间内容',
+        isFinal: true,
+        revision: 1,
+        source: 'local_inference' as const,
+      },
+      {
+        id: 'latest-long',
+        sessionId: 'session-one',
+        captureStartNs: 5_000_000_000,
+        captureEndNs: 7_000_000_000,
+        speakerClusterId: null,
+        text: '最新内容',
+        isFinal: false,
+        revision: 2,
+        source: 'local_inference' as const,
+      },
+    ]
+    const originalOrder = spans.map(span => span.id)
+    const wrapper = mount(TimelinePanel, { props: { spans } })
+
+    expect(wrapper.findAll('.timeline-entry').map(entry => entry.find('p').text())).toEqual([
+      '最新内容',
+      '同一时刻较短内容',
+      '中间内容',
+      '最早内容',
+    ])
+    expect(spans.map(span => span.id)).toEqual(originalOrder)
+    expect(wrapper.findAll('.timeline-entry')[0]?.text()).toContain('转写中')
+  })
+
   test('renders capture timing and anonymous speaker labels', () => {
     const wrapper = mount(TimelinePanel, {
       props: {

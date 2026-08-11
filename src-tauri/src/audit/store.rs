@@ -1,5 +1,5 @@
 use super::{AuditEvent, AuditKind, AuditTrail};
-use crate::audio::{CaptureGap, CapturePoint};
+use crate::audio::{CaptureGap, CapturePoint, SpeechDetectionSettings};
 use crate::domain::{
     CaptureSegment, CaptureSession, SpeakerCluster, SpeakerClusterAliasRevision,
     SpeakerClusterCreatedAuditPayload, SpeakerClusterLabelRevision, SpeakerClusterRecord,
@@ -11,7 +11,7 @@ use crate::inference::{
     AsrFinalIdempotencyKey, InferenceGap, InferenceGapReason, InferenceGapStage,
 };
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, types::Value, Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
@@ -475,9 +475,57 @@ impl AuditStore {
             );
             CREATE INDEX IF NOT EXISTS local_models_kind_imported
                 ON local_models(model_kind, imported_at);
+
+            CREATE TABLE IF NOT EXISTS capture_preferences (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                rms_threshold_dbfs INTEGER NOT NULL
+                    CHECK (rms_threshold_dbfs BETWEEN -60 AND 0)
+            );
             ",
         )?;
         Ok(Self { connection })
+    }
+
+    /// Read the mutable local capture preference. A missing row or a row that
+    /// cannot satisfy the current validation contract falls back to the safe
+    /// product default instead of becoming an active runtime threshold.
+    pub fn speech_detection_settings(&self) -> Result<SpeechDetectionSettings, AuditStoreError> {
+        let persisted = self
+            .connection
+            .query_row(
+                "SELECT rms_threshold_dbfs FROM capture_preferences WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Value>(0),
+            )
+            .optional()?;
+        Ok(match persisted {
+            Some(Value::Integer(value)) => {
+                SpeechDetectionSettings::from_persisted_rms_threshold_dbfs(value)
+                    .unwrap_or_default()
+            }
+            Some(_) | None => SpeechDetectionSettings::default(),
+        })
+    }
+
+    pub fn set_speech_detection_settings(
+        &mut self,
+        settings: SpeechDetectionSettings,
+    ) -> Result<(), AuditStoreError> {
+        settings
+            .validate()
+            .map_err(|_| AuditStoreError::InvalidCaptureMetadata {
+                field: "speech RMS threshold dBFS",
+                value: settings.rms_threshold_dbfs.to_string(),
+            })?;
+        self.connection.execute(
+            "
+            INSERT INTO capture_preferences (singleton, rms_threshold_dbfs)
+            VALUES (1, ?1)
+            ON CONFLICT(singleton) DO UPDATE SET rms_threshold_dbfs = excluded.rms_threshold_dbfs
+            ",
+            params![settings.rms_threshold_dbfs],
+        )?;
+        Ok(())
     }
 
     pub fn append(&self, event: &AuditEvent) -> Result<(), AuditStoreError> {
@@ -3353,7 +3401,7 @@ fn speaker_error(field: &'static str, value: impl Into<String>) -> AuditStoreErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::CaptureGapReason;
+    use crate::audio::{CaptureGapReason, SpeechDetectionSettings};
     use crate::audit::AuditKind;
     use crate::inference::{InferenceGap, InferenceGapReason, InferenceGapStage};
     use chrono::Duration;
@@ -3390,6 +3438,68 @@ mod tests {
             previous_hash,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn speech_detection_settings_default_and_persist_across_reopen() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-speech-detection-settings-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            assert_eq!(
+                store.speech_detection_settings().unwrap(),
+                SpeechDetectionSettings::default()
+            );
+            let configured = SpeechDetectionSettings::new(-24).unwrap();
+            store.set_speech_detection_settings(configured).unwrap();
+            assert_eq!(store.speech_detection_settings().unwrap(), configured);
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert_eq!(
+            reopened.speech_detection_settings().unwrap(),
+            SpeechDetectionSettings::new(-24).unwrap()
+        );
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn speech_detection_settings_reject_invalid_values_without_replacing_the_saved_value() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let configured = SpeechDetectionSettings::new(-24).unwrap();
+        store.set_speech_detection_settings(configured).unwrap();
+
+        assert!(store
+            .set_speech_detection_settings(SpeechDetectionSettings {
+                rms_threshold_dbfs: -61,
+            })
+            .is_err());
+        assert_eq!(store.speech_detection_settings().unwrap(), configured);
+    }
+
+    #[test]
+    fn speech_detection_settings_fall_back_to_default_for_an_invalid_persisted_row() {
+        let store = AuditStore::open_in_memory().unwrap();
+        store
+            .connection
+            .execute_batch("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO capture_preferences (singleton, rms_threshold_dbfs) VALUES (1, ?1)",
+                params![-61],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.speech_detection_settings().unwrap(),
+            SpeechDetectionSettings::default()
+        );
     }
 
     #[test]

@@ -125,6 +125,37 @@ describe('wordCovenantApi browser development mock', () => {
     expect(invokeMock).toHaveBeenCalledWith('get_bundled_asr_status')
   })
 
+  test('keeps browser speech detection settings in local memory without network access', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ rmsThresholdDbfs: -10 })
+    await expect(wordCovenantApi.setSpeechDetectionSettings({ rmsThresholdDbfs: -26 })).resolves.toEqual({
+      rmsThresholdDbfs: -26,
+    })
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ rmsThresholdDbfs: -26 })
+
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  test('uses typed native commands for speech detection settings', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {})
+    const invokeMock = vi.mocked(invoke)
+    invokeMock.mockResolvedValueOnce({ rmsThresholdDbfs: -10 }).mockResolvedValueOnce({ rmsThresholdDbfs: -18 })
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ rmsThresholdDbfs: -10 })
+    await expect(wordCovenantApi.setSpeechDetectionSettings({ rmsThresholdDbfs: -18 })).resolves.toEqual({
+      rmsThresholdDbfs: -18,
+    })
+
+    expect(invokeMock).toHaveBeenNthCalledWith(1, 'get_speech_detection_settings')
+    expect(invokeMock).toHaveBeenNthCalledWith(2, 'set_speech_detection_settings', {
+      input: { rmsThresholdDbfs: -18 },
+    })
+  })
+
   test('keeps browser speaker corrections local and returns durable revisions', async () => {
     const fetchSpy = vi.fn()
     vi.stubGlobal('fetch', fetchSpy)
