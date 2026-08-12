@@ -6,3 +6,7 @@
 # will have schema files for capabilities auto-completion
 # /gen/schemas
 /gen/
+
+# Staged only after local or CI SHA-256 verification. The manifest remains tracked.
+/resources/models/ggml-large-v3-turbo-q5_0.bin
+/resources/models/ggml-large-v3-turbo-q5_0.bin.download

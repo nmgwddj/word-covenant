@@ -12,7 +12,11 @@
     "type-check": "vue-tsc --build --force",
     "tauri": "tauri",
     "bump": "node bump-version.cjs",
-    "check": "cargo check --manifest-path src-tauri/Cargo.toml"
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "model:stage": "node scripts/stage-bundled-model.mjs",
+    "model:verify": "node scripts/stage-bundled-model.mjs --verify",
+    "bundle:verify-macos": "bash scripts/verify-macos-dmg.sh",
+    "test:model-stage": "node --test scripts/stage-bundled-model.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",

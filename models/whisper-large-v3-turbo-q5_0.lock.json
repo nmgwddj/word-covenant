@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "modelId": "e061b65d-e3a6-4700-86ad-9a8ea6df3626",
+  "modelKind": "speech_recognition",
+  "inputFormat": "whisper.cpp-ggml",
+  "variant": "large-v3-turbo-q5_0",
+  "multilingual": true,
+  "artifactFileName": "ggml-large-v3-turbo-q5_0.bin",
+  "sizeBytes": 574041195,
+  "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+  "version": "whisper.cpp-large-v3-turbo-q5_0-5359861c",
+  "modelCardId": "openai/whisper-large-v3-turbo",
+  "licenseId": "MIT",
+  "licenseConfirmedAt": "2026-08-11T00:00:00Z",
+  "source": {
+    "repository": "ggerganov/whisper.cpp",
+    "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin"
+  }
+}

@@ -25,3 +25,6 @@ dist-ssr
 LOCAL_NOTES.md
 .env
 target/
+
+# Optional local speaker-recognition artifact. Distribute it outside Git.
+src-tauri/resources/models/speaker-embedding/model.onnx

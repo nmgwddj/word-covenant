@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -96,6 +98,38 @@ pub struct RegisteredModel {
     pub imported_at: DateTime<Utc>,
 }
 
+/// Model bytes authorized by a native trust boundary for local inference.
+///
+/// Imported artifacts enter only after their SHA-256 is verified from one
+/// no-follow file descriptor. App-bundled artifacts may instead rely on the
+/// signed bundle boundary. This type intentionally has no Serde implementation;
+/// model bytes must never reach Tauri IPC, audit payloads, or the WebView.
+#[derive(Debug)]
+pub struct AuthorizedModelArtifact {
+    model: RegisteredModel,
+    bytes: Box<[u8]>,
+}
+
+impl AuthorizedModelArtifact {
+    pub fn model(&self) -> &RegisteredModel {
+        &self.model
+    }
+
+    pub(crate) fn into_bytes(self) -> Box<[u8]> {
+        self.bytes
+    }
+
+    /// Creates an artifact from bytes whose digest the registry just verified.
+    pub(crate) fn from_hash_verified_bytes(model: RegisteredModel, bytes: Box<[u8]>) -> Self {
+        Self { model, bytes }
+    }
+
+    /// Creates an artifact loaded from the app's signed resource bundle.
+    pub(crate) fn from_trusted_bundled_bytes(model: RegisteredModel, bytes: Box<[u8]>) -> Self {
+        Self { model, bytes }
+    }
+}
+
 /// An in-memory index of locally imported models.
 ///
 /// Persistence is intentionally owned by a higher layer. This keeps the file
@@ -153,13 +187,14 @@ impl ModelRegistry {
         self.by_id.get(&id)
     }
 
-    /// Resolves one registered artifact for a native inference caller only.
-    /// The byte size and SHA-256 are checked immediately before this path is
-    /// returned, so a file replaced after application startup is detected.
-    /// A future worker must retain and hash a no-follow file handle through
-    /// loading rather than reopen this path, closing the remaining TOCTOU
-    /// window. This absolute path is never serializable or WebView-facing.
-    pub fn verified_artifact_path(&self, id: Uuid) -> Result<PathBuf, ModelRegistryError> {
+    /// Resolves a registered artifact into a native-only capability after
+    /// reading and hashing the exact managed bytes immediately before loading.
+    /// The capability deliberately cannot be serialized, created from an
+    /// arbitrary path, or made to reopen a substituted file.
+    pub fn verified_artifact(
+        &self,
+        id: Uuid,
+    ) -> Result<AuthorizedModelArtifact, ModelRegistryError> {
         let model = self
             .get(id)
             .ok_or(ModelRegistryError::UnknownModelId { id })?;
@@ -167,8 +202,11 @@ impl ModelRegistry {
             .managed_root
             .as_deref()
             .ok_or(ModelRegistryError::ManagedRootNotConfigured)?;
-        verify_persisted_artifact(managed_root, model)?;
-        resolve_persisted_artifact(managed_root, &model.file_path)
+        let bytes = read_verified_persisted_artifact_bytes(managed_root, model)?;
+        Ok(AuthorizedModelArtifact::from_hash_verified_bytes(
+            model.clone(),
+            bytes,
+        ))
     }
 
     pub fn models(&self) -> impl Iterator<Item = &RegisteredModel> {
@@ -729,11 +767,7 @@ fn validate_registered_path(path: &Path) -> Result<(), ModelRegistryError> {
         });
     }
     let mut components = path.components();
-    if components.next().is_none()
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    {
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return Err(ModelRegistryError::UnsafeRegisteredPath {
             path: path.to_path_buf(),
         });
@@ -780,14 +814,14 @@ fn resolve_existing_managed_root(root: &Path) -> Result<PathBuf, ModelRegistryEr
 
     match fs::symlink_metadata(root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ModelRegistryError::ManagedRootIsSymlink {
+            Err(ModelRegistryError::ManagedRootIsSymlink {
                 path: root.to_path_buf(),
-            });
+            })
         }
         Ok(metadata) if !metadata.file_type().is_dir() => {
-            return Err(ModelRegistryError::ManagedRootIsNotDirectory {
+            Err(ModelRegistryError::ManagedRootIsNotDirectory {
                 path: root.to_path_buf(),
-            });
+            })
         }
         Ok(_) => canonical_managed_root(root),
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
@@ -927,8 +961,28 @@ fn verify_persisted_artifact(
     model: &RegisteredModel,
 ) -> Result<(), ModelRegistryError> {
     let artifact_path = resolve_persisted_artifact(managed_root, &model.file_path)?;
-    let (actual_size, actual_sha256) = read_with_sha256(&artifact_path)?;
+    let mut file = open_registered_artifact(&artifact_path, &model.file_path)?;
+    let (actual_size, actual_sha256) = read_with_sha256(&mut file, &model.file_path)?;
+    verify_registered_artifact_integrity(model, actual_size, &actual_sha256)
+}
 
+fn read_verified_persisted_artifact_bytes(
+    managed_root: &Path,
+    model: &RegisteredModel,
+) -> Result<Box<[u8]>, ModelRegistryError> {
+    let artifact_path = resolve_persisted_artifact(managed_root, &model.file_path)?;
+    let mut file = open_registered_artifact(&artifact_path, &model.file_path)?;
+    let (bytes, actual_size, actual_sha256) =
+        read_bytes_with_sha256(&mut file, model.file_size_bytes, &model.file_path)?;
+    verify_registered_artifact_integrity(model, actual_size, &actual_sha256)?;
+    Ok(bytes)
+}
+
+fn verify_registered_artifact_integrity(
+    model: &RegisteredModel,
+    actual_size: u64,
+    actual_sha256: &str,
+) -> Result<(), ModelRegistryError> {
     if actual_size != model.file_size_bytes {
         return Err(ModelRegistryError::RegisteredArtifactSizeMismatch {
             path: model.file_path.clone(),
@@ -940,11 +994,61 @@ fn verify_persisted_artifact(
         return Err(ModelRegistryError::RegisteredArtifactHashMismatch {
             path: model.file_path.clone(),
             expected: model.sha256.clone(),
-            actual: actual_sha256,
+            actual: actual_sha256.to_owned(),
         });
     }
 
     Ok(())
+}
+
+fn open_registered_artifact(path: &Path, relative_path: &Path) -> Result<File, ModelRegistryError> {
+    #[cfg(unix)]
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            // A swapped special file must fail before it can block the loader.
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|source| match source.raw_os_error() {
+                Some(libc::ELOOP) => ModelRegistryError::RegisteredArtifactIsSymlink {
+                    path: relative_path.to_path_buf(),
+                },
+                _ if source.kind() == io::ErrorKind::NotFound => {
+                    ModelRegistryError::RegisteredArtifactNotFound {
+                        path: relative_path.to_path_buf(),
+                    }
+                }
+                _ => ModelRegistryError::Io {
+                    action: "open registered managed model artifact",
+                    path: relative_path.to_path_buf(),
+                    source,
+                },
+            })?;
+        let metadata = file.metadata().map_err(|source| ModelRegistryError::Io {
+            action: "inspect opened registered managed model artifact",
+            path: relative_path.to_path_buf(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(ModelRegistryError::RegisteredArtifactNotRegularFile {
+                path: relative_path.to_path_buf(),
+            });
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(ModelRegistryError::Io {
+            action: "open registered managed model artifact without symlink traversal",
+            path: relative_path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified local model loading requires no-follow file descriptors",
+            ),
+        })
+    }
 }
 
 fn ensure_target_is_new(target: &Path) -> Result<(), ModelRegistryError> {
@@ -1057,12 +1161,10 @@ fn copy_with_sha256(
     Ok((file_size_bytes, sha256))
 }
 
-fn read_with_sha256(path: &Path) -> Result<(u64, String), ModelRegistryError> {
-    let mut file = File::open(path).map_err(|source| ModelRegistryError::Io {
-        action: "open registered managed model artifact",
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn read_with_sha256(
+    file: &mut File,
+    relative_path: &Path,
+) -> Result<(u64, String), ModelRegistryError> {
     let mut buffer = [0_u8; COPY_BUFFER_BYTES];
     let mut hasher = Sha256::new();
     let mut file_size_bytes = 0_u64;
@@ -1072,7 +1174,7 @@ fn read_with_sha256(path: &Path) -> Result<(u64, String), ModelRegistryError> {
             .read(&mut buffer)
             .map_err(|source| ModelRegistryError::Io {
                 action: "read registered managed model artifact",
-                path: path.to_path_buf(),
+                path: relative_path.to_path_buf(),
                 source,
             })?;
         if read == 0 {
@@ -1083,11 +1185,73 @@ fn read_with_sha256(path: &Path) -> Result<(u64, String), ModelRegistryError> {
         file_size_bytes = file_size_bytes
             .checked_add(u64::try_from(read).expect("read size fits in u64"))
             .ok_or_else(|| ModelRegistryError::FileSizeOverflow {
-                path: path.to_path_buf(),
+                path: relative_path.to_path_buf(),
             })?;
     }
 
     Ok((file_size_bytes, hex_digest(&hasher.finalize())))
+}
+
+fn read_bytes_with_sha256(
+    file: &mut File,
+    expected_size: u64,
+    relative_path: &Path,
+) -> Result<(Box<[u8]>, u64, String), ModelRegistryError> {
+    let capacity =
+        usize::try_from(expected_size).map_err(|_| ModelRegistryError::FileSizeOverflow {
+            path: relative_path.to_path_buf(),
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| ModelRegistryError::FileSizeOverflow {
+            path: relative_path.to_path_buf(),
+        })?;
+
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    loop {
+        let remaining = expected_size.saturating_sub(size);
+        let read_limit = if remaining == 0 {
+            1
+        } else {
+            usize::try_from(remaining)
+                .unwrap_or(COPY_BUFFER_BYTES)
+                .min(buffer.len())
+        };
+        let read =
+            file.read(&mut buffer[..read_limit])
+                .map_err(|source| ModelRegistryError::Io {
+                    action: "read registered managed model artifact",
+                    path: relative_path.to_path_buf(),
+                    source,
+                })?;
+        if read == 0 {
+            break;
+        }
+
+        size = size
+            .checked_add(u64::try_from(read).expect("read size fits in u64"))
+            .ok_or_else(|| ModelRegistryError::FileSizeOverflow {
+                path: relative_path.to_path_buf(),
+            })?;
+        if size > expected_size {
+            return Err(ModelRegistryError::RegisteredArtifactSizeMismatch {
+                path: relative_path.to_path_buf(),
+                expected: expected_size,
+                actual: size,
+            });
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok((
+        bytes.into_boxed_slice(),
+        size,
+        hex_digest(&hasher.finalize()),
+    ))
 }
 
 fn stream_copy_with_sha256(
@@ -1292,23 +1456,18 @@ mod tests {
     fn rechecks_a_model_artifact_when_a_native_worker_requests_it() {
         let directory = TestDirectory::new();
         let managed_root = directory.child("managed-models");
-        let model = write_persisted_model(&managed_root, "existing.model", b"original model");
+        let original = b"original model";
+        let model = write_persisted_model(&managed_root, "existing.model", original);
         let registry = ModelRegistry::from_persisted(&managed_root, [model.clone()]).unwrap();
+        let artifact = registry.verified_artifact(model.id).unwrap();
 
-        assert_eq!(
-            registry.verified_artifact_path(model.id).unwrap(),
-            fs::canonicalize(managed_root.join(&model.file_path)).unwrap()
-        );
-
+        assert_eq!(artifact.model(), &model);
         fs::write(managed_root.join(&model.file_path), b"replaced model").unwrap();
+        assert_eq!(&*artifact.into_bytes(), original);
         assert!(matches!(
-            registry.verified_artifact_path(model.id),
+            registry.verified_artifact(model.id),
             Err(ModelRegistryError::RegisteredArtifactSizeMismatch { .. })
                 | Err(ModelRegistryError::RegisteredArtifactHashMismatch { .. })
-        ));
-        assert!(matches!(
-            registry.verified_artifact_path(Uuid::new_v4()),
-            Err(ModelRegistryError::UnknownModelId { .. })
         ));
     }
 

@@ -19,13 +19,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "WordCovenant"
 path = "src/main.rs"
 
+[[bench]]
+name = "speaker_recognition"
+harness = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 crossbeam-queue = "0.3"
+libc = "0.2"
+ferrous-opencc = { version = "=0.4.0", default-features = false, features = ["t2s-conversion"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rubato = "=0.16.2"
 sha2 = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = { version = "2.7.2", default-features = false }
@@ -34,6 +41,7 @@ serde_json = "1"
 tauri-plugin-prevent-default = "5.0"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+webrtc-vad = "=0.4.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -41,6 +49,14 @@ cpal = "0.18"
 mach2 = "0.6"
 objc2 = "0.6"
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
+sherpa-rs = { version = "=0.6.8", default-features = false, features = ["static"] }
+whisper-rs = { version = "=0.16.0", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "=0.16.0", default-features = false }
+
+[dev-dependencies]
+hound = "3.5"
 
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.

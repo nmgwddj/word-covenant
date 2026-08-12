@@ -1,14 +1,37 @@
 <script setup lang="ts">
-import type { TranscriptSpan } from '@/types'
+import { computed } from 'vue'
+import type { SpeakerCluster, TranscriptSpan } from '@/types'
 
-const props = withDefaults(defineProps<{
-  spans: TranscriptSpan[]
-  sessionStartNs?: number
-  useWallClock?: boolean
-}>(), {
-  sessionStartNs: 0,
-  useWallClock: false,
-})
+const props = withDefaults(
+  defineProps<{
+    spans: TranscriptSpan[]
+    speakerClusters?: SpeakerCluster[]
+    sessionStartNs?: number
+    useWallClock?: boolean
+  }>(),
+  {
+    speakerClusters: () => [],
+    sessionStartNs: 0,
+    useWallClock: false,
+  }
+)
+
+const emit = defineEmits<{
+  openSpeakerManager: [spanId: string]
+}>()
+
+const displayedSpans = computed(() =>
+  props.spans
+    .map((span, index) => ({ span, index }))
+    .sort(
+      (left, right) =>
+        right.span.captureStartNs - left.span.captureStartNs ||
+        right.span.captureEndNs - left.span.captureEndNs ||
+        right.span.revision - left.span.revision ||
+        right.index - left.index
+    )
+    .map(item => item.span)
+)
 
 function timestamp(ns: number): string {
   const totalSeconds = Math.floor(ns / 1_000_000_000)
@@ -35,8 +58,11 @@ function captureTimestamp(span: TranscriptSpan): string {
 
 function speakerLabel(speakerClusterId: string | null): string {
   if (!speakerClusterId) return '未归类'
-  const number = speakerClusterId.replace('speaker-', '')
-  return `说话人 ${number}`
+  const cluster = props.speakerClusters.find(item => item.id === speakerClusterId)
+  const canonicalCluster = cluster ? props.speakerClusters.find(item => item.id === cluster.canonicalClusterId) : null
+  const label = canonicalCluster?.label ?? cluster?.label
+  if (label) return label
+  return '未归类'
 }
 </script>
 
@@ -50,13 +76,23 @@ function speakerLabel(speakerClusterId: string | null): string {
       <span class="section-heading__meta">{{ props.spans.length }} 条</span>
     </div>
 
-    <ol v-if="props.spans.length" class="timeline-list">
-      <li v-for="span in props.spans" :key="span.id" class="timeline-entry">
+    <ol v-if="displayedSpans.length" class="timeline-list">
+      <li v-for="span in displayedSpans" :key="span.id" class="timeline-entry">
         <time :datetime="span.wallClockStart ?? String(span.captureStartNs)">{{ captureTimestamp(span) }}</time>
         <div class="timeline-entry__rail" aria-hidden="true"><span /></div>
         <article class="timeline-entry__body">
           <div class="timeline-entry__meta">
-            <span class="speaker-tag">{{ speakerLabel(span.speakerClusterId) }}</span>
+            <button
+              v-if="span.isFinal"
+              class="speaker-tag speaker-tag--interactive"
+              type="button"
+              data-testid="open-speaker-manager"
+              :aria-label="`管理${speakerLabel(span.speakerClusterId)}`"
+              @click="emit('openSpeakerManager', span.id)"
+            >
+              {{ speakerLabel(span.speakerClusterId) }}
+            </button>
+            <span v-else class="speaker-tag">{{ speakerLabel(span.speakerClusterId) }}</span>
             <span v-if="!span.isFinal" class="draft-tag">转写中</span>
             <span class="timeline-entry__duration">{{ timestamp(span.captureEndNs - span.captureStartNs) }}</span>
           </div>

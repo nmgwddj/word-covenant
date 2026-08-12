@@ -1,9 +1,14 @@
-use crate::domain::{DataCategory, TranscriptSpan};
+use crate::audio::SpeechDetectionSettings;
+use crate::domain::{DataCategory, SpeakerCluster, TranscriptSpan};
+use crate::inference::bundled_model::BundledAsrStatus;
 use crate::inference::model_registry::{
     LicenseAcknowledgement, LocalModelKind, ModelImportRequest, RegisteredModel,
 };
 use crate::policy::{EgressApproval, PolicyDecision};
-use crate::state::{AgentAction, AppState, PrivacyStatus};
+use crate::state::{
+    ActiveLocalAsrProfile, AgentAction, AppState, PrivacyStatus, SpeakerOperationResult,
+    VoiceProfileProjection,
+};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -48,6 +53,58 @@ pub struct ImportLocalModelInput {
     pub license_acknowledged: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectActiveLocalAsrModelInput {
+    pub model_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSpeakerClusterInput {
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSpeakerClusterInput {
+    pub session_id: Uuid,
+    pub cluster_id: String,
+    pub expected_label_revision: u32,
+    pub label: String,
+    pub consent: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameVoiceProfileInput {
+    pub profile_id: Uuid,
+    pub expected_revision: u32,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceProfileMutationInput {
+    pub profile_id: Uuid,
+    pub expected_revision: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReassignTranscriptSpeakerInput {
+    pub session_id: Uuid,
+    pub logical_span_id: Uuid,
+    pub expected_revision: u32,
+    pub target_cluster_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSessionInput {
+    pub session_id: Uuid,
+}
+
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +123,21 @@ pub fn set_egress_enabled(
     enabled: bool,
 ) -> Result<PrivacyStatus, String> {
     state.set_egress_enabled(enabled)
+}
+
+#[tauri::command]
+pub fn get_speech_detection_settings(
+    state: State<'_, AppState>,
+) -> Result<SpeechDetectionSettings, String> {
+    state.speech_detection_settings()
+}
+
+#[tauri::command]
+pub fn set_speech_detection_settings(
+    state: State<'_, AppState>,
+    input: SpeechDetectionSettings,
+) -> Result<SpeechDetectionSettings, String> {
+    state.set_speech_detection_settings(input)
 }
 
 #[tauri::command]
@@ -113,6 +185,18 @@ pub fn stop_session(
 }
 
 #[tauri::command]
+pub fn list_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::domain::session::SessionSummary>, String> {
+    state.list_sessions()
+}
+
+#[tauri::command]
+pub fn delete_session(state: State<'_, AppState>, input: DeleteSessionInput) -> Result<(), String> {
+    state.delete_session(input.session_id)
+}
+
+#[tauri::command]
 pub fn list_timeline(
     state: State<'_, AppState>,
     session_id: Option<Uuid>,
@@ -121,8 +205,114 @@ pub fn list_timeline(
 }
 
 #[tauri::command]
+pub fn list_speaker_clusters(
+    state: State<'_, AppState>,
+    session_id: Option<Uuid>,
+) -> Result<Vec<SpeakerCluster>, String> {
+    state.list_speaker_clusters(session_id)
+}
+
+#[tauri::command]
+pub fn create_speaker_cluster(
+    state: State<'_, AppState>,
+    input: CreateSpeakerClusterInput,
+) -> Result<SpeakerOperationResult, String> {
+    state.create_speaker_cluster(input.session_id)
+}
+
+#[tauri::command]
+pub fn rename_speaker_cluster(
+    state: State<'_, AppState>,
+    input: RenameSpeakerClusterInput,
+) -> Result<SpeakerOperationResult, String> {
+    state.rename_speaker_cluster(
+        input.session_id,
+        input.cluster_id,
+        input.expected_label_revision,
+        input.label,
+        input.consent,
+    )
+}
+
+#[tauri::command]
+pub fn list_voice_profiles(
+    state: State<'_, AppState>,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.list_voice_profiles()
+}
+
+#[tauri::command]
+pub fn rename_voice_profile(
+    state: State<'_, AppState>,
+    input: RenameVoiceProfileInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.rename_voice_profile(
+        input.profile_id,
+        input.expected_revision,
+        input.display_name,
+    )
+}
+
+#[tauri::command]
+pub fn relearn_voice_profile(
+    state: State<'_, AppState>,
+    input: VoiceProfileMutationInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.relearn_voice_profile(input.profile_id, input.expected_revision)
+}
+
+#[tauri::command]
+pub fn add_voice_profile_confirmed_sample(
+    state: State<'_, AppState>,
+    input: VoiceProfileMutationInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.add_voice_profile_confirmed_sample(input.profile_id, input.expected_revision)
+}
+
+#[tauri::command]
+pub fn delete_voice_profile(
+    state: State<'_, AppState>,
+    input: VoiceProfileMutationInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.delete_voice_profile(input.profile_id, input.expected_revision)
+}
+
+#[tauri::command]
+pub fn reassign_transcript_speaker(
+    state: State<'_, AppState>,
+    input: ReassignTranscriptSpeakerInput,
+) -> Result<SpeakerOperationResult, String> {
+    state.reassign_transcript_speaker(
+        input.session_id,
+        input.logical_span_id,
+        input.expected_revision,
+        input.target_cluster_id,
+    )
+}
+
+#[tauri::command]
 pub fn list_local_models(state: State<'_, AppState>) -> Result<Vec<RegisteredModel>, String> {
     state.list_local_models()
+}
+
+#[tauri::command]
+pub fn get_bundled_asr_status(state: State<'_, AppState>) -> Result<BundledAsrStatus, String> {
+    state.bundled_asr_status()
+}
+
+#[tauri::command]
+pub fn get_active_local_asr_profile(
+    state: State<'_, AppState>,
+) -> Result<Option<ActiveLocalAsrProfile>, String> {
+    state.active_local_asr_profile()
+}
+
+#[tauri::command]
+pub fn select_active_local_asr_model(
+    state: State<'_, AppState>,
+    input: SelectActiveLocalAsrModelInput,
+) -> Result<ActiveLocalAsrProfile, String> {
+    state.select_active_local_asr_model(input.model_id)
 }
 
 #[tauri::command]
@@ -226,8 +416,14 @@ pub fn attempt_http_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::selected_local_model_path;
+    use super::{
+        selected_local_model_path, CreateSpeakerClusterInput, ReassignTranscriptSpeakerInput,
+        RenameSpeakerClusterInput, SelectActiveLocalAsrModelInput,
+    };
+    use crate::audio::SpeechDetectionSettings;
+    use serde_json::json;
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[test]
     fn local_model_file_selection_returns_none_when_the_picker_is_cancelled() {
@@ -243,6 +439,69 @@ mod tests {
         assert_eq!(
             selected_local_model_path(Some(PathBuf::from("model.gguf"))).unwrap_err(),
             "selected model file must use an absolute local path"
+        );
+    }
+
+    #[test]
+    fn speaker_command_inputs_use_the_camel_case_bridge_contract() {
+        let session_id = Uuid::new_v4();
+        let logical_span_id = Uuid::new_v4();
+
+        let create: CreateSpeakerClusterInput = serde_json::from_value(json!({
+            "sessionId": session_id,
+        }))
+        .unwrap();
+        assert_eq!(create.session_id, session_id);
+
+        let rename: RenameSpeakerClusterInput = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "clusterId": "speaker-01234567-89ab-cdef-0123-456789abcdef",
+            "expectedLabelRevision": 4,
+            "label": "会议主持人",
+            "consent": true,
+        }))
+        .unwrap();
+        assert_eq!(rename.session_id, session_id);
+        assert_eq!(
+            rename.cluster_id,
+            "speaker-01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(rename.expected_label_revision, 4);
+        assert_eq!(rename.label, "会议主持人");
+        assert!(rename.consent);
+
+        let reassign: ReassignTranscriptSpeakerInput = serde_json::from_value(json!({
+            "sessionId": session_id,
+            "logicalSpanId": logical_span_id,
+            "expectedRevision": 7,
+            "targetClusterId": null,
+        }))
+        .unwrap();
+        assert_eq!(reassign.session_id, session_id);
+        assert_eq!(reassign.logical_span_id, logical_span_id);
+        assert_eq!(reassign.expected_revision, 7);
+        assert_eq!(reassign.target_cluster_id, None);
+
+        let select: SelectActiveLocalAsrModelInput = serde_json::from_value(json!({
+            "modelId": session_id,
+        }))
+        .unwrap();
+        assert_eq!(select.model_id, session_id);
+    }
+
+    #[test]
+    fn speech_detection_settings_use_the_camel_case_bridge_contract() {
+        let settings: SpeechDetectionSettings = serde_json::from_value(json!({
+            "mode": "manual",
+            "rmsThresholdDbfs": -24,
+        }))
+        .unwrap();
+
+        assert_eq!(settings.mode, crate::audio::SpeechDetectionMode::Manual);
+        assert_eq!(settings.rms_threshold_dbfs, -24);
+        assert_eq!(
+            serde_json::to_value(settings).unwrap(),
+            json!({ "mode": "manual", "rmsThresholdDbfs": -24 })
         );
     }
 }

@@ -12,13 +12,21 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AgentActionPanel: typeof import('./src/components/AgentActionPanel.vue')['default']
+    CaptureSettingsPanel: typeof import('./src/components/CaptureSettingsPanel.vue')['default']
     CaptureStatus: typeof import('./src/components/CaptureStatus.vue')['default']
     DevelopmentCaptureControl: typeof import('./src/components/DevelopmentCaptureControl.vue')['default']
+    FlatSelect: typeof import('./src/components/FlatSelect.vue')['default']
     GreetComponent: typeof import('./src/components/GreetComponent.vue')['default']
+    InputDeviceSettings: typeof import('./src/components/InputDeviceSettings.vue')['default']
+    LiveAudioMeter: typeof import('./src/components/LiveAudioMeter.vue')['default']
     ModelRegistryPanel: typeof import('./src/components/ModelRegistryPanel.vue')['default']
     OutboundAccessControl: typeof import('./src/components/OutboundAccessControl.vue')['default']
     PrivacyStatus: typeof import('./src/components/PrivacyStatus.vue')['default']
     RecordingControl: typeof import('./src/components/RecordingControl.vue')['default']
+    SessionRail: typeof import('./src/components/SessionRail.vue')['default']
+    SettingsPage: typeof import('./src/components/SettingsPage.vue')['default']
+    SpeakerManager: typeof import('./src/components/SpeakerManager.vue')['default']
     TimelinePanel: typeof import('./src/components/TimelinePanel.vue')['default']
+    VoiceProfileSettings: typeof import('./src/components/VoiceProfileSettings.vue')['default']
   }
 }

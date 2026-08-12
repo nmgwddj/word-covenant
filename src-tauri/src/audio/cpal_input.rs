@@ -13,13 +13,11 @@ use mach2::mach_time::{mach_continuous_time, mach_timebase_info, mach_timebase_i
 use objc2::runtime::Bool;
 use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaType, AVMediaTypeAudio};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
-use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const PERMISSION_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
-const PCM_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(2);
 const MINIMUM_DBFS: f32 = -96.0;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -62,32 +60,27 @@ pub struct CpalInput {
     stream: Option<Stream>,
     ingress: Arc<CaptureIngress>,
     telemetry: Arc<CaptureTelemetryAtomic>,
-    stop_worker: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
 }
 
 struct CaptureTelemetryAtomic {
-    rms_dbfs_bits: AtomicU32,
-    peak_dbfs_bits: AtomicU32,
-    clipping: AtomicBool,
     failure: AtomicU8,
 }
 
 impl CaptureTelemetryAtomic {
     fn new() -> Self {
         Self {
-            rms_dbfs_bits: AtomicU32::new(MINIMUM_DBFS.to_bits()),
-            peak_dbfs_bits: AtomicU32::new(MINIMUM_DBFS.to_bits()),
-            clipping: AtomicBool::new(false),
             failure: AtomicU8::new(CpalInputFailure::None as u8),
         }
     }
 
     fn snapshot(&self, dropped_packets: u64) -> CpalInputTelemetry {
         CpalInputTelemetry {
-            rms_dbfs: f32::from_bits(self.rms_dbfs_bits.load(Ordering::Relaxed)),
-            peak_dbfs: f32::from_bits(self.peak_dbfs_bits.load(Ordering::Relaxed)),
-            clipping: self.clipping.load(Ordering::Relaxed),
+            // Level projection belongs to the native dispatcher, the sole
+            // consumer of CaptureIngress. Keep this compatibility shape until
+            // the service reads that projection directly.
+            rms_dbfs: MINIMUM_DBFS,
+            peak_dbfs: MINIMUM_DBFS,
+            clipping: false,
             dropped_packets,
             failure: match self.failure.load(Ordering::Relaxed) {
                 value if value == CpalInputFailure::DeviceUnavailable as u8 => {
@@ -105,28 +98,6 @@ impl CaptureTelemetryAtomic {
         }
     }
 
-    fn record_level(&self, samples: &[f32]) {
-        if samples.is_empty() {
-            return;
-        }
-
-        let mut square_sum = 0.0_f64;
-        let mut peak = 0.0_f32;
-        let mut clipping = false;
-        for sample in samples {
-            let magnitude = sample.abs();
-            square_sum += f64::from(*sample) * f64::from(*sample);
-            peak = peak.max(magnitude);
-            clipping |= magnitude >= 0.999;
-        }
-        let rms = (square_sum / samples.len() as f64).sqrt() as f32;
-        self.rms_dbfs_bits
-            .store(to_dbfs(rms).to_bits(), Ordering::Relaxed);
-        self.peak_dbfs_bits
-            .store(to_dbfs(peak).to_bits(), Ordering::Relaxed);
-        self.clipping.store(clipping, Ordering::Relaxed);
-    }
-
     fn record_failure(&self, failure: CpalInputFailure) {
         self.failure.store(failure as u8, Ordering::Relaxed);
     }
@@ -135,23 +106,22 @@ impl CaptureTelemetryAtomic {
 impl CpalInput {
     pub fn list_input_devices() -> Result<InputDeviceList, String> {
         let host = cpal::default_host();
-        let default_uid = host
+        let default_device = host
             .default_input_device()
-            .map(|device| device_uid(&device))
-            .transpose()?;
-        let devices = host
-            .input_devices()
-            .map_err(|error| format!("could not enumerate input devices: {error}"))?
-            .map(|device| {
-                let uid = device_uid(&device)?;
-                MacOsInputDevice::new(uid, device.to_string()).map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(InputDeviceList {
-            devices,
-            default_uid,
-        })
+            .and_then(|device| input_device_metadata(&device).ok());
+        match host.input_devices() {
+            Ok(devices) => Ok(input_device_list_from_candidates(
+                default_device,
+                devices.map(|device| input_device_metadata(&device)),
+            )),
+            // CoreAudio's full directory can briefly fail during route changes
+            // while a readable default device is still available. Keep that
+            // device visible instead of presenting an empty selector.
+            Err(_error) if default_device.is_some() => {
+                Ok(input_device_list_from_candidates(default_device, []))
+            }
+            Err(error) => Err(format!("could not enumerate input devices: {error}")),
+        }
     }
 
     pub fn permission_status() -> Result<MicrophonePermission, String> {
@@ -193,7 +163,11 @@ impl CpalInput {
         }
     }
 
-    pub fn start(selected_device_uid: Option<&str>) -> Result<(Self, CapturePoint), String> {
+    /// Resolve microphone access and prepare a paused input stream.
+    ///
+    /// The caller must attach the sole ingress dispatcher before calling
+    /// [`Self::activate`], so no other native worker can consume PCM first.
+    pub fn prepare(selected_device_uid: Option<&str>) -> Result<(Self, CapturePoint), String> {
         let permission = Self::request_permission()?;
         if permission != MicrophonePermission::Granted {
             return Err(match permission {
@@ -209,11 +183,12 @@ impl CpalInput {
         }
 
         let host = cpal::default_host();
-        let device = select_input_device(&host, selected_device_uid)?;
-        let device_uid = device_uid(&device)?;
-        let device = MacOsInputDevice::new(device_uid, device.to_string())
-            .map_err(|error| error.to_string())?;
-        let supported_config = device_config(&host, selected_device_uid)?;
+        // Resolve the hardware handle once. Re-enumerating separately for
+        // metadata, configuration, and stream creation races unplug/replug
+        // events and can bind configuration to a different route.
+        let stream_device = select_input_device(&host, selected_device_uid)?;
+        let device = input_device_metadata(&stream_device)?;
+        let supported_config = device_config(&stream_device)?;
         let sample_format = supported_config.sample_format();
         let config = supported_config.config();
         let sample_rate = config.sample_rate;
@@ -222,27 +197,14 @@ impl CpalInput {
         let telemetry = Arc::new(CaptureTelemetryAtomic::new());
         let next_sample_offset = Arc::new(AtomicU64::new(0));
         let stream = build_stream(
-            &host,
-            selected_device_uid,
+            stream_device,
             config,
             sample_format,
             Arc::clone(&ingress),
             Arc::clone(&telemetry),
             next_sample_offset,
         )?;
-        let stop_worker = Arc::new(AtomicBool::new(false));
-        let worker = spawn_pcm_worker(
-            Arc::clone(&ingress),
-            Arc::clone(&telemetry),
-            Arc::clone(&stop_worker),
-        );
         let anchor = capture_point_now();
-
-        if let Err(error) = stream.play() {
-            stop_worker.store(true, Ordering::Release);
-            let _ = worker.join();
-            return Err(format!("could not start input stream: {error}"));
-        }
 
         Ok((
             Self {
@@ -252,11 +214,29 @@ impl CpalInput {
                 stream: Some(stream),
                 ingress,
                 telemetry,
-                stop_worker,
-                worker: Some(worker),
             },
             anchor,
         ))
+    }
+
+    /// Start the prepared CoreAudio stream after its downstream dispatcher is
+    /// ready to consume ingress packets.
+    pub fn activate(&mut self) -> Result<(), String> {
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| "microphone input stream has already stopped".to_owned())?;
+        stream
+            .play()
+            .map_err(|error| format!("could not start input stream: {error}"))
+    }
+
+    /// Backward-compatible single-phase start for callers that do not need to
+    /// install a dispatcher between stream construction and activation.
+    pub fn start(selected_device_uid: Option<&str>) -> Result<(Self, CapturePoint), String> {
+        let (mut input, anchor) = Self::prepare(selected_device_uid)?;
+        input.activate()?;
+        Ok((input, anchor))
     }
 
     pub fn device(&self) -> &MacOsInputDevice {
@@ -275,12 +255,12 @@ impl CpalInput {
         self.telemetry.snapshot(self.ingress.dropped_packets())
     }
 
+    pub(crate) fn ingress(&self) -> Arc<CaptureIngress> {
+        Arc::clone(&self.ingress)
+    }
+
     pub fn stop(&mut self) {
-        self.stream.take();
-        self.stop_worker.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        release_stream(&mut self.stream);
     }
 }
 
@@ -290,16 +270,18 @@ impl Drop for CpalInput {
     }
 }
 
+fn release_stream<T>(stream: &mut Option<T>) {
+    drop(stream.take());
+}
+
 fn build_stream(
-    host: &cpal::Host,
-    selected_device_uid: Option<&str>,
+    device: cpal::Device,
     config: StreamConfig,
     sample_format: SampleFormat,
     ingress: Arc<CaptureIngress>,
     telemetry: Arc<CaptureTelemetryAtomic>,
     next_sample_offset: Arc<AtomicU64>,
 ) -> Result<Stream, String> {
-    let device = select_input_device(host, selected_device_uid)?;
     match sample_format {
         SampleFormat::I8 => {
             build_typed_stream::<i8>(device, config, ingress, telemetry, next_sample_offset)
@@ -389,27 +371,64 @@ fn select_input_device(
             .ok_or_else(|| "no default microphone is available".to_owned());
     };
 
-    host.input_devices()
+    for device in host
+        .input_devices()
         .map_err(|error| format!("could not enumerate input devices: {error}"))?
-        .find_map(|device| match device_uid(&device) {
-            Ok(uid) if uid == selected_device_uid => Some(Ok(device)),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .unwrap_or_else(|| {
-            Err(format!(
-                "selected input device {selected_device_uid:?} is unavailable"
-            ))
-        })
+    {
+        if let Ok(uid) = device_uid(&device) {
+            if uid == selected_device_uid {
+                return Ok(device);
+            }
+        }
+    }
+
+    Err(format!(
+        "selected input device {selected_device_uid:?} is unavailable"
+    ))
 }
 
-fn device_config(
-    host: &cpal::Host,
-    selected_device_uid: Option<&str>,
-) -> Result<cpal::SupportedStreamConfig, String> {
-    select_input_device(host, selected_device_uid)?
+fn device_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, String> {
+    device
         .default_input_config()
         .map_err(|error| format!("could not get default input stream configuration: {error}"))
+}
+
+fn input_device_metadata(device: &cpal::Device) -> Result<MacOsInputDevice, String> {
+    let uid = device_uid(device)?;
+    let name = device
+        .description()
+        .map(|description| description.name().to_owned())
+        .map_err(|error| format!("could not read input device name: {error}"))?;
+    MacOsInputDevice::new(uid, name).map_err(|error| error.to_string())
+}
+
+fn input_device_list_from_candidates(
+    default_device: Option<MacOsInputDevice>,
+    candidates: impl IntoIterator<Item = Result<MacOsInputDevice, String>>,
+) -> InputDeviceList {
+    let default_uid = default_device
+        .as_ref()
+        .map(|device| device.uid().to_owned());
+    let mut devices: Vec<MacOsInputDevice> = Vec::new();
+
+    for device in candidates.into_iter().flatten() {
+        if !devices.iter().any(|known| known.uid() == device.uid()) {
+            devices.push(device);
+        }
+    }
+    if let Some(default_device) = default_device {
+        if !devices
+            .iter()
+            .any(|known| known.uid() == default_device.uid())
+        {
+            devices.push(default_device);
+        }
+    }
+
+    InputDeviceList {
+        devices,
+        default_uid,
+    }
 }
 
 fn device_uid(device: &cpal::Device) -> Result<String, String> {
@@ -417,24 +436,6 @@ fn device_uid(device: &cpal::Device) -> Result<String, String> {
         .id()
         .map(|id| id.to_string())
         .map_err(|error| format!("could not read input device UID: {error}"))
-}
-
-fn spawn_pcm_worker(
-    ingress: Arc<CaptureIngress>,
-    telemetry: Arc<CaptureTelemetryAtomic>,
-    stop_worker: Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    thread::Builder::new()
-        .name("word-covenant-pcm-meter".to_owned())
-        .spawn(move || {
-            while !stop_worker.load(Ordering::Acquire) {
-                if !ingress.try_consume(|packet| telemetry.record_level(packet.samples)) {
-                    thread::sleep(PCM_WORKER_IDLE_SLEEP);
-                }
-            }
-            while ingress.try_consume(|_| {}) {}
-        })
-        .expect("PCM meter worker thread starts")
 }
 
 pub fn capture_point_now() -> CapturePoint {
@@ -467,13 +468,6 @@ fn cpal_failure(error: cpal::ErrorKind) -> CpalInputFailure {
     }
 }
 
-fn to_dbfs(value: f32) -> f32 {
-    if value <= 0.0 {
-        return MINIMUM_DBFS;
-    }
-    (20.0 * value.log10()).clamp(MINIMUM_DBFS, 0.0)
-}
-
 fn continuous_time_ns() -> u64 {
     let timebase = *TIMEBASE.get_or_init(|| {
         let mut timebase = mach_timebase_info_data_t { numer: 0, denom: 0 };
@@ -491,11 +485,26 @@ static TIMEBASE: OnceLock<mach_timebase_info_data_t> = OnceLock::new();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
-    fn converts_silence_to_a_finite_meter_floor() {
-        assert_eq!(to_dbfs(0.0), MINIMUM_DBFS);
-        assert_eq!(to_dbfs(1.0), 0.0);
+    fn releasing_the_stream_handle_drops_its_resource() {
+        struct DropProbe(Rc<Cell<bool>>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(false));
+        let mut stream = Some(DropProbe(Rc::clone(&dropped)));
+
+        release_stream(&mut stream);
+
+        assert!(stream.is_none());
+        assert!(dropped.get());
     }
 
     #[test]
@@ -503,5 +512,33 @@ mod tests {
         let first = continuous_time_ns();
         let second = continuous_time_ns();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn device_directory_skips_individually_unreadable_devices() {
+        let default = MacOsInputDevice::new("built-in", "MacBook microphone").unwrap();
+        let usb = MacOsInputDevice::new("usb", "USB microphone").unwrap();
+
+        let directory = input_device_list_from_candidates(
+            Some(default.clone()),
+            vec![
+                Ok(default.clone()),
+                Err("could not read transient device identity".to_owned()),
+                Ok(usb.clone()),
+            ],
+        );
+
+        assert_eq!(directory.default_uid.as_deref(), Some(default.uid()));
+        assert_eq!(directory.devices, vec![default, usb]);
+    }
+
+    #[test]
+    fn device_directory_retains_a_readable_default_when_enumeration_is_empty() {
+        let default = MacOsInputDevice::new("built-in", "MacBook microphone").unwrap();
+
+        let directory = input_device_list_from_candidates(Some(default.clone()), Vec::new());
+
+        assert_eq!(directory.default_uid.as_deref(), Some(default.uid()));
+        assert_eq!(directory.devices, vec![default]);
     }
 }

@@ -1,0 +1,15 @@
+Whisper large-v3-turbo model distribution notice
+
+Model card ID: openai/whisper-large-v3-turbo
+Canonical model card: https://huggingface.co/openai/whisper-large-v3-turbo
+Bundled artifact: ggml-large-v3-turbo-q5_0.bin, multilingual whisper.cpp GGML Q5_0 conversion
+
+This bundled model is used only for local speech recognition in WordCovenant.
+It can produce inaccurate, incomplete, or fabricated text, especially for
+short, noisy, overlapping, domain-specific, or underrepresented-language
+speech. It does not identify people, verify identity, or establish a fact.
+
+Review the canonical model card and license terms before using its output for
+high-impact decisions. WordCovenant keeps microphone PCM and transcription
+inference on the device; opening the canonical model-card URL is not required
+to use the bundled model.

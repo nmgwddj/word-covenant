@@ -106,6 +106,14 @@ impl CaptureIngress {
         self.dropped_packets.load(Ordering::Relaxed)
     }
 
+    /// Returns a point-in-time count of queued packets without exposing PCM.
+    ///
+    /// The value is intended for bounded native maintenance paths. A callback
+    /// may enqueue another packet immediately after this snapshot.
+    pub(crate) fn queued_packet_count(&self) -> usize {
+        self.ready.len()
+    }
+
     /// Copy a normalized PCM buffer into a free fixed-capacity slot.
     pub fn try_write(
         &self,
@@ -134,7 +142,8 @@ impl CaptureIngress {
         samples: &[T],
         map_sample: impl Fn(T) -> f32,
     ) -> CaptureWriteResult {
-        if sample_rate == 0 || channels == 0 || samples.len() % usize::from(channels) != 0 {
+        if sample_rate == 0 || channels == 0 || !samples.len().is_multiple_of(usize::from(channels))
+        {
             self.record_drop();
             return CaptureWriteResult::Dropped;
         }

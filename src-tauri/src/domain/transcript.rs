@@ -12,14 +12,6 @@ pub enum TranscriptSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SpeakerCluster {
-    pub id: String,
-    pub label: String,
-    pub is_user_named: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct TranscriptSpan {
     pub id: Uuid,
     pub session_id: Uuid,
@@ -31,6 +23,10 @@ pub struct TranscriptSpan {
     pub wall_clock_start: Option<DateTime<Utc>>,
     pub speaker_cluster_id: Option<String>,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalization_profile: Option<String>,
     pub is_final: bool,
     pub revision: u32,
     pub source: TranscriptSource,
@@ -65,6 +61,8 @@ impl TranscriptSpan {
             wall_clock_start: None,
             speaker_cluster_id,
             text,
+            original_text: None,
+            normalization_profile: None,
             is_final,
             revision,
             source,

@@ -8,12 +8,23 @@ use uuid::Uuid;
 pub enum AuditKind {
     SessionStarted,
     SessionStopped,
+    SessionDeleted,
     CaptureInputStarted,
     CaptureInputStopped,
     CaptureSegmentRecorded,
     CaptureGapRecorded,
+    InferenceGapRecorded,
     TranscriptRecorded,
     TranscriptRevisionRecorded,
+    SpeakerClusterCreated,
+    SpeakerClusterLabelRevisionRecorded,
+    SpeakerClusterAliasRevisionRecorded,
+    TranscriptSpeakerReassigned,
+    VoiceProfileCreated,
+    VoiceProfileRevisionRecorded,
+    VoiceProfileEnrollmentRecorded,
+    VoiceProfileDeleted,
+    SpeakerObservationRecorded,
     LocalModelImported,
     PlanProposed,
     EgressApprovalCreated,
@@ -171,6 +182,10 @@ impl AuditTrail {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the hash material mirrors the immutable audit event fields explicitly"
+)]
 fn hash_event(
     id: Uuid,
     run_id: Option<Uuid>,

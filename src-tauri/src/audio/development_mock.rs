@@ -393,13 +393,14 @@ const SCRIPTED_CUES: [DevelopmentMockCue; 3] = [
 ];
 
 fn scripted_pipeline_config() -> SpeechPipelineConfig {
-    let mut config = SpeechPipelineConfig::default();
-    config.pre_roll_frames = 0;
     // The shortest scripted silence is 300 ms, so 160 ms gives each sentence
     // a deterministic finalization boundary without joining neighbors.
-    config.hangover_frames = PIPELINE_HANGOVER_FRAMES;
-    config.emit_partials = true;
-    config
+    SpeechPipelineConfig {
+        pre_roll_frames: 0,
+        hangover_frames: PIPELINE_HANGOVER_FRAMES,
+        emit_partials: true,
+        ..SpeechPipelineConfig::default()
+    }
 }
 
 fn scripted_pcm_for_packet(starting_sample_offset: u64) -> Vec<f32> {

@@ -1,10 +1,11 @@
-export type SessionState = 'recording' | 'stopped'
+export type SessionState = 'starting' | 'recording' | 'stopped'
 export type TranscriptSource = 'synthetic' | 'local_inference' | 'user_edited'
 export type ActionStatus = 'ready' | 'blocked' | 'completed'
 export type CaptureInputKind = 'microphone' | 'development_mock'
 export type LocalModelKind = 'speech_recognition' | 'voice_activity_detection' | 'speaker_embedding'
 export type CaptureStatus = 'idle' | 'awaiting_permission' | 'recording' | 'interrupted' | 'failed'
 export type MicrophonePermission = 'not_determined' | 'granted' | 'denied' | 'restricted'
+export type CaptureBridgeStatus = 'parked' | 'armed' | 'closing' | 'drained'
 export type CaptureIssueCode =
   | 'permission_denied'
   | 'permission_restricted'
@@ -29,6 +30,10 @@ export interface CaptureSession {
   state: SessionState
 }
 
+export interface SessionSummary extends CaptureSession {
+  transcriptCount: number
+}
+
 export interface CaptureInputDevice {
   uid: string
   name: string
@@ -41,9 +46,54 @@ export interface CaptureMeter {
   droppedPackets: number
 }
 
+/**
+ * Local-only speech gate preferences. The native runtime snapshots these
+ * settings when a microphone session begins, so an active recording cannot
+ * change its detection threshold midway through a session.
+ */
+export interface SpeechDetectionSettings {
+  mode: 'adaptive' | 'manual'
+  rmsThresholdDbfs: number
+}
+
 export interface CaptureIssue {
   code: CaptureIssueCode
   deviceName: string | null
+}
+
+/**
+ * Bounded native inference bridge telemetry. It deliberately excludes PCM,
+ * transcript text, model identifiers, and durable outcome payloads.
+ */
+export interface CaptureBridgeMetrics {
+  ingressPacketsConsumed: number
+  ingressDiscontinuities: number
+  segmenterFailures: number
+  jobsAdmitted: number
+  jobsCompleted: number
+  jobQueueSaturated: number
+  resultQueueSaturated: number
+  unavailableEngineOutcomes: number
+  engineFailureOutcomes: number
+  shutdownOutcomes: number
+  outcomeClaimsAborted: number
+  jobQueueHighWatermark: number
+  resultQueueHighWatermark: number
+  pendingEventHighWatermark: number
+  jobQueueDepth: number
+  resultQueueDepth: number
+  pendingEventDepth: number
+  workerHoldsOutcome: boolean
+  ownedOutcomeLeaseActive: boolean
+  closing: boolean
+}
+
+export interface CaptureBridgeProjection {
+  status: CaptureBridgeStatus
+  armed: boolean
+  shutdownRequested: boolean
+  workerFinished: boolean
+  metrics: CaptureBridgeMetrics
 }
 
 export interface CaptureProjection {
@@ -53,6 +103,8 @@ export interface CaptureProjection {
   selectedDevice: CaptureInputDevice | null
   devices: CaptureInputDevice[]
   meter: CaptureMeter | null
+  // Optional while older native clients are upgraded; current backends return null when absent.
+  bridge?: CaptureBridgeProjection | null
   lastIssue: CaptureIssue | null
 }
 
@@ -76,6 +128,25 @@ export interface RegisteredModel {
   importedAt: string
 }
 
+/**
+ * A user-visible, per-app-run selection of an already imported local ASR
+ * model. The file path and artifact bytes remain native-only.
+ */
+export interface ActiveLocalAsrProfile {
+  modelId: string
+}
+
+/**
+ * Compact availability of the release-bundled local ASR model. Native code
+ * owns resource paths and artifact verification; the WebView receives only
+ * whether the bundled default can be selected for this app run.
+ */
+export interface BundledAsrStatus {
+  available: boolean
+  modelId: string | null
+  message: string | null
+}
+
 export interface LocalModelImportInput {
   sourcePath: string
   modelKind: LocalModelKind
@@ -95,9 +166,65 @@ export interface TranscriptSpan {
   wallClockStart?: string | null
   speakerClusterId: string | null
   text: string
+  originalText?: string
+  normalizationProfile?: string
   isFinal: boolean
   revision: number
   source: TranscriptSource
+}
+
+/**
+ * A native final transcript is available locally. The event deliberately
+ * carries only an opaque session reference and sequence number; the client
+ * reloads the timeline through its existing command to access transcript text.
+ */
+export interface FinalTranscriptProjection {
+  sessionId: string
+  revision: number
+}
+
+/**
+ * A local, session-scoped speaking-part catalog entry with durable labels and
+ * revision metadata.
+ */
+export interface SpeakerCluster {
+  id: string
+  sessionId: string
+  label: string
+  isUserNamed: boolean
+  labelRevision: number
+  aliasRevision: number
+  mergedIntoClusterId: string | null
+  canonicalClusterId: string
+  spanCount: number
+  canEnrollVoiceProfile: boolean
+}
+
+export interface SpeakerSpanRef {
+  id: string
+  revision: number
+}
+
+export interface SpeakerOperationResult {
+  clusters: SpeakerCluster[]
+  updatedSpans: SpeakerSpanRef[]
+}
+
+export type VoiceProfileState = 'learning' | 'ready' | 'relearn_required'
+
+/** Display-only voice profile metadata. Speaker vectors never cross IPC. */
+export interface VoiceProfile {
+  id: string
+  revision: number
+  displayName: string
+  state: VoiceProfileState
+  confirmedDurationNs: number
+  readyConfirmedDurationNs: number
+  modelId: string
+  modelVersion: string
+  lastConfirmationAt: string | null
+  canAddConfirmedSample: boolean
+  updatedAt: string
 }
 
 export interface AgentAction {

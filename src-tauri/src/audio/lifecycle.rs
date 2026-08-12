@@ -22,6 +22,7 @@ pub enum CaptureStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureLifecycleAction {
     BeginPermissionResolution,
+    CancelPreparation,
     CaptureStarted,
     InputDeviceChanged,
     InputDeviceUnavailable,
@@ -35,6 +36,7 @@ impl fmt::Display for CaptureLifecycleAction {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::BeginPermissionResolution => "begin permission resolution",
+            Self::CancelPreparation => "cancel capture preparation",
             Self::CaptureStarted => "process capture started",
             Self::InputDeviceChanged => "process input device changed",
             Self::InputDeviceUnavailable => "process input device unavailable",
@@ -180,6 +182,17 @@ impl CaptureLifecycle {
             ],
         )?;
         self.transition(CaptureStatus::AwaitingPermission, at);
+        Ok(())
+    }
+
+    /// Return an unarmed staged start to idle without publishing a recording
+    /// or failure. The caller has already stopped any prepared producer.
+    pub fn cancel_preparation(&mut self, at: CapturePoint) -> Result<(), CaptureLifecycleError> {
+        self.require_status(
+            CaptureLifecycleAction::CancelPreparation,
+            &[CaptureStatus::AwaitingPermission],
+        )?;
+        self.transition(CaptureStatus::Idle, at);
         Ok(())
     }
 
@@ -410,6 +423,22 @@ mod tests {
         assert_eq!(lifecycle.selected_device(), Some(&input));
         assert_eq!(lifecycle.last_error(), None);
         assert_eq!(lifecycle.transitioned_at(), Some(&started_at));
+    }
+
+    #[test]
+    fn cancels_an_unarmed_preparation_without_publishing_recording() {
+        let mut lifecycle = CaptureLifecycle::new();
+        lifecycle
+            .begin_permission_resolution(point(10, 10))
+            .unwrap();
+
+        let cancelled_at = point(20, 20);
+        lifecycle.cancel_preparation(cancelled_at.clone()).unwrap();
+
+        assert_eq!(lifecycle.status(), CaptureStatus::Idle);
+        assert_eq!(lifecycle.transitioned_at(), Some(&cancelled_at));
+        assert!(lifecycle.selected_device().is_none());
+        assert!(lifecycle.last_error().is_none());
     }
 
     #[test]

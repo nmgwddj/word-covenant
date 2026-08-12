@@ -5,20 +5,26 @@ on:
     branches:
       - main
     paths:
-      - "src/**"
-      - "src-tauri/**"
-      - "tests/**"
-      - "pnpm-lock.yaml"
-      - "src-tauri/Cargo.lock"
-      - ".github/workflows/test.yml"
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'tests/**'
+      - 'models/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'src-tauri/Cargo.lock'
+      - '.github/workflows/test.yml'
   pull_request:
     paths:
-      - "src/**"
-      - "src-tauri/**"
-      - "tests/**"
-      - "pnpm-lock.yaml"
-      - "src-tauri/Cargo.lock"
-      - ".github/workflows/test.yml"
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'tests/**'
+      - 'models/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'src-tauri/Cargo.lock'
+      - '.github/workflows/test.yml'
 
 concurrency:
   group: test-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -39,7 +45,10 @@ jobs:
         uses: actions/setup-node@v6.5.0
         with:
           node-version: 24
-          cache: "pnpm"
+          cache: 'pnpm'
 
       - name: Run unit tests
         run: pnpm test
+
+      - name: Run bundled model staging tests
+        run: pnpm test:model-stage

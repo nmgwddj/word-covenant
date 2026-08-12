@@ -1,12 +1,12 @@
-# WordCovenant Product Roadmap and Execution Plan
+# WordCovenant 产品路线图与执行计划
 
-> **For Codex:** Execute this plan in small, tested changes. Do not add an outbound client, cloud model, auto-download, arbitrary hook, or arbitrary shell execution outside the explicit milestone that permits it.
+> **For Codex:** Execute this plan in small, tested changes. Do not add an outbound client, cloud model, runtime auto-download, arbitrary hook, or arbitrary shell execution outside the explicit milestone that permits it.
 
-**Goal:** Deliver a macOS-first, local-first conversation record application whose audio, transcript, speaker data, and Agent context remain on-device unless the user visibly enables a narrowly scoped outbound action.
+**目标：** 交付一款 macOS 优先、本地优先的对话记录应用。除非用户在可见界面中主动启用受限出网动作，否则音频、转写、说话人数据和 Agent 上下文均留在设备上。
 
-**Architecture:** WordCovenant is a modular Tauri desktop application. The Rust process is the sole owner of microphone access, capture time, storage, policy decisions, credentials, model execution, and tool execution. The Vue WebView only renders projections and sends typed intents. Every Agent, skill, hook, model, transcript, and external response may create an action proposal but cannot cause a side effect without the Rust policy and approval path.
+**架构：** WordCovenant 是模块化的 Tauri 桌面应用。Rust 进程是麦克风访问、采集时间、存储、策略决策、凭据、模型执行和工具执行的唯一所有者。Vue WebView 只渲染投影并发送强类型意图。任何 Agent、技能、钩子、模型、转写和外部响应都只能提出动作建议；未经 Rust 策略与批准路径，不能产生副作用。
 
-**Tech Stack:** Tauri 2, Rust, Vue 3, TypeScript, Pinia, SQLite/FTS5, macOS Keychain, CoreAudio/CPAL, Metal-accelerated local ASR, ONNX Runtime, JSON Schema, `tracing`, and native macOS signing/notarization tooling.
+**技术栈：** Tauri 2、Rust、Vue 3、TypeScript、Pinia、SQLite/FTS5、macOS Keychain、CoreAudio/CPAL、Metal 加速的本地 ASR、ONNX Runtime、JSON Schema、`tracing` 以及原生 macOS 签名/公证工具。这里列出的本地 ASR、ONNX Runtime 和说话人模型是目标技术栈，不代表已经完成集成或验证。
 
 ---
 
@@ -23,14 +23,14 @@
 4. Turning off the visible switch instantly blocks all future egress. Revoking a profile does the same. Neither one deletes local records.
 5. WebView CSP/capabilities do not grant network or shell access. A future Rust HTTP client is created only after a successful policy decision.
 6. Agent output is typed `PlanV1` data, never executable text. Arbitrary shell commands, arbitrary URLs, native sidecars, and generic MCP tools are not MVP capabilities.
-7. Diarization initially assigns anonymous clusters. A display name or voiceprint profile is explicit user data, not an identity claim inferred from ambient audio.
+7. 当前 M3.0 仅由用户手动创建和改派会话内匿名簇；自动说话人分离尚未提供。未来若引入显示名称或声纹档案，均必须是明确的用户数据，且绝不能由环境音频推断成身份声明。
 8. The current SHA-256 audit chain binds local records and detects modifications that do not recompute the chain. A Keychain-backed seal is required before claiming resistance to an attacker who can rewrite or truncate SQLite; it also does not prove legal enforceability or non-repudiation.
 
 ### MVP definition
 
-The first usable release is a visible local recorder that lets a macOS user start/stop capture, see final Chinese transcript spans with capture-time timestamps and anonymous speaker clusters, search/correct those spans, and manually trigger a local Agent action. It works offline after the user imports local models. It shows all recording, model, egress, approval, gap, and action decisions in local history.
+第一版可用版本是可见的本地录音器：macOS 用户能够开始/停止采集、查看带采集时间戳的最终中文转写片段、手动创建/修正会话内匿名说话人簇、搜索/修正这些片段，并手动触发本地 Agent 动作。受审查的多语种 Whisper `ggml-large-v3-turbo-q5_0.bin` 随 macOS 安装包提供并在本机验证，因此正常离线录音不要求用户下载、导入或填写模型元数据；用户导入的模型只可作为高级本地覆盖。它会在本地历史中显示录音、模型、出网、批准、间隙和动作决策。
 
-Not MVP: automatic human identification from a voiceprint, ambient/background recording, overlap separation guarantees, cloud transcription, automatic model downloads, unattended external actions, generic plugins, legal-contract claims, or a cross-device sync service.
+Not MVP: automatic human identification from a voiceprint, ambient/background recording, overlap separation guarantees, cloud transcription, runtime automatic model downloads, unattended external actions, generic plugins, legal-contract claims, or a cross-device sync service.
 
 ## Current Baseline and Immediate Work
 
@@ -44,7 +44,9 @@ Not MVP: automatic human identification from a voiceprint, ambient/background re
 | Done | M1 lifecycle foundation | Typed permission/recording/interruption state machine behind the macOS callback boundary |
 | Awaiting manual acceptance | M1 native input adapter | CoreAudio/CPAL input and microphone lifecycle code exist; the real-device exit gate remains the M1 manual acceptance run. The native source is not yet an ASR ingress. |
 | In progress | M2.1 pure Rust/local mock speech pipeline contract | Deterministic local mock PCM exercises the bounded pipeline and final transcript persistence. It does not consume the real CPAL ingress and does not claim a real VAD or `whisper.cpp` adapter. |
-| Pending | M2.2 native capture-to-inference bridge | Replace the current single-consumer meter path with one dispatcher, use two-phase startup and bounded ASR job/result queues, define backpressure/inference-gap behavior, then complete a real macOS manual run. |
+| 代码已实现，待真实 macOS 人工验收 | M2.2 native capture-to-inference bridge | 单一 dispatcher、`Starting -> Recording` 两阶段启动、16/48 kHz 预检、有界 ASR job/result 队列、显式 inference gap、drain 与 generation fence 均已实现；它是 M2.3 本地模型运行时的基础，M2.2 单独不代表真实 VAD、`whisper.cpp`/Metal 或模型质量已完成。 |
+| 代码已实现，待真实 macOS 人工验收 | M2.3 real local speech experience | macOS 包内受审查的多语种 `ggml-large-v3-turbo-q5_0.bin` 由发布流程校验摘要，并以签名 App Bundle 作为运行时信任边界；WebRTC VAD、whisper.cpp/Metal、本地最终转写与时间线投影均已接通。高级本地导入只作本次进程覆盖。真实麦克风、模型质量、停止收尾、输入中断和零出网仍须按 M2.3 清单在同一构建上验收。 |
+| 代码已实现，完整离线验收就绪 | M3.0 手动匿名说话人修正 | 可在单个会话中创建匿名簇、修订显示名称，并将当前最终转写片段改派或改回未归类。簇、标签和改派均为 SQLite 仅追加记录并绑定审计链；过期、部分、跨会话、无效或已别名目标会被拒绝。它不是自动说话人分离，不含嵌入、声纹/语音档案、置信度、重叠判定或身份声明；合并/拆分的端到端操作也尚未提供。 |
 
 ## Target Architecture
 
@@ -52,7 +54,7 @@ Not MVP: automatic human identification from a voiceprint, ambient/background re
 flowchart LR
   MIC["macOS input device"] --> CAP["Rust capture adapter\nclock + bounded PCM queue"]
   CAP --> DISPATCH["Single native dispatcher\nmeter + bounded ASR job queue"]
-  DISPATCH --> PIPE["Local pipeline\nresample, VAD, ASR, diarization"]
+  DISPATCH --> PIPE["Local pipeline\nresample, VAD, ASR; future diarization"]
   PIPE --> DB["Encrypted local records\nSQLite / audio chunks"]
   DB --> UI["Vue timeline, search, corrections"]
   UI --> TRIGGER["Manual Agent trigger"]
@@ -133,7 +135,7 @@ TranscriptSpan {
 
 ### M2: Offline Speech Understanding
 
-**Outcome:** Explicitly installed local models produce revisioned Chinese transcript spans without automatic downloads.
+**Outcome:** A reviewed local model bundled with macOS releases produces revisioned Chinese transcript spans without runtime downloads; separately imported local models remain optional advanced overrides.
 
 #### M2.1：纯 Rust / 本地 mock 管线合约（进行中）
 
@@ -148,52 +150,122 @@ VAD，也不是 `whisper.cpp`/Metal 绑定。M2.1 不会给真实 CPAL ingress �
 持久化及 final 的审计写入。通过这些测试不等于真实 macOS 采集、真实 VAD、真实
 ASR 或质量指标已通过。
 
-#### M2.2：真实采集到推理的桥接（待实现）
+#### M2.2：真实采集到推理的桥接（代码已实现；真实 macOS 人工验收待执行）
 
-**目标：** 把 M2.1 的本地管线接到真实原生采集，但不让实时回调、WebView 或任意
-未授权的网络路径拥有推理或外发能力。M2.2 是 ingress、生命周期和背压的工作，
-不是对真实模型质量的声明。
+**目标：** 将 M2.1 的本地管线接入真实原生采集，同时保持实时回调、WebView 和未授权
+网络路径都不拥有推理或外发能力。M2.2 证明 ingress、生命周期、背压和审计语义的代码
+实现；它不声明真实模型质量。
 
-**必做项：**
+**已实现范围：**
 
-1. 用一个原生 dispatcher 取代当前 `CaptureIngress` 的单一电平消费者。该 dispatcher
-   是唯一读取 PCM 的位置，并向紧凑电平投影和 ASR job 路径分发；不得通过第二个
-   `try_consume` 循环竞争同一队列。
-2. 实现两阶段启动：先创建会话、dispatcher 与所有有界工作资源且不公布 `Recording`；
-   仅在这些资源就绪后启动/交接 CPAL 流，并在交接成功后才公布录音状态。任一阶段
-   失败都必须回收已创建资源，保留非录音的可见状态，且不伪造时间线。
-3. 为 ASR job 和 result 各建立有界队列，定义容量、停止语义和可观察计数。job 或
-   result 满时的行为必须是显式的背压和带采集范围的 inference/transcript gap（或
-   等价的可审计终态），不能无声丢弃，也不能让回调阻塞或让内存无界增长。
-4. 保持 PCM 不跨 Tauri IPC；回调仍只做有限归一化和入队，推理、持久化、UI 更新都
-   在回调之外执行。停止、设备丢失和重启期间，未完成范围要么按已定义顺序完成，
-   要么被明确标记为未推理/缺口。
-5. 完成 [M1 macOS 真实采集人工验收清单](2026-08-08-m1-macos-real-capture-manual-acceptance.md)
-   中新增的 M2.2 追加场景；没有同一构建的真实硬件记录，不得把桥接路径标记为完成。
+1. 每个活跃原生运行时只有一个 `CaptureDispatcher` 读取 `CaptureIngress`。它同时投影
+   紧凑电平并向有界 ASR job 队列分发，PCM 不跨 Tauri IPC、日志、SQLite 或 WebView。
+2. 启动使用 `Starting -> Recording` 两阶段：先构造 parked dispatcher 与有界资源并交接
+   CPAL，再持久化启动审计束；只有 `arm_after_commit` 成功后才公布 `Recording`。`Starting`
+   不会被隐私状态或前端当作正在录音，提交前积压的 PCM 会丢弃；任何阶段失败都会回收
+   资源，不伪造会话或时间线。
+3. 原生输入目前只预检并支持 16 kHz 与 48 kHz；44.1 kHz 等其他配置明确拒绝，等待独立
+   验证的重采样工作，不以静默降级冒充支持。
+4. ASR job 与 result 都使用固定容量队列和可观察计数。job/result 饱和分别生成带采集
+   范围的 `job_queue_saturated`/`result_queue_saturated` inference gap；缺少可执行本地
+   引擎生成 `local_engine_unavailable` gap，不会制造 fixture 文本。gap 与审计事件原子
+   绑定，重复持久化可按同一 gap ID 幂等重放。
+5. 停止先关闭 CPAL，再 drain ingress、job、worker-held 和 result outcome；每个已接纳
+   范围在 `SessionStopped` 前成为 final 或 gap。停止事件使用同一连续采集时钟点，runtime
+   generation/segment fence 会拒绝迟到结果进入重启后的会话。
+6. 本里程碑没有新增 HTTP 客户端、客户端运行时模型下载或连接开启路径。可见的“允许出网”开关仍是
+   任何未来出网的必要条件，匹配审批仍是额外条件；M2.2 本身在开关关闭或开启时都不应
+   发起出网。
 
-**后续本地模型适配：** 真实 VAD 与 `whisper.cpp`/Metal 仍是 M2 的独立工作，必须
-在选定模型、显式导入和本地基准完成后才可宣称可用。模型注册表继续记录文件路径、
-SHA-256、模型卡/许可证确认、输入格式、大小和版本；partial 只用于显示，Agent
-只能收到不可变 final，修订不能覆盖原始模型输出。
+**待执行出口：** 完成 [M1 macOS 真实采集人工验收清单](2026-08-08-m1-macos-real-capture-manual-acceptance.md)
+中的 M2.2-0 至 M2.2-7，并保留同一构建的设备、时钟、队列/gap、generation 和零出网
+证据。代码已实现不等于真实硬件验收完成。
+
+**后续本地模型适配：** M2.3 已接入真实 WebRTC VAD 与 `whisper.cpp`/Metal 运行时；
+macOS 安装包内置、经审查的多语种 `ggml-large-v3-turbo-q5_0.bin` 会在发布期完成摘要校验，
+并以签名 App Bundle 作为运行时信任边界后成为默认 ASR。模型注册表保留给
+可选高级本地导入，继续记录其文件路径、SHA-256、模型卡/许可证确认、输入格式、大小和
+版本；高级覆盖只在当前进程有效。partial 只用于显示，Agent 只能收到不可变 final，修订
+不能覆盖原始模型输出。代码接通不等于质量验收，真实模型/硬件/零出网证据见
+[M2.3 真实本地语音体验验收清单](2026-08-10-m2-3-real-local-speech-acceptance.md)。
 
 **M2 验收目标：** M2.1 的离线 fixture 测试只证明管线合约；M2.2 的真实 macOS
-验收只证明 ingress/队列/时间线语义。离线模型导入、Agent 只接收 final、可见模型
-来源以及中文 CER/WER、p95 partial/final 延迟、实时因子、内存、热/能耗和导入时间，
-仍须由已同意、已授权的 fixture 与实际模型基准分别证明。
+验收只证明 ingress/队列/时间线语义。包内默认模型的本机完整性与可用状态、可选高级
+导入、Agent 只接收 final、可见模型来源以及中文 CER/WER、p95 partial/final 延迟、实时
+因子、内存、热/能耗和高级导入时间，仍须由已同意、已授权的 fixture 与实际模型基准
+分别证明。
 
-### M3: Speaker Workflow
+#### M2.3：真实本地语音体验（代码已实现；真实 macOS 人工验收待执行）
 
-**Outcome:** The timeline groups sufficiently clear non-overlapping speech into anonymous, correctable clusters.
+**结果：** macOS 安装包内置、经审查的多语种 Whisper `ggml-large-v3-turbo-q5_0.bin` 在本机验证后即为
+默认 ASR；正常录音无需用户下载、导入或填写模型元数据。真实麦克风经过 WebRTC VAD 和
+独立的本地 Whisper worker 后，最终中文转写通过既有 SQLite/审计事务写入时间线。原生文件
+导入只保留为高级本地模型的临时覆盖。此结果只描述匿名、最终的语音转文字路径，不描述
+自动说话人区分。
 
-**Tasks:**
+**已实现范围：**
 
-1. Add local speaker embedding adapter and online cosine-similarity clustering with a calibrated ambiguity threshold.
-2. Persist an embedding reference/hash separately from transcript projection; encrypt or delete it with the cluster.
-3. Show `Speaker 1/2/...`, confidence, overlap/uncertain labels, and manual rename/merge/split controls.
-4. Require an explicit consent flow for mapping an anonymous cluster to a profile. Support deletion, re-enrolment, and all related audit events.
-5. Benchmark diarization error rate and wrong-assignment rate on consented, licensed fixtures; test ambiguity paths.
+1. 内置默认模型使用精确的 `whisper.cpp-ggml` 格式。应用启动时会将包内
+   `manifest.json` 与编译进可执行文件的审查锁逐项比对，并只检查常规文件与大小；不会
+   读取模型计算运行时 SHA-256。资源绝对路径是 native-only 能力，不会跨 Tauri IPC，也不会
+   被写成用户导入或导入审计记录。
+2. 内置默认模型验证成功后自动成为当前进程的活动 ASR，用户只需主动开始录音。资源缺失、
+   清单/格式/大小不一致或加载失败均在麦克风准备前失败关闭，不生成 fixture/synthetic
+   文本，也不回退到云端或系统识别。用户可显式选择兼容的高级本地导入模型作本次进程覆盖，
+   重启后恢复内置默认模型。
+3. WebRTC VAD 只处理原生内存中的 16 kHz 单声道 10 ms 帧；临时 `i16` PCM 不序列化、
+   不写入 SQLite、审计记录、日志或 WebView。Whisper 仅产生带经验证模型来源的中文
+   final 记录，禁用翻译与自动语言检测。
+4. 单一 dispatcher 仍是唯一 PCM 消费者。Whisper runtime 属于有界、单 worker 的 ASR
+   路径，避免模型推理阻塞 CoreAudio 回调；最终结果只以会话 ID 与修订号投影给前端，
+   前端再从本地 SQLite 查询时间线。
+5. 停止、队列饱和、模型失败、文件篡改和输入中断均须成为最终转写或范围明确的 gap，
+   而不是静默丢弃或伪造连续记录。runtime generation fence 拒绝迟到结果。
+6. 已安装客户端没有 HTTP 模型客户端、模型 URL、运行时自动下载、更新、恢复、云 ASR
+   或出网回退。发布/CI 仅可在显式构建步骤中取得已锁定的工件；应用启动后仍默认拒绝
+   出网，即使用户日后显式打开会话开关，M2.3 路径也不应建立网络连接。
 
-**Acceptance targets:** no automatic personal-name assertion; overlapping/uncertain speech remains visibly uncertain; edits are revisioned and reversible.
+**人工验收出口：** 必须在同一可识别构建上完成
+[M2.3 真实本地语音体验验收清单](2026-08-10-m2-3-real-local-speech-acceptance.md)，
+记录包内模型清单/SHA/许可证证据、16/48 kHz 设备、允许/拒绝权限、安静/中文语句、
+静音、停止中语句、篡改模型和进程级零出网观察。没有这些硬件记录时，不能宣称真实转写
+质量已经验收。
+
+**M2.3 明确不提供：** 自动说话人区分、自动聚类、声纹/语音档案、声纹匹配、真实身份
+识别、跨会话关联、重叠说话分离、嵌入持久化或客户端运行时模型下载。当前人工匿名簇
+工作流保持为后续的人工修正入口，不能作为自动说话人能力的证据。
+
+### M3.0：手动匿名说话人修正（代码已实现，完整离线验收就绪）
+
+**结果：** 时间线中的当前最终转写片段可由用户手动归入会话内匿名簇，或改回未归类。系统不从音频自动推断说话人，也不宣称任何簇对应真实的人。
+
+**已实现范围：**
+
+1. 每个簇都使用会话内、不含身份信息的本地不透明 ID 和匿名序号；初始标签以及之后的用户输入标签都是显示元数据，不是身份声明。
+2. 簇、标签修订和可用的别名基础记录均使用本地 SQLite 的仅追加表和修订链保存，并绑定 SHA-256 审计事件。历史转写和名称不会被原地覆盖。
+3. 前端以扁平的管理面板显示目录。用户可创建匿名簇、重命名当前簇，并把一个当前最终版转写片段改派给活动匿名簇或改回未归类。
+4. 改派会创建一条 `UserEdited` 最终转写修订和一个专用审计事件，同时保留文本、采集时间、墙上时钟时间和模型来源。请求必须携带当前修订；过期、部分、未知、跨会话、无效或已别名目标都会在写入前被拒绝。
+5. 原始 PCM 不会跨 Tauri IPC 进入 WebView，也不会写入 SQLite、审计记录或日志。M3.0 没有 PCM 查看、导出或调试接口。
+
+**M3.0 明确不提供：** 自动说话人分离或自动聚类、嵌入向量、声纹/语音档案、声纹匹配、跨会话关联、置信度、重叠/不确定性判定、真实身份确认或声明。用户输入的名称不改变这一边界。合并和拆分的端到端用户命令与界面也不属于当前实现，虽有仅追加别名数据模型基础，但不能据此宣称此功能可用。
+
+**出网与模型边界：** M3.0 未新增 HTTP 客户端、客户端运行时模型下载或出网请求。应用启动和重启后仍默认拒绝出网；即使用户日后主动打开本次会话的可见出网总开关，也仍需要匹配的具名工具、HTTPS 源站和数据范围审批。说话人修正本身不会因开关状态而请求网络。
+
+**离线验收门槛：** 以下矩阵必须在不触发客户端运行时模型下载、不创建网络客户端、不暴露 PCM 且不改变默认出网拒绝行为的前提下通过，才能将 M3.0 标记为已验收：
+
+```sh
+cargo fmt --manifest-path src-tauri/Cargo.toml --check
+cargo test --manifest-path src-tauri/Cargo.toml --offline
+cargo check --manifest-path src-tauri/Cargo.toml --release --offline
+pnpm test --run
+pnpm type-check
+pnpm build
+git diff --check
+```
+
+### M3 后续：本地说话人分离的独立研究与验收（未开始）
+
+未来的本地说话人分离必须另行设计和批准，不能把 M3.0 的人工修正当作自动归因能力。前置条件包括：明确的生物特征数据威胁模型、用户同意与删除/重新登记流程、完全本地的嵌入适配器、经许可且获同意的测试样本、歧义阈值以及说话人分离错误率和误归类率基准。通过后仍只能分配匿名簇，不能自动声明真实个人身份。
 
 ### M4: Agent Actions and Controlled Tools
 
@@ -244,14 +316,14 @@ SHA-256、模型卡/许可证确认、输入格式、大小和版本；partial �
 ```text
 M0.1 egress gate -------------------------------------------> M4 HTTP profiles
 M1 native input ---------------------------------------------+
-M2.1 pure Rust/mock contract --------------------------------+--> M2.2 dispatcher + queues --> native VAD/ASR --> M3 clustering
+M2.1 pure Rust/mock contract --------------------------------+--> M2.2 dispatcher + queues --> native VAD/ASR --> future automatic diarization
 M2 model registry -------------------------------------------+
-M2 final transcript events --------------------------------------> M4 Agent context --> M5 declarative skills
+M2 final transcript events --------------------------------------> M3.0 manual catalog/corrections --> M4 Agent context --> M5 declarative skills
 M0 audit core ---------------------------------------------------> M4 / M5 / M6
 M1 permission/release work -------------------------------------> M6 notarization
 ```
 
-The safe parallel units are UI-only policy projections, pure Rust policy tests, M2.1 fixture/benchmark tooling, and documentation. M2.1 may remain independent of the real CPAL consumer while its deterministic contract is tested. The following must stay sequenced: M2.2's single dispatcher before any native ASR consumer; two-phase startup and bounded job/result queues before M2.2 hardware acceptance; real VAD/ASR bindings and model benchmarks after the bridge; actual HTTP client after M0.1+M4 policy/approval paths; voiceprint naming after anonymous clustering; executable hooks after declarative skills; encryption migration after a threat-model decision.
+可安全并行的单元包括仅 UI 的策略投影、纯 Rust 策略测试、M2.1 fixture/基准工具、M3.0 手动目录/修正和文档。M2.1 在确定性契约被测试期间可以保持独立于真实 CPAL 消费者。必须保持顺序的工作包括：M2.2 的单一 dispatcher 必须先于任何原生 ASR 消费者；两阶段启动与有界 job/result 队列必须先于 M2.2 硬件验收；真实 VAD/ASR 绑定和模型基准必须在桥接后进行；自动说话人分离、嵌入或任何声纹档案必须在独立隐私设计、同意流程和基准之后进行；实际 HTTP 客户端必须在 M0.1+M4 策略/批准路径后引入；可执行钩子必须在声明式技能之后引入；加密迁移必须在威胁模型决策后进行。
 
 ## Non-Functional Gates
 
@@ -273,7 +345,7 @@ The safe parallel units are UI-only policy projections, pure Rust policy tests, 
 | --- | --- | --- |
 | Recording/biometric law differs by place | Visible recording, anonymous clusters by default, consent/revocation/deletion, jurisdiction-specific legal review | Block broad release until legal review |
 | Single mic cannot separate overlap reliably | Label uncertainty/overlap; do not infer a speaker | Never advertise guaranteed attribution |
-| Model license or weights restrict use | Record model provenance/license at import | Block model from production registry |
+| Model license or weights restrict use | 审查并记录包内模型的来源/许可证；高级导入仍记录用户确认 | 阻止未审查模型进入默认发布包 |
 | UI switch is bypassed by backend/plugin | Central Rust gate, static deny-by-default capabilities, regression tests | Block release on any bypass |
 | TTS feeds back into transcription/Agent | Pause triggering during local playback; later add AEC/source tagging | Limit MVP behavior until tested |
 | Native sidecars inherit user rights | Exclude from normal product; developer mode only after design review | Do not ship in MVP |
