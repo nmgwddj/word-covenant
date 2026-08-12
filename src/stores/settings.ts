@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { wordCovenantApi } from '@/lib/wordCovenantApi'
-import type { SpeechDetectionSettings } from '@/types'
+import type { SpeechDetectionSettings, VoiceProfile } from '@/types'
 
 export const defaultSpeechDetectionSettings: SpeechDetectionSettings = {
   mode: 'adaptive',
@@ -24,6 +24,10 @@ export const useSettingsStore = defineStore('settings', {
     isLoadingSpeechDetection: false,
     isSavingSpeechDetection: false,
     speechDetectionError: null as string | null,
+    voiceProfiles: [] as VoiceProfile[],
+    isLoadingVoiceProfiles: false,
+    pendingVoiceProfileId: null as string | null,
+    voiceProfileError: null as string | null,
   }),
 
   actions: {
@@ -31,9 +35,14 @@ export const useSettingsStore = defineStore('settings', {
       this.speechDetectionError = null
     },
 
+    clearVoiceProfileError() {
+      this.voiceProfileError = null
+    },
+
     async initialize() {
       this.isLoadingSpeechDetection = true
       this.clearSpeechDetectionError()
+      const voiceProfiles = this.loadVoiceProfiles()
       try {
         this.speechDetection = await wordCovenantApi.getSpeechDetectionSettings()
       } catch {
@@ -41,6 +50,7 @@ export const useSettingsStore = defineStore('settings', {
       } finally {
         this.isLoadingSpeechDetection = false
       }
+      await voiceProfiles
     },
 
     async setSpeechDetection(settings: SpeechDetectionSettings) {
@@ -66,6 +76,64 @@ export const useSettingsStore = defineStore('settings', {
 
     async setRmsThresholdDbfs(rmsThresholdDbfs: number) {
       return this.setSpeechDetection({ mode: 'manual', rmsThresholdDbfs })
+    },
+
+    async loadVoiceProfiles() {
+      this.isLoadingVoiceProfiles = true
+      this.clearVoiceProfileError()
+      try {
+        this.voiceProfiles = await wordCovenantApi.listVoiceProfiles()
+      } catch {
+        this.voiceProfileError = '无法读取本机声纹档案'
+      } finally {
+        this.isLoadingVoiceProfiles = false
+      }
+    },
+
+    async runVoiceProfileMutation(profileId: string, operation: () => Promise<VoiceProfile[]>) {
+      if (this.pendingVoiceProfileId) return false
+      this.pendingVoiceProfileId = profileId
+      this.clearVoiceProfileError()
+      try {
+        this.voiceProfiles = await operation()
+        return true
+      } catch (error) {
+        this.voiceProfileError = error instanceof Error ? error.message : '声纹档案操作未完成'
+        return false
+      } finally {
+        this.pendingVoiceProfileId = null
+      }
+    },
+
+    async renameVoiceProfile(profile: VoiceProfile, displayName: string) {
+      return this.runVoiceProfileMutation(profile.id, () =>
+        wordCovenantApi.renameVoiceProfile({
+          profileId: profile.id,
+          expectedRevision: profile.revision,
+          displayName,
+        })
+      )
+    },
+
+    async relearnVoiceProfile(profile: VoiceProfile) {
+      return this.runVoiceProfileMutation(profile.id, () =>
+        wordCovenantApi.relearnVoiceProfile({ profileId: profile.id, expectedRevision: profile.revision })
+      )
+    },
+
+    async addVoiceProfileConfirmedSample(profile: VoiceProfile) {
+      return this.runVoiceProfileMutation(profile.id, () =>
+        wordCovenantApi.addVoiceProfileConfirmedSample({
+          profileId: profile.id,
+          expectedRevision: profile.revision,
+        })
+      )
+    },
+
+    async deleteVoiceProfile(profile: VoiceProfile) {
+      return this.runVoiceProfileMutation(profile.id, () =>
+        wordCovenantApi.deleteVoiceProfile({ profileId: profile.id, expectedRevision: profile.revision })
+      )
     },
   },
 })

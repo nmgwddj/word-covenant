@@ -11,10 +11,12 @@ import type {
   LocalModelImportInput,
   PrivacyStatus,
   RegisteredModel,
+  SessionSummary,
   SpeechDetectionSettings,
   SpeakerCluster,
   SpeakerOperationResult,
   TranscriptSpan,
+  VoiceProfile,
 } from '@/types'
 
 const demoSessionId = 'local-demo-session'
@@ -25,6 +27,7 @@ let demoSession: CaptureSession | null = null
 let demoActions: AgentAction[] = []
 let demoEgressEnabled = false
 let browserActiveLocalAsrProfile: ActiveLocalAsrProfile | null = null
+const browserDeletedSessionIds = new Set<string>()
 let browserSpeechDetectionSettings: SpeechDetectionSettings = {
   mode: 'adaptive',
   rmsThresholdDbfs: -10,
@@ -35,6 +38,15 @@ const browserBundledAsrStatus: BundledAsrStatus = {
   message: '浏览器预览不包含内置本地转写模型',
 }
 const browserSpeakerClustersBySession = new Map<string, SpeakerCluster[]>()
+let browserVoiceProfiles: VoiceProfile[] = []
+const browserDemoSessionSummary: SessionSummary = {
+  id: demoSessionId,
+  startedAt: '2026-08-11T09:00:00.000Z',
+  startedMonotonicNs: 0,
+  stoppedAt: '2026-08-11T09:00:12.000Z',
+  state: 'stopped',
+  transcriptCount: 3,
+}
 
 const browserCaptureProjection: CaptureProjection = {
   revision: 0,
@@ -104,6 +116,7 @@ const demoSpeakerClusters: SpeakerCluster[] = [
     mergedIntoClusterId: null,
     canonicalClusterId: 'speaker-1',
     spanCount: 2,
+    canEnrollVoiceProfile: true,
   },
   {
     id: 'speaker-2',
@@ -115,6 +128,7 @@ const demoSpeakerClusters: SpeakerCluster[] = [
     mergedIntoClusterId: null,
     canonicalClusterId: 'speaker-2',
     spanCount: 1,
+    canEnrollVoiceProfile: true,
   },
 ]
 
@@ -165,6 +179,20 @@ function createDemoSession(id = demoSessionId): CaptureSession {
     stoppedAt: null,
     state: 'recording',
   }
+}
+
+function browserSessionSummaries(): SessionSummary[] {
+  const summaries = browserDeletedSessionIds.has(demoSessionId) ? [] : [{ ...browserDemoSessionSummary }]
+  if (browserDevelopmentMock && !browserDeletedSessionIds.has(browserDevelopmentMock.session.id)) {
+    summaries.push({
+      ...browserDevelopmentMock.session,
+      transcriptCount: browserDevelopmentMock.timeline.filter(span => span.isFinal).length,
+    })
+  }
+
+  return summaries.sort(
+    (left, right) => Date.parse(right.startedAt) - Date.parse(left.startedAt) || right.id.localeCompare(left.id)
+  )
 }
 
 function browserMockProgress(newSpans: TranscriptSpan[] = []): DevelopmentMockProgress {
@@ -373,11 +401,32 @@ export const wordCovenantApi = {
     return demoSession
   },
 
+  async listSessions(): Promise<SessionSummary[]> {
+    if (isTauriRuntime()) {
+      return invoke<SessionSummary[]>('list_sessions')
+    }
+
+    return browserSessionSummaries()
+  },
+
+  async deleteSession(sessionId: string): Promise<void> {
+    if (isTauriRuntime()) {
+      return invoke<void>('delete_session', { input: { sessionId } })
+    }
+
+    const session = browserSessionSummaries().find(summary => summary.id === sessionId)
+    if (!session) throw new Error('会话不存在或已删除')
+    if (session.state !== 'stopped') throw new Error('录音中的会话不能删除，请先停止录音')
+    browserDeletedSessionIds.add(sessionId)
+    browserSpeakerClustersBySession.delete(sessionId)
+  },
+
   async listTimeline(sessionId?: string): Promise<TranscriptSpan[]> {
     if (isTauriRuntime()) {
       return invoke<TranscriptSpan[]>('list_timeline', { sessionId })
     }
 
+    if (sessionId && browserDeletedSessionIds.has(sessionId)) return []
     if (browserDevelopmentMock && (!sessionId || sessionId === browserDevelopmentMock.session.id)) {
       return browserDevelopmentMock.timeline
     }
@@ -414,6 +463,7 @@ export const wordCovenantApi = {
       mergedIntoClusterId: null,
       canonicalClusterId: id,
       spanCount: 0,
+      canEnrollVoiceProfile: false,
     })
     return browserSpeakerOperationResult(input.sessionId)
   },
@@ -423,6 +473,7 @@ export const wordCovenantApi = {
     clusterId: string
     expectedLabelRevision: number
     label: string
+    consent: boolean
   }): Promise<SpeakerOperationResult> {
     if (isTauriRuntime()) {
       return invoke<SpeakerOperationResult>('rename_speaker_cluster', { input })
@@ -440,13 +491,91 @@ export const wordCovenantApi = {
     if (!label) {
       throw new Error('名称不能为空')
     }
+    const existingProfile = browserVoiceProfiles.find(
+      profile => profile.id === `browser-profile-${input.sessionId}-${input.clusterId}`
+    )
+    if (!existingProfile && !input.consent) {
+      throw new Error('需要明确同意在本机建立声纹档案')
+    }
 
     Object.assign(cluster, {
       label,
       isUserNamed: true,
       labelRevision: cluster.labelRevision + 1,
     })
+    if (existingProfile) {
+      existingProfile.displayName = label
+      existingProfile.revision += 1
+      existingProfile.updatedAt = new Date().toISOString()
+    } else {
+      browserVoiceProfiles = [
+        {
+          id: `browser-profile-${input.sessionId}-${input.clusterId}`,
+          revision: 2,
+          displayName: label,
+          state: 'learning',
+          confirmedDurationNs: 2_800_000_000,
+          readyConfirmedDurationNs: 4_000_000_000,
+          modelId: 'speech-campplus-sv-zh-en-16k-common-advanced',
+          modelVersion: '2024-10-14',
+          lastConfirmationAt: new Date().toISOString(),
+          canAddConfirmedSample: false,
+          updatedAt: new Date().toISOString(),
+        },
+        ...browserVoiceProfiles,
+      ]
+    }
     return browserSpeakerOperationResult(input.sessionId)
+  },
+
+  async listVoiceProfiles(): Promise<VoiceProfile[]> {
+    if (isTauriRuntime()) return invoke<VoiceProfile[]>('list_voice_profiles')
+    return browserVoiceProfiles.map(profile => ({ ...profile }))
+  },
+
+  async renameVoiceProfile(input: {
+    profileId: string
+    expectedRevision: number
+    displayName: string
+  }): Promise<VoiceProfile[]> {
+    if (isTauriRuntime()) return invoke<VoiceProfile[]>('rename_voice_profile', { input })
+    const profile = browserVoiceProfiles.find(item => item.id === input.profileId)
+    if (!profile || profile.revision !== input.expectedRevision) throw new Error('声纹档案已变化，请刷新')
+    profile.displayName = input.displayName.trim()
+    profile.revision += 1
+    profile.updatedAt = new Date().toISOString()
+    return browserVoiceProfiles.map(item => ({ ...item }))
+  },
+
+  async relearnVoiceProfile(input: { profileId: string; expectedRevision: number }): Promise<VoiceProfile[]> {
+    if (isTauriRuntime()) return invoke<VoiceProfile[]>('relearn_voice_profile', { input })
+    const profile = browserVoiceProfiles.find(item => item.id === input.profileId)
+    if (!profile || profile.revision !== input.expectedRevision) throw new Error('声纹档案已变化，请刷新')
+    Object.assign(profile, {
+      revision: profile.revision + 1,
+      state: 'relearn_required',
+      confirmedDurationNs: 0,
+      lastConfirmationAt: null,
+      canAddConfirmedSample: false,
+      updatedAt: new Date().toISOString(),
+    })
+    return browserVoiceProfiles.map(item => ({ ...item }))
+  },
+
+  async addVoiceProfileConfirmedSample(input: {
+    profileId: string
+    expectedRevision: number
+  }): Promise<VoiceProfile[]> {
+    if (isTauriRuntime()) return invoke<VoiceProfile[]>('add_voice_profile_confirmed_sample', { input })
+    throw new Error('浏览器预览没有新的真实声纹样本')
+  },
+
+  async deleteVoiceProfile(input: { profileId: string; expectedRevision: number }): Promise<VoiceProfile[]> {
+    if (isTauriRuntime()) return invoke<VoiceProfile[]>('delete_voice_profile', { input })
+    const profile = browserVoiceProfiles.find(item => item.id === input.profileId)
+    if (!profile || profile.revision !== input.expectedRevision) throw new Error('声纹档案已变化，请刷新')
+    browserVoiceProfiles = browserVoiceProfiles.filter(item => item.id !== input.profileId)
+    return browserVoiceProfiles.map(item => ({ ...item }))
   },
 
   async reassignTranscriptSpeaker(input: {

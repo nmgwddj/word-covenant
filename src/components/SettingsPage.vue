@@ -2,6 +2,7 @@
 import CaptureSettingsPanel from '@/components/CaptureSettingsPanel.vue'
 import InputDeviceSettings from '@/components/InputDeviceSettings.vue'
 import ModelRegistryPanel from '@/components/ModelRegistryPanel.vue'
+import VoiceProfileSettings from '@/components/VoiceProfileSettings.vue'
 import type {
   ActiveLocalAsrProfile,
   BundledAsrStatus,
@@ -10,6 +11,7 @@ import type {
   LocalModelImportInput,
   RegisteredModel,
   SpeechDetectionSettings,
+  VoiceProfile,
 } from '@/types'
 
 withDefaults(
@@ -34,6 +36,10 @@ withDefaults(
     error?: string | null
     activeAsrError?: string | null
     selectSourcePath?: () => Promise<string | null>
+    voiceProfiles?: VoiceProfile[]
+    loadingVoiceProfiles?: boolean
+    pendingVoiceProfileId?: string | null
+    voiceProfileError?: string | null
   }>(),
   {
     bundledAsrStatus: null,
@@ -53,6 +59,10 @@ withDefaults(
     error: null,
     activeAsrError: null,
     selectSourcePath: undefined,
+    voiceProfiles: () => [],
+    loadingVoiceProfiles: false,
+    pendingVoiceProfileId: null,
+    voiceProfileError: null,
   }
 )
 
@@ -66,7 +76,16 @@ const emit = defineEmits<{
   refreshInputDevices: []
   saveSpeechDetection: [settings: SpeechDetectionSettings]
   clearSpeechDetectionError: []
+  renameVoiceProfile: [profile: VoiceProfile, displayName: string]
+  relearnVoiceProfile: [profile: VoiceProfile]
+  addVoiceProfileSample: [profile: VoiceProfile]
+  deleteVoiceProfile: [profile: VoiceProfile]
+  clearVoiceProfileError: []
 }>()
+
+function emitVoiceProfileRename(profile: VoiceProfile, displayName: string) {
+  emit('renameVoiceProfile', profile, displayName)
+}
 </script>
 
 <template>
@@ -146,6 +165,29 @@ const emit = defineEmits<{
           @clear-active-asr-error="emit('clearActiveAsrError')"
           @import="emit('import', $event)"
           @select-active-asr-model="emit('selectActiveAsrModel', $event)"
+        />
+      </section>
+
+      <section class="settings-page__section" aria-labelledby="voice-profile-settings-title">
+        <header class="settings-page__section-heading">
+          <span class="settings-page__section-icon i-mdi-fingerprint" aria-hidden="true" />
+          <div>
+            <p>LOCAL BIOMETRICS</p>
+            <h3 id="voice-profile-settings-title">声纹档案</h3>
+          </div>
+          <span class="settings-page__local-state">仅本机</span>
+        </header>
+
+        <VoiceProfileSettings
+          :profiles="voiceProfiles"
+          :loading="loadingVoiceProfiles"
+          :pending-profile-id="pendingVoiceProfileId"
+          :error="voiceProfileError"
+          @clear-error="emit('clearVoiceProfileError')"
+          @rename="emitVoiceProfileRename"
+          @relearn="emit('relearnVoiceProfile', $event)"
+          @add-sample="emit('addVoiceProfileSample', $event)"
+          @delete="emit('deleteVoiceProfile', $event)"
         />
       </section>
     </div>

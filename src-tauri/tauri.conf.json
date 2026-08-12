@@ -38,6 +38,8 @@
     "resources": {
       "resources/models/ggml-large-v3-turbo-q5_0.bin": "models/ggml-large-v3-turbo-q5_0.bin",
       "resources/models/manifest.json": "models/manifest.json",
+      "resources/models/speaker-embedding/model.onnx": "models/speaker-embedding/model.onnx",
+      "resources/models/speaker-embedding/manifest.json": "models/speaker-embedding/manifest.json",
       "resources/third-party/whisper-large-v3-turbo-model-card.txt": "third-party/whisper-large-v3-turbo-model-card.txt",
       "resources/third-party/whisper-large-v3-turbo-model-MIT.txt": "third-party/whisper-large-v3-turbo-model-MIT.txt"
     },

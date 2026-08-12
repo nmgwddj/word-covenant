@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import FlatSelect from '@/components/FlatSelect.vue'
 import type { SpeakerCluster, TranscriptSpan } from '@/types'
 
 const props = withDefaults(
@@ -29,6 +30,7 @@ const emit = defineEmits<{
       clusterId: string
       expectedLabelRevision: number
       label: string
+      consent: boolean
     },
   ]
   reassign: [
@@ -45,6 +47,9 @@ const emit = defineEmits<{
 const targetClusterId = ref<string | null>(null)
 const labelEdits = ref<Record<string, string>>({})
 const manager = ref<HTMLElement | null>(null)
+const enrollmentCandidate = ref<SpeakerCluster | null>(null)
+const localError = ref<string | null>(null)
+const displayedError = computed(() => localError.value ?? props.error)
 
 const selectedSpan = computed(() => {
   const span = props.spans.find(item => item.id === props.selectedSpanId)
@@ -59,6 +64,13 @@ const visibleClusters = computed(() => {
 const canReassign = computed(
   () => Boolean(selectedSpan.value) && targetClusterId.value !== selectedSpan.value?.speakerClusterId && !props.pending
 )
+const targetOptions = computed(() => [
+  { value: '', label: '未归类' },
+  ...visibleClusters.value.map(cluster => ({
+    value: cluster.id,
+    label: `${cluster.label} · ${cluster.spanCount} 条记录`,
+  })),
+])
 
 watch(
   () => [selectedSpan.value?.id, selectedSpan.value?.revision, selectedSpan.value?.speakerClusterId],
@@ -105,6 +117,7 @@ onMounted(() => {
 
 function requestCreate() {
   if (!selectedSpan.value || props.pending) return
+  localError.value = null
   emit('clearError')
   emit('create', selectedSpan.value.sessionId)
 }
@@ -113,18 +126,42 @@ function submitRename(cluster: SpeakerCluster) {
   const label = labelEdits.value[cluster.id]?.trim() ?? ''
   if (!label || label === cluster.label || props.pending) return
 
+  if (!cluster.isUserNamed) {
+    if (!cluster.canEnrollVoiceProfile) {
+      emit('clearError')
+      localError.value = '该归类还没有可用于声纹学习的录音，请重新录制一段清晰人声后，为自动生成的说话人归类命名'
+      return
+    }
+    localError.value = null
+    enrollmentCandidate.value = cluster
+    return
+  }
+  requestRename(cluster, false)
+}
+
+function requestRename(cluster: SpeakerCluster, consent: boolean) {
+  const label = labelEdits.value[cluster.id]?.trim() ?? ''
+  if (!label || label === cluster.label || props.pending) return
+  localError.value = null
   emit('clearError')
   emit('rename', {
     sessionId: cluster.sessionId,
     clusterId: cluster.id,
     expectedLabelRevision: cluster.labelRevision,
     label,
+    consent,
   })
+  enrollmentCandidate.value = null
+}
+
+function confirmEnrollment() {
+  if (enrollmentCandidate.value) requestRename(enrollmentCandidate.value, true)
 }
 
 function submitReassignment() {
   if (!selectedSpan.value || !canReassign.value) return
 
+  localError.value = null
   emit('clearError')
   emit('reassign', {
     sessionId: selectedSpan.value.sessionId,
@@ -168,12 +205,15 @@ function submitReassignment() {
       <form class="speaker-manager__assignment" @submit.prevent="submitReassignment">
         <label class="speaker-manager__field" for="speaker-target">
           <span>归类到</span>
-          <select id="speaker-target" v-model="targetClusterId" data-testid="speaker-target">
-            <option :value="null">未归类</option>
-            <option v-for="cluster in visibleClusters" :key="cluster.id" :value="cluster.id">
-              {{ cluster.label }} · {{ cluster.spanCount }} 条记录
-            </option>
-          </select>
+          <FlatSelect
+            id="speaker-target"
+            :model-value="targetClusterId ?? ''"
+            :options="targetOptions"
+            label="归类到说话人"
+            test-id="speaker-target"
+            :disabled="pending"
+            @update:model-value="targetClusterId = $event || null"
+          />
         </label>
         <button
           class="speaker-manager__apply"
@@ -241,6 +281,26 @@ function submitReassignment() {
     </template>
     <p v-else class="speaker-manager__empty">未选择记录片段</p>
 
-    <p v-if="error" class="speaker-manager__error" role="alert">{{ error }}</p>
+    <p v-if="displayedError" class="speaker-manager__error" role="alert">{{ displayedError }}</p>
+
+    <section
+      v-if="enrollmentCandidate"
+      class="speaker-manager__consent"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="voice-enrollment-title"
+    >
+      <span class="speaker-manager__consent-icon i-mdi-fingerprint" aria-hidden="true" />
+      <h3 id="voice-enrollment-title">在本机记住这个声音？</h3>
+      <p>
+        WordCovenant 会将这个说话人的合格片段转为本机声纹档案。原始音频不会保存、不会传到网页，也不会出网。
+      </p>
+      <div class="speaker-manager__consent-actions">
+        <button type="button" :disabled="pending" @click="enrollmentCandidate = null">取消</button>
+        <button type="button" data-testid="confirm-voice-enrollment" :disabled="pending" @click="confirmEnrollment">
+          同意并记住
+        </button>
+      </div>
+    </section>
   </aside>
 </template>

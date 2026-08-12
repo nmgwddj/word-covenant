@@ -9,8 +9,9 @@ use super::{
     AsrBridgeConfig, AsrJobClaim, AsrJobExecution, AsrJobLease, AsrQueueMetrics, CaptureClock,
     CaptureDispatcher, CaptureIngress, DispatcherError, DispatcherMeter, DispatcherRuntime,
     DispatcherStatus, IngressPumpResult, OwnedOutcomeLease, OwnedOutcomeLeaseError,
-    ShutdownDrainResult, ShutdownPreparationResult, WorkerPumpResult,
+    ShutdownDrainResult, ShutdownPreparationResult, SpeakerAnalysis, WorkerPumpResult,
 };
+use crate::diarization::SpeakerEmbeddingEngine;
 use crate::inference::pipeline::{
     EnergyGatedSpeechDetector, EnergySpeechDetector, SpeechActivityDetector, SpeechPipelineConfig,
     SpeechSegmenter,
@@ -148,6 +149,7 @@ impl Default for SpeechDetectionSettings {
 pub struct NativeInferenceEngines {
     vad_detector: Box<dyn SpeechActivityDetector>,
     asr_engine: Option<Box<dyn AsrEngine>>,
+    speaker_engine: Option<Box<dyn SpeakerEmbeddingEngine>>,
 }
 
 impl NativeInferenceEngines {
@@ -156,14 +158,27 @@ impl NativeInferenceEngines {
         D: SpeechActivityDetector + 'static,
         A: AsrEngine + 'static,
     {
-        Self::from_boxed(Box::new(vad_detector), Some(Box::new(asr_engine)))
+        Self::from_boxed(Box::new(vad_detector), Some(Box::new(asr_engine)), None)
+    }
+
+    pub fn with_speaker<D, A, S>(vad_detector: D, asr_engine: A, speaker_engine: S) -> Self
+    where
+        D: SpeechActivityDetector + 'static,
+        A: AsrEngine + 'static,
+        S: SpeakerEmbeddingEngine + 'static,
+    {
+        Self::from_boxed(
+            Box::new(vad_detector),
+            Some(Box::new(asr_engine)),
+            Some(Box::new(speaker_engine)),
+        )
     }
 
     pub fn without_asr<D>(vad_detector: D) -> Self
     where
         D: SpeechActivityDetector + 'static,
     {
-        Self::from_boxed(Box::new(vad_detector), None)
+        Self::from_boxed(Box::new(vad_detector), None, None)
     }
 
     /// Accept boxed engines from a profile/runtime factory without exposing
@@ -171,10 +186,12 @@ impl NativeInferenceEngines {
     pub fn from_boxed(
         vad_detector: Box<dyn SpeechActivityDetector>,
         asr_engine: Option<Box<dyn AsrEngine>>,
+        speaker_engine: Option<Box<dyn SpeakerEmbeddingEngine>>,
     ) -> Self {
         Self {
             vad_detector,
             asr_engine,
+            speaker_engine,
         }
     }
 }
@@ -407,6 +424,7 @@ impl NativeCaptureRuntime {
         let NativeInferenceEngines {
             vad_detector,
             asr_engine,
+            speaker_engine,
         } = engines;
         // Apply the same local RMS floor to injected production VAD engines
         // that the no-engine fallback already receives. The wrapper calls the
@@ -454,6 +472,7 @@ impl NativeCaptureRuntime {
                     asr_control,
                     idle_wait,
                     asr_engine,
+                    speaker_engine,
                     shutdown_inference_attempt_limit,
                 )
             }) {
@@ -727,6 +746,7 @@ fn run_asr_worker(
     control: Arc<RuntimeControl>,
     idle_wait: Duration,
     mut engine: Option<Box<dyn AsrEngine>>,
+    mut speaker_engine: Option<Box<dyn SpeakerEmbeddingEngine>>,
     mut shutdown_attempts_remaining: usize,
 ) {
     loop {
@@ -756,7 +776,7 @@ fn run_asr_worker(
         match claim {
             AsrJobClaim::Claimed(lease) => {
                 let used_shutdown_attempt = snapshot.shutdown_requested;
-                let execution = execute_asr_job(&mut engine, &lease);
+                let execution = execute_asr_job(&mut engine, &mut speaker_engine, &lease);
                 let completion = {
                     let mut dispatcher = recover_mutex(&dispatcher);
                     dispatcher
@@ -800,10 +820,25 @@ fn run_asr_worker(
 
 fn execute_asr_job(
     engine: &mut Option<Box<dyn AsrEngine>>,
+    speaker_engine: &mut Option<Box<dyn SpeakerEmbeddingEngine>>,
     lease: &AsrJobLease,
 ) -> AsrJobExecution {
     let Some(asr_engine) = engine.as_mut() else {
         return AsrJobExecution::EngineUnavailable;
+    };
+    let speaker = match speaker_engine.as_mut() {
+        Some(engine) => {
+            let result = catch_unwind(AssertUnwindSafe(|| engine.embed(&lease.request().audio)));
+            match result {
+                Ok(Ok((embedding, quality))) => SpeakerAnalysis::Available { embedding, quality },
+                Ok(Err(_)) => SpeakerAnalysis::Failed,
+                Err(_) => {
+                    *speaker_engine = None;
+                    SpeakerAnalysis::Failed
+                }
+            }
+        }
+        None => SpeakerAnalysis::Unavailable,
     };
     let model_provenance = asr_engine.model_provenance().clone();
     let result = catch_unwind(AssertUnwindSafe(|| asr_engine.transcribe(lease.request())));
@@ -811,6 +846,7 @@ fn execute_asr_job(
         Ok(result) => AsrJobExecution::EngineResult {
             model_provenance,
             result,
+            speaker: Box::new(speaker),
         },
         Err(_) => {
             // An engine panic still needs a terminal outcome for the active
@@ -820,6 +856,7 @@ fn execute_asr_job(
             AsrJobExecution::EngineResult {
                 model_provenance,
                 result: Err(InferenceError::failed("local ASR engine panicked")),
+                speaker: Box::new(speaker),
             }
         }
     }

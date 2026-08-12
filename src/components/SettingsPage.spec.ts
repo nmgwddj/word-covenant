@@ -28,6 +28,20 @@ const capture = {
   lastIssue: null,
 }
 
+const voiceProfile = {
+  id: 'profile-one',
+  revision: 2,
+  displayName: '主持人',
+  state: 'learning' as const,
+  confirmedDurationNs: 2_000_000_000,
+  readyConfirmedDurationNs: 4_000_000_000,
+  modelId: 'campplus',
+  modelVersion: '2024-10-14',
+  lastConfirmationAt: null,
+  canAddConfirmedSample: false,
+  updatedAt: '2026-08-12T08:00:00.000Z',
+}
+
 describe('SettingsPage', () => {
   test('keeps local model maintenance in a dedicated settings view', async () => {
     const wrapper = mount(SettingsPage, {
@@ -36,12 +50,15 @@ describe('SettingsPage', () => {
         capture,
         compatibleAsrModels: [model],
         activeAsrProfile: { modelId: model.id },
+        voiceProfiles: [voiceProfile],
       },
     })
 
     expect(wrapper.get('#settings-page-title').text()).toBe('设置')
     expect(wrapper.get('#recording-settings-title').text()).toBe('录音与检测')
     expect(wrapper.get('#model-settings-title').text()).toBe('模型与转写')
+    expect(wrapper.get('#voice-profile-settings-title').text()).toBe('声纹档案')
+    expect(wrapper.get('#voice-profile-name-profile-one').attributes('value')).toBe('主持人')
     expect(wrapper.find('[data-testid="input-device-select"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="speech-mode-adaptive"]').exists()).toBe(true)
     expect(wrapper.find('[data-testid="active-asr-model-select"]').exists()).toBe(true)

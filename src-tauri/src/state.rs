@@ -5,8 +5,8 @@ use crate::audio::{
     capture_point_now, DispatcherRuntimeId, NativeCaptureRuntimeConfig, NativeInferenceEngines,
 };
 use crate::audio::{
-    AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime, SpeechDetectionMode,
-    SpeechDetectionSettings,
+    AsrJobMetadata, AsrOutcome, CapturePoint, DispatcherRuntime, SpeakerAnalysis,
+    SpeechDetectionMode, SpeechDetectionSettings,
 };
 #[cfg(target_os = "macos")]
 use crate::audio::{CaptureGap, CaptureProjection, CaptureService};
@@ -16,12 +16,25 @@ use crate::audit::{
     AsrFinalAuditPayload, AsrFinalIdempotencyBinding, AuditKind, AuditStore, AuditStoreError,
     AuditTrail,
 };
+#[cfg(all(target_os = "macos", not(test)))]
+use crate::diarization::OnnxSpeakerEmbeddingEngine;
+#[cfg(target_os = "macos")]
+use crate::diarization::{bundled_speaker_model, SpeakerModelManifest};
+use crate::diarization::{
+    match_speaker_profile, AnonymousSpeakerAssignment, SessionSpeakerClusterer,
+    SpeakerMatchCandidate, SpeakerMatchDecision, SpeakerMatchPolicy,
+};
+use crate::domain::session::{SessionDeletedAuditPayload, SessionSummary};
 #[cfg(target_os = "macos")]
 use crate::domain::CaptureSegment;
 use crate::domain::{
     CaptureSession, DataCategory, SpeakerCluster, SpeakerClusterCreatedAuditPayload,
-    SpeakerClusterLabelRevision, SpeakerClusterRecord, TranscriptModelProvenance,
-    TranscriptRevision, TranscriptSource, TranscriptSpan, TranscriptTiming,
+    SpeakerClusterLabelRevision, SpeakerClusterRecord, SpeakerObservation,
+    SpeakerObservationAuditBinding, SpeakerObservationAuditPayload, SpeakerObservationDecision,
+    SpeakerPrototype, SpeakerPrototypeAuditBinding, TranscriptModelProvenance, TranscriptRevision,
+    TranscriptSource, TranscriptSpan, TranscriptTiming, VoiceProfile, VoiceProfileAuditBinding,
+    VoiceProfileCreatedAuditPayload, VoiceProfileEnrollmentAuditPayload,
+    VoiceProfileRevisionAuditPayload, VoiceProfileState,
 };
 use crate::inference::asr::MAX_ASR_EMISSIONS_PER_REQUEST;
 #[cfg(all(target_os = "macos", not(test)))]
@@ -112,6 +125,22 @@ pub struct SpeakerOperationResult {
     pub updated_spans: Vec<SpeakerSpanRef>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceProfileProjection {
+    pub id: Uuid,
+    pub revision: u32,
+    pub display_name: String,
+    pub state: VoiceProfileState,
+    pub confirmed_duration_ns: u64,
+    pub ready_confirmed_duration_ns: u64,
+    pub model_id: String,
+    pub model_version: String,
+    pub last_confirmation_at: Option<DateTime<Utc>>,
+    pub can_add_confirmed_sample: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// A compact notification that a native final transcript was durably added to
 /// a session timeline. The WebView must reload the timeline to obtain the
 /// transcript itself; this notification intentionally contains no content or
@@ -139,6 +168,15 @@ pub struct ActiveLocalAsrProfile {
 struct FinalTranscriptProjectionState {
     revision: u64,
     latest: Option<FinalTranscriptProjection>,
+}
+
+struct NativeSpeakerPersistence {
+    transcript_cluster_id: Option<String>,
+    cluster_creation: Option<(SpeakerClusterRecord, SpeakerClusterLabelRevision)>,
+    profile_label: Option<SpeakerClusterLabelRevision>,
+    observation: Option<SpeakerObservation>,
+    staged_clusterer: Option<SessionSpeakerClusterer>,
+    profile_cluster_mapping: Option<(Uuid, String)>,
 }
 
 /// Native-only lifetime for the resource shipped within the application
@@ -243,9 +281,13 @@ pub struct AppState {
     speech_detection_settings: Mutex<SpeechDetectionSettings>,
     model_registry: Mutex<ModelRegistry>,
     bundled_asr_runtime: Mutex<BundledAsrRuntime>,
+    #[cfg(target_os = "macos")]
+    bundled_speaker_model: Mutex<Option<(PathBuf, SpeakerModelManifest)>>,
     active_local_asr_profile: Mutex<Option<ActiveLocalAsrProfile>>,
     inference_mapper: Mutex<TranscriptEmissionMapper>,
     final_transcript_projection: Mutex<FinalTranscriptProjectionState>,
+    session_speaker_clusterers: Mutex<BTreeMap<Uuid, SessionSpeakerClusterer>>,
+    session_profile_clusters: Mutex<BTreeMap<(Uuid, Uuid), String>>,
     native_runtime: Mutex<Option<NativeRuntimeFence>>,
     model_root: Option<PathBuf>,
     #[cfg(target_os = "macos")]
@@ -314,9 +356,13 @@ impl AppState {
             speech_detection_settings: Mutex::new(speech_detection_settings),
             model_registry: Mutex::new(model_registry),
             bundled_asr_runtime: Mutex::new(BundledAsrRuntime::default()),
+            #[cfg(target_os = "macos")]
+            bundled_speaker_model: Mutex::new(None),
             active_local_asr_profile: Mutex::new(None),
             inference_mapper: Mutex::new(TranscriptEmissionMapper::default()),
             final_transcript_projection: Mutex::new(FinalTranscriptProjectionState::default()),
+            session_speaker_clusterers: Mutex::new(BTreeMap::new()),
+            session_profile_clusters: Mutex::new(BTreeMap::new()),
             native_runtime: Mutex::new(None),
             model_root,
             #[cfg(target_os = "macos")]
@@ -1513,13 +1559,18 @@ impl AppState {
                 self.record_inference_gap(gap)?;
                 Ok(Vec::new())
             }
-            AsrOutcome::Response { job, response } => {
+            AsrOutcome::Response {
+                job,
+                response,
+                speaker,
+            } => {
                 validate_native_asr_job(runtime, job)?;
                 match validate_native_asr_response(job, response) {
                     Ok(true) => {
                         let projections = self.append_local_asr_response_with_capture_anchor(
                             &session,
                             response.clone(),
+                            speaker,
                             &runtime.capture_anchor,
                         )?;
                         if !projections.is_empty() {
@@ -1650,7 +1701,13 @@ impl AppState {
         }
 
         let session = CaptureSession::begin(point.monotonic_ns, point.wall_clock);
-        self.record_audit(AuditKind::SessionStarted, point.monotonic_ns, &session)?;
+        self.record_session_audit_at(
+            session.id,
+            AuditKind::SessionStarted,
+            point.monotonic_ns,
+            point.wall_clock,
+            &session,
+        )?;
         self.timelines
             .lock()
             .map_err(|_| "timeline state lock poisoned".to_owned())?
@@ -1769,7 +1826,8 @@ impl AppState {
 
             let mut stopped = session.clone();
             stopped.stop(stop_point.wall_clock);
-            self.record_audit_at(
+            self.record_session_audit_at(
+                stopped.id,
                 AuditKind::SessionStopped,
                 stop_point.monotonic_ns,
                 stop_point.wall_clock,
@@ -1780,6 +1838,120 @@ impl AppState {
         };
 
         Ok(Some(stopped))
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, String> {
+        // Snapshot each projection independently. Session and transcript
+        // writers use different lock orders, so this read path must never hold
+        // one lock while acquiring another.
+        let events = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?
+            .events()
+            .to_vec();
+        let live_sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let transcript_counts = self
+            .timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?
+            .iter()
+            .map(|(session_id, timeline)| (*session_id, timeline.len()))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut summaries = session_summary_projections(&events);
+        for session in live_sessions {
+            summaries.insert(session.id, SessionSummary::from(&session));
+        }
+        for summary in summaries.values_mut() {
+            summary.transcript_count = transcript_counts.get(&summary.id).copied().unwrap_or(0);
+        }
+
+        let mut summaries = summaries.into_values().collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.started_monotonic_ns.cmp(&left.started_monotonic_ns))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(summaries)
+    }
+
+    pub fn delete_session(&self, session_id: Uuid) -> Result<(), String> {
+        let summary = self
+            .list_sessions()?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| "会话不存在或已删除".to_owned())?;
+        if summary.state != crate::domain::SessionState::Stopped {
+            return Err("录音中的会话不能删除，请先停止录音".to_owned());
+        }
+
+        let payload = SessionDeletedAuditPayload { session_id };
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let event = trail
+            .next_event(
+                Some(session_id),
+                None,
+                AuditKind::SessionDeleted,
+                self.monotonic_ns(),
+                Utc::now(),
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize session deletion: {error}"))?;
+        self.audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?
+            .delete_session_with_audit(&event, &payload)
+            .map_err(|error| format!("could not delete local session: {error}"))?;
+        if !trail.append_event(event) {
+            return Err("could not append verified session deletion event".to_owned());
+        }
+        drop(trail);
+
+        self.sessions
+            .lock()
+            .map_err(|_| "session state lock poisoned".to_owned())?
+            .remove(&session_id);
+        self.timelines
+            .lock()
+            .map_err(|_| "timeline state lock poisoned".to_owned())?
+            .remove(&session_id);
+        self.inference_mapper
+            .lock()
+            .map_err(|_| "inference mapper lock poisoned".to_owned())?
+            .clear_session(session_id)
+            .map_err(|error| format!("could not clear deleted ASR session: {error}"))?;
+        let mut projection = self
+            .final_transcript_projection
+            .lock()
+            .map_err(|_| "final transcript projection lock poisoned".to_owned())?;
+        if projection
+            .latest
+            .as_ref()
+            .is_some_and(|latest| latest.session_id == session_id)
+        {
+            projection.latest = None;
+        }
+        self.session_speaker_clusterers
+            .lock()
+            .map_err(|_| "speaker clusterer lock poisoned".to_owned())?
+            .remove(&session_id);
+        self.session_profile_clusters
+            .lock()
+            .map_err(|_| "profile speaker cluster lock poisoned".to_owned())?
+            .retain(|(stored_session_id, _), _| *stored_session_id != session_id);
+        Ok(())
     }
 
     pub fn list_timeline(&self, session_id: Option<Uuid>) -> Result<Vec<TranscriptSpan>, String> {
@@ -1898,6 +2070,7 @@ impl AppState {
         cluster_id: String,
         expected_label_revision: u32,
         label: String,
+        consent: bool,
     ) -> Result<SpeakerOperationResult, String> {
         let _timelines = self
             .timelines
@@ -1930,6 +2103,14 @@ impl AppState {
         if revision.label == previous.label {
             return Err("speaker cluster already uses that label".to_owned());
         }
+        let existing_profile = audit_store
+            .list_voice_profiles()
+            .map_err(|error| format!("could not load voice profiles: {error}"))?
+            .into_iter()
+            .find(|profile| {
+                profile.origin_session_id == Some(session_id)
+                    && profile.origin_cluster_id.as_deref() == Some(cluster_id.as_str())
+            });
         let event = trail
             .next_event(
                 Some(session_id),
@@ -1940,13 +2121,134 @@ impl AppState {
                 &revision,
             )
             .map_err(|error| format!("could not serialize speaker label revision: {error}"))?;
-        audit_store
-            .append_speaker_cluster_label_revision_with_audit(&event, &revision)
-            .map_err(|error| format!("could not persist speaker label revision: {error}"))?;
-        assert!(
-            trail.append_event(event),
-            "an audit event generated while holding the trail lock must append"
-        );
+        if let Some(profile) = existing_profile {
+            let renamed = VoiceProfile::rename_with_id(
+                &profile,
+                Uuid::new_v4(),
+                revision.label.clone(),
+                Utc::now(),
+            )
+            .map_err(|error| format!("could not rename voice profile: {error}"))?;
+            let payload = VoiceProfileRevisionAuditPayload {
+                profile: VoiceProfileAuditBinding::from_profile(&renamed)
+                    .map_err(|error| format!("could not bind voice profile revision: {error}"))?,
+            };
+            let profile_event = chained_audit_event(
+                &event,
+                None,
+                renamed.parent_revision_id,
+                AuditKind::VoiceProfileRevisionRecorded,
+                self.monotonic_ns(),
+                renamed.updated_at,
+                &payload,
+            )?;
+            audit_store
+                .append_speaker_label_and_voice_profile_revision_with_audit(
+                    &event,
+                    &revision,
+                    &profile_event,
+                    &renamed,
+                )
+                .map_err(|error| format!("could not persist speaker and profile names: {error}"))?;
+            append_chained_events(&mut trail, [event, profile_event]);
+        } else {
+            if !consent {
+                return Err("explicit local voice profile consent is required".to_owned());
+            }
+            let policy = self.profile_speaker_match_policy()?;
+            let observations = audit_store
+                .list_speaker_observations(session_id)
+                .map_err(|error| format!("could not load speaker observations: {error}"))?;
+            let eligible = observations
+                .into_iter()
+                .filter(|observation| {
+                    observation.decision == SpeakerObservationDecision::AnonymousCluster
+                        && observation.anonymous_cluster_id.as_deref() == Some(cluster_id.as_str())
+                        && policy.sample_rejection(observation.quality).is_none()
+                })
+                .take(crate::domain::voice_profile::MAX_PROTOTYPES_PER_PROFILE)
+                .collect::<Vec<_>>();
+            let first = eligible.first().ok_or_else(|| {
+                "this speaker has no high-quality local sample available for enrollment".to_owned()
+            })?;
+            let created_at = Utc::now().max(first.observed_at);
+            let initial = VoiceProfile::new_from_cluster_with_id(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                revision.label.clone(),
+                first.embedding.model().clone(),
+                session_id,
+                cluster_id.clone(),
+                created_at,
+            )
+            .map_err(|error| format!("could not create voice profile: {error}"))?;
+            let created_payload = VoiceProfileCreatedAuditPayload {
+                profile: VoiceProfileAuditBinding::from_profile(&initial)
+                    .map_err(|error| format!("could not bind voice profile: {error}"))?,
+            };
+            let created_event = chained_audit_event(
+                &event,
+                None,
+                None,
+                AuditKind::VoiceProfileCreated,
+                self.monotonic_ns(),
+                initial.updated_at,
+                &created_payload,
+            )?;
+            let mut profiles = vec![initial];
+            let mut prototypes = Vec::new();
+            let mut profile_events = vec![created_event];
+            for observation in eligible {
+                let previous_profile = profiles.last().expect("initial profile exists");
+                let confirmed_at = Utc::now()
+                    .max(previous_profile.updated_at)
+                    .max(observation.observed_at);
+                let confirmed = VoiceProfile::confirm_with_id(
+                    previous_profile,
+                    Uuid::new_v4(),
+                    observation.quality.voiced_duration_ns(),
+                    confirmed_at,
+                )
+                .map_err(|error| format!("could not confirm voice profile sample: {error}"))?;
+                let prototype = SpeakerPrototype::new_from_observation_with_id(
+                    Uuid::new_v4(),
+                    &confirmed,
+                    observation.embedding,
+                    observation.quality.voiced_duration_ns(),
+                    confirmed_at,
+                    observation.id,
+                )
+                .map_err(|error| format!("could not create voice prototype: {error}"))?;
+                let payload = VoiceProfileEnrollmentAuditPayload {
+                    profile: VoiceProfileAuditBinding::from_profile(&confirmed).map_err(
+                        |error| format!("could not bind voice profile enrollment: {error}"),
+                    )?,
+                    prototype: SpeakerPrototypeAuditBinding::from_prototype(&prototype),
+                };
+                let profile_event = chained_audit_event(
+                    profile_events.last().expect("created event exists"),
+                    None,
+                    confirmed.parent_revision_id,
+                    AuditKind::VoiceProfileEnrollmentRecorded,
+                    self.monotonic_ns(),
+                    confirmed.updated_at,
+                    &payload,
+                )?;
+                profiles.push(confirmed);
+                prototypes.push(prototype);
+                profile_events.push(profile_event);
+            }
+            audit_store
+                .append_voice_profile_cluster_enrollment_with_audit(
+                    &event,
+                    &revision,
+                    &profile_events,
+                    &profiles,
+                    &prototypes,
+                )
+                .map_err(|error| format!("could not persist voice profile enrollment: {error}"))?;
+            append_chained_events(&mut trail, std::iter::once(event).chain(profile_events));
+        }
         let clusters = audit_store
             .list_speaker_clusters(session_id)
             .map_err(|error| format!("could not load speaker catalog: {error}"))?;
@@ -2052,6 +2354,230 @@ impl AppState {
                 revision: revision.revision,
             }],
         })
+    }
+
+    pub fn list_voice_profiles(&self) -> Result<Vec<VoiceProfileProjection>, String> {
+        let store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        project_voice_profiles(&store)
+    }
+
+    pub fn rename_voice_profile(
+        &self,
+        profile_id: Uuid,
+        expected_revision: u32,
+        display_name: String,
+    ) -> Result<Vec<VoiceProfileProjection>, String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let profile = current_voice_profile(&store, profile_id, expected_revision)?;
+        let revision =
+            VoiceProfile::rename_with_id(&profile, Uuid::new_v4(), display_name, Utc::now())
+                .map_err(|error| format!("invalid voice profile name: {error}"))?;
+        let payload = VoiceProfileRevisionAuditPayload {
+            profile: VoiceProfileAuditBinding::from_profile(&revision)
+                .map_err(|error| format!("could not bind voice profile revision: {error}"))?,
+        };
+        let event = trail
+            .next_event(
+                None,
+                revision.parent_revision_id,
+                AuditKind::VoiceProfileRevisionRecorded,
+                self.monotonic_ns(),
+                revision.updated_at,
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize voice profile revision: {error}"))?;
+        store
+            .append_voice_profile_revision_with_audit(&event, &revision)
+            .map_err(|error| format!("could not persist voice profile revision: {error}"))?;
+        assert!(trail.append_event(event));
+        project_voice_profiles(&store)
+    }
+
+    pub fn relearn_voice_profile(
+        &self,
+        profile_id: Uuid,
+        expected_revision: u32,
+    ) -> Result<Vec<VoiceProfileProjection>, String> {
+        let model = self.current_speaker_model_provenance()?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let profile = current_voice_profile(&store, profile_id, expected_revision)?;
+        let revision =
+            VoiceProfile::require_relearn_with_id(&profile, Uuid::new_v4(), model, Utc::now())
+                .map_err(|error| format!("could not prepare voice profile relearning: {error}"))?;
+        let payload = VoiceProfileRevisionAuditPayload {
+            profile: VoiceProfileAuditBinding::from_profile(&revision)
+                .map_err(|error| format!("could not bind voice profile revision: {error}"))?,
+        };
+        let event = trail
+            .next_event(
+                None,
+                revision.parent_revision_id,
+                AuditKind::VoiceProfileRevisionRecorded,
+                self.monotonic_ns(),
+                revision.updated_at,
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize voice profile revision: {error}"))?;
+        store
+            .append_voice_profile_revision_with_audit(&event, &revision)
+            .map_err(|error| format!("could not persist voice profile revision: {error}"))?;
+        assert!(trail.append_event(event));
+        project_voice_profiles(&store)
+    }
+
+    pub fn add_voice_profile_confirmed_sample(
+        &self,
+        profile_id: Uuid,
+        expected_revision: u32,
+    ) -> Result<Vec<VoiceProfileProjection>, String> {
+        let policy = self.profile_speaker_match_policy()?;
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        let profile = current_voice_profile(&store, profile_id, expected_revision)?;
+        let used = store
+            .list_speaker_prototypes(profile_id)
+            .map_err(|error| format!("could not load voice prototypes: {error}"))?
+            .into_iter()
+            .filter_map(|prototype| prototype.source_observation_id)
+            .collect::<BTreeSet<_>>();
+        let observation = store
+            .list_all_speaker_observations()
+            .map_err(|error| format!("could not load speaker observations: {error}"))?
+            .into_iter()
+            .rev()
+            .find(|observation| {
+                !used.contains(&observation.id)
+                    && observation.observed_at >= profile.learning_started_at
+                    && observation.embedding.model() == &profile.model
+                    && policy.sample_rejection(observation.quality).is_none()
+                    && (observation.profile_id == Some(profile_id)
+                        || (observation.session_id
+                            == profile.origin_session_id.unwrap_or_default()
+                            && observation.anonymous_cluster_id.as_deref()
+                                == profile.origin_cluster_id.as_deref()))
+            })
+            .ok_or_else(|| "no new high-quality confirmed sample is available".to_owned())?;
+        let confirmed_at = Utc::now()
+            .max(profile.updated_at)
+            .max(observation.observed_at);
+        let confirmed = VoiceProfile::confirm_with_id(
+            &profile,
+            Uuid::new_v4(),
+            observation.quality.voiced_duration_ns(),
+            confirmed_at,
+        )
+        .map_err(|error| format!("could not confirm voice profile sample: {error}"))?;
+        let prototype = SpeakerPrototype::new_from_observation_with_id(
+            Uuid::new_v4(),
+            &confirmed,
+            observation.embedding,
+            observation.quality.voiced_duration_ns(),
+            confirmed_at,
+            observation.id,
+        )
+        .map_err(|error| format!("could not create voice prototype: {error}"))?;
+        let payload = VoiceProfileEnrollmentAuditPayload {
+            profile: VoiceProfileAuditBinding::from_profile(&confirmed)
+                .map_err(|error| format!("could not bind voice profile enrollment: {error}"))?,
+            prototype: SpeakerPrototypeAuditBinding::from_prototype(&prototype),
+        };
+        let event = trail
+            .next_event(
+                None,
+                confirmed.parent_revision_id,
+                AuditKind::VoiceProfileEnrollmentRecorded,
+                self.monotonic_ns(),
+                confirmed.updated_at,
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize voice profile enrollment: {error}"))?;
+        store
+            .append_voice_profile_enrollment_with_audit(&event, &confirmed, &prototype)
+            .map_err(|error| format!("could not persist voice profile enrollment: {error}"))?;
+        assert!(trail.append_event(event));
+        project_voice_profiles(&store)
+    }
+
+    pub fn delete_voice_profile(
+        &self,
+        profile_id: Uuid,
+        expected_revision: u32,
+    ) -> Result<Vec<VoiceProfileProjection>, String> {
+        let mut trail = self
+            .audit_trail
+            .lock()
+            .map_err(|_| "audit state lock poisoned".to_owned())?;
+        let mut store = self
+            .audit_store
+            .lock()
+            .map_err(|_| "audit store lock poisoned".to_owned())?;
+        current_voice_profile(&store, profile_id, expected_revision)?;
+        let payload = store
+            .voice_profile_deletion_payload(profile_id)
+            .map_err(|error| format!("could not prepare voice profile deletion: {error}"))?;
+        let event = trail
+            .next_event(
+                None,
+                None,
+                AuditKind::VoiceProfileDeleted,
+                self.monotonic_ns(),
+                Utc::now(),
+                &payload,
+            )
+            .map_err(|error| format!("could not serialize voice profile deletion: {error}"))?;
+        store
+            .delete_voice_profile_with_audit(&event, &payload)
+            .map_err(|error| format!("could not delete voice profile: {error}"))?;
+        assert!(trail.append_event(event));
+        project_voice_profiles(&store)
+    }
+
+    fn current_speaker_model_provenance(
+        &self,
+    ) -> Result<crate::inference::ModelProvenance, String> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some((_, manifest)) = self
+                .bundled_speaker_model
+                .lock()
+                .map_err(|_| "bundled speaker model lock poisoned".to_owned())?
+                .as_ref()
+            {
+                return manifest.provenance();
+            }
+        }
+        #[cfg(test)]
+        return crate::inference::ModelProvenance::new(
+            "fixture",
+            "speaker-embedding",
+            "v1",
+            "a".repeat(64),
+        );
+        #[allow(unreachable_code)]
+        Err("bundled speaker model is unavailable".to_owned())
     }
 
     fn speaker_catalog_session_id(
@@ -2162,9 +2688,10 @@ impl AppState {
     /// transcript revision.
     fn append_final_asr_transcript_revision(
         &self,
-        revision: TranscriptRevision,
+        mut revision: TranscriptRevision,
         key: &crate::inference::AsrFinalIdempotencyKey,
         emission_payload_sha256: &str,
+        speaker: &SpeakerAnalysis,
     ) -> Result<Option<TranscriptSpan>, String> {
         if !revision.is_final {
             return Err(
@@ -2174,10 +2701,6 @@ impl AppState {
         revision
             .validate()
             .map_err(|error| format!("invalid final transcript revision: {error}"))?;
-        let idempotency = AsrFinalIdempotencyBinding::new(key, &revision, emission_payload_sha256)
-            .map_err(|error| format!("invalid local ASR idempotency binding: {error}"))?;
-
-        let projection = transcript_revision_projection(&revision);
         // Keep the same lock order as other audit writes. Checking for an
         // existing key before generating the in-memory audit event means a
         // harmless replay cannot advance the hash chain.
@@ -2197,7 +2720,10 @@ impl AppState {
             .lookup_asr_final_idempotency(key)
             .map_err(|error| format!("could not query local ASR idempotency: {error}"))?
         {
-            if existing.emission_payload_sha256 == idempotency.emission_payload_sha256 {
+            if existing
+                .emission_payload_sha256
+                .eq_ignore_ascii_case(emission_payload_sha256)
+            {
                 return Ok(None);
             }
             return Err(
@@ -2205,8 +2731,62 @@ impl AppState {
             );
         }
 
+        let speaker_persistence =
+            self.prepare_native_speaker_persistence(&audit_store, &revision, speaker)?;
+        revision.speaker_cluster_id = speaker_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.transcript_cluster_id.clone());
+        revision
+            .validate()
+            .map_err(|error| format!("invalid speaker-assigned transcript revision: {error}"))?;
+        let idempotency = AsrFinalIdempotencyBinding::new(key, &revision, emission_payload_sha256)
+            .map_err(|error| format!("invalid local ASR idempotency binding: {error}"))?;
+        let projection = transcript_revision_projection(&revision);
+
         let audit_payload = AsrFinalAuditPayload::new(&revision, &idempotency);
-        let event = trail
+        let mut staged_trail = trail.clone();
+        let mut cluster_event = None;
+        let mut profile_label_event = None;
+        if let Some(persistence) = &speaker_persistence {
+            if let Some((cluster, initial_label)) = persistence.cluster_creation.as_ref() {
+                let payload =
+                    SpeakerClusterCreatedAuditPayload::new(cluster.clone(), initial_label.clone())
+                        .map_err(|error| {
+                            format!("could not bind native speaker cluster: {error}")
+                        })?;
+                let event = staged_trail
+                    .next_event(
+                        Some(revision.session_id),
+                        None,
+                        AuditKind::SpeakerClusterCreated,
+                        revision.capture_end_ns,
+                        revision.wall_clock_end,
+                        &payload,
+                    )
+                    .map_err(|error| {
+                        format!("could not serialize native speaker cluster: {error}")
+                    })?;
+                assert!(staged_trail.append_event(event.clone()));
+                cluster_event = Some(event);
+            }
+            if let Some(label) = persistence.profile_label.as_ref() {
+                let event = staged_trail
+                    .next_event(
+                        Some(revision.session_id),
+                        label.parent_revision_id,
+                        AuditKind::SpeakerClusterLabelRevisionRecorded,
+                        revision.capture_end_ns,
+                        revision.wall_clock_end,
+                        label,
+                    )
+                    .map_err(|error| {
+                        format!("could not serialize profile speaker label: {error}")
+                    })?;
+                assert!(staged_trail.append_event(event.clone()));
+                profile_label_event = Some(event);
+            }
+        }
+        let event = staged_trail
             .next_event(
                 Some(revision.session_id),
                 revision.parent_revision_id,
@@ -2216,18 +2796,351 @@ impl AppState {
                 &audit_payload,
             )
             .map_err(|error| format!("could not serialize transcript revision: {error}"))?;
+        assert!(staged_trail.append_event(event.clone()));
+        let observation_event = if let Some(observation) = speaker_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.observation.as_ref())
+        {
+            let payload = SpeakerObservationAuditPayload {
+                observation: SpeakerObservationAuditBinding::from_observation(observation)
+                    .map_err(|error| format!("could not bind speaker observation: {error}"))?,
+            };
+            let observation_event = staged_trail
+                .next_event(
+                    Some(revision.session_id),
+                    Some(revision.id),
+                    AuditKind::SpeakerObservationRecorded,
+                    revision.capture_end_ns,
+                    observation.observed_at,
+                    &payload,
+                )
+                .map_err(|error| format!("could not serialize speaker observation: {error}"))?;
+            assert!(staged_trail.append_event(observation_event.clone()));
+            Some(observation_event)
+        } else {
+            None
+        };
+
+        let cluster_creation = speaker_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.cluster_creation.as_ref())
+            .zip(cluster_event.as_ref())
+            .map(|((cluster, label), event)| (event, cluster, label));
+        let profile_label = speaker_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.profile_label.as_ref())
+            .zip(profile_label_event.as_ref())
+            .map(|(label, event)| (event, label));
+        let observation = speaker_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.observation.as_ref())
+            .zip(observation_event.as_ref())
+            .map(|(observation, event)| (event, observation));
         audit_store
-            .append_asr_final_transcript_revision_with_audit(&event, &revision, &idempotency)
+            .append_asr_final_with_speaker_audit(
+                &event,
+                &revision,
+                &idempotency,
+                cluster_creation,
+                profile_label,
+                observation,
+            )
             .map_err(|error| format!("could not persist transcript revision: {error}"))?;
-        assert!(
-            trail.append_event(event),
-            "an audit event generated while holding the trail lock must append"
-        );
+        for committed in staged_trail.events()[trail.events().len()..]
+            .iter()
+            .cloned()
+        {
+            assert!(trail.append_event(committed));
+        }
+        if let Some(persistence) = speaker_persistence {
+            if let Some(clusterer) = persistence.staged_clusterer {
+                self.session_speaker_clusterers
+                    .lock()
+                    .map_err(|_| "speaker clusterer lock poisoned".to_owned())?
+                    .insert(revision.session_id, clusterer);
+            }
+            if let Some((profile_id, cluster_id)) = persistence.profile_cluster_mapping {
+                self.session_profile_clusters
+                    .lock()
+                    .map_err(|_| "profile speaker cluster lock poisoned".to_owned())?
+                    .insert((revision.session_id, profile_id), cluster_id);
+            }
+        }
         drop(audit_store);
         drop(trail);
 
         Self::upsert_timeline_projection(&mut timelines, projection.clone());
         Ok(Some(projection))
+    }
+
+    fn prepare_native_speaker_persistence(
+        &self,
+        audit_store: &AuditStore,
+        revision: &TranscriptRevision,
+        speaker: &SpeakerAnalysis,
+    ) -> Result<Option<NativeSpeakerPersistence>, String> {
+        let SpeakerAnalysis::Available { embedding, quality } = speaker else {
+            return Ok(None);
+        };
+        let policy = self.profile_speaker_match_policy()?;
+        let profiles = audit_store
+            .list_voice_profiles()
+            .map_err(|error| format!("could not load voice profiles: {error}"))?;
+        let ready_profiles = profiles
+            .iter()
+            .filter(|profile| {
+                profile.state == VoiceProfileState::Ready && profile.model == *embedding.model()
+            })
+            .map(|profile| (profile.id, profile))
+            .collect::<BTreeMap<_, _>>();
+        let mut prototypes = Vec::new();
+        for profile_id in ready_profiles.keys().copied() {
+            prototypes.extend(
+                audit_store
+                    .list_speaker_prototypes(profile_id)
+                    .map_err(|error| format!("could not load voice prototypes: {error}"))?,
+            );
+        }
+        let candidates = prototypes
+            .iter()
+            .map(|prototype| SpeakerMatchCandidate {
+                profile_id: prototype.profile_id,
+                prototype: &prototype.embedding,
+            })
+            .collect::<Vec<_>>();
+
+        match match_speaker_profile(embedding, *quality, &candidates, policy) {
+            SpeakerMatchDecision::Matched {
+                profile_id,
+                similarity,
+                runner_up_similarity,
+                ..
+            } => {
+                let profile = ready_profiles.get(&profile_id).ok_or_else(|| {
+                    "speaker matcher returned a profile outside its ready candidate set".to_owned()
+                })?;
+                let existing_cluster_id = self
+                    .session_profile_clusters
+                    .lock()
+                    .map_err(|_| "profile speaker cluster lock poisoned".to_owned())?
+                    .get(&(revision.session_id, profile_id))
+                    .cloned();
+                let (cluster_id, cluster_creation, profile_label) = if let Some(cluster_id) =
+                    existing_cluster_id
+                {
+                    (cluster_id, None, None)
+                } else {
+                    let ordinal = u32::try_from(
+                        audit_store
+                            .list_speaker_clusters(revision.session_id)
+                            .map_err(|error| {
+                                format!("could not load session speaker clusters: {error}")
+                            })?
+                            .len(),
+                    )
+                    .ok()
+                    .and_then(|count| count.checked_add(1))
+                    .ok_or_else(|| "speaker cluster ordinal overflowed".to_owned())?;
+                    let cluster = SpeakerClusterRecord::new(revision.session_id, ordinal).map_err(
+                        |error| format!("could not create profile speaker cluster: {error}"),
+                    )?;
+                    let initial = SpeakerClusterLabelRevision::initial_generated(&cluster)
+                        .map_err(|error| {
+                            format!("could not create profile speaker label: {error}")
+                        })?;
+                    let label = SpeakerClusterLabelRevision::revision_of(
+                        &initial,
+                        profile.display_name.clone(),
+                    )
+                    .map_err(|error| format!("could not snapshot profile speaker name: {error}"))?;
+                    (cluster.id.clone(), Some((cluster, initial)), Some(label))
+                };
+                let observation = SpeakerObservation::new(
+                    Uuid::new_v4(),
+                    revision.session_id,
+                    revision.id,
+                    Some(profile_id),
+                    None,
+                    Some(profile.display_name.clone()),
+                    SpeakerObservationDecision::MatchedProfile,
+                    Some(similarity),
+                    runner_up_similarity,
+                    embedding.clone(),
+                    *quality,
+                    revision.wall_clock_end,
+                )
+                .map_err(|error| {
+                    format!("could not create matched speaker observation: {error}")
+                })?;
+                Ok(Some(NativeSpeakerPersistence {
+                    transcript_cluster_id: Some(cluster_id.clone()),
+                    cluster_creation,
+                    profile_label,
+                    observation: Some(observation),
+                    staged_clusterer: None,
+                    profile_cluster_mapping: Some((profile_id, cluster_id)),
+                }))
+            }
+            SpeakerMatchDecision::Ambiguous {
+                best_similarity,
+                runner_up_similarity,
+                ..
+            } => Ok(Some(native_unassigned_speaker_persistence(
+                revision,
+                embedding.clone(),
+                *quality,
+                SpeakerObservationDecision::Ambiguous,
+                Some(best_similarity),
+                Some(runner_up_similarity),
+            )?)),
+            SpeakerMatchDecision::Ineligible(_) => Ok(Some(native_unassigned_speaker_persistence(
+                revision,
+                embedding.clone(),
+                *quality,
+                SpeakerObservationDecision::Ineligible,
+                None,
+                None,
+            )?)),
+            SpeakerMatchDecision::Unknown { best_similarity } => self
+                .prepare_anonymous_speaker_persistence(
+                    audit_store,
+                    revision,
+                    embedding.clone(),
+                    *quality,
+                    self.anonymous_speaker_match_policy()?,
+                    best_similarity,
+                )
+                .map(Some),
+        }
+    }
+
+    fn profile_speaker_match_policy(&self) -> Result<SpeakerMatchPolicy, String> {
+        #[cfg(target_os = "macos")]
+        if let Some((_, manifest)) = self
+            .bundled_speaker_model
+            .lock()
+            .map_err(|_| "bundled speaker model lock poisoned".to_owned())?
+            .as_ref()
+        {
+            return manifest.profile_match_policy();
+        }
+        #[cfg(test)]
+        return test_speaker_match_policy();
+        #[allow(unreachable_code)]
+        Err("bundled speaker model policy is unavailable".to_owned())
+    }
+
+    fn anonymous_speaker_match_policy(&self) -> Result<SpeakerMatchPolicy, String> {
+        #[cfg(target_os = "macos")]
+        if let Some((_, manifest)) = self
+            .bundled_speaker_model
+            .lock()
+            .map_err(|_| "bundled speaker model lock poisoned".to_owned())?
+            .as_ref()
+        {
+            return manifest.anonymous_match_policy();
+        }
+        #[cfg(test)]
+        return test_speaker_match_policy();
+        #[allow(unreachable_code)]
+        Err("bundled speaker model policy is unavailable".to_owned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_anonymous_speaker_persistence(
+        &self,
+        audit_store: &AuditStore,
+        revision: &TranscriptRevision,
+        embedding: crate::diarization::SpeakerEmbedding,
+        quality: crate::diarization::SpeakerSampleQuality,
+        policy: SpeakerMatchPolicy,
+        best_profile_similarity: Option<f32>,
+    ) -> Result<NativeSpeakerPersistence, String> {
+        let mut clusterer = self
+            .session_speaker_clusterers
+            .lock()
+            .map_err(|_| "speaker clusterer lock poisoned".to_owned())?
+            .get(&revision.session_id)
+            .cloned()
+            .unwrap_or(SessionSpeakerClusterer::new(revision.session_id, policy)?);
+        let assignment = clusterer.assign(embedding.clone(), quality);
+        let (cluster_id, cluster_creation, decision, similarity) = match assignment {
+            AnonymousSpeakerAssignment::Assigned {
+                cluster_id,
+                similarity,
+            } => (
+                Some(cluster_id),
+                None,
+                SpeakerObservationDecision::AnonymousCluster,
+                Some(similarity),
+            ),
+            AnonymousSpeakerAssignment::Created { cluster_id } => {
+                let ordinal = u32::try_from(
+                    audit_store
+                        .list_speaker_clusters(revision.session_id)
+                        .map_err(|error| {
+                            format!("could not load session speaker clusters: {error}")
+                        })?
+                        .len(),
+                )
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(|| "speaker cluster ordinal overflowed".to_owned())?;
+                let cluster = SpeakerClusterRecord::new_with_id(
+                    cluster_id.clone(),
+                    revision.session_id,
+                    ordinal,
+                )
+                .map_err(|error| format!("could not create anonymous speaker cluster: {error}"))?;
+                let initial =
+                    SpeakerClusterLabelRevision::initial_generated(&cluster).map_err(|error| {
+                        format!("could not create anonymous speaker label: {error}")
+                    })?;
+                (
+                    Some(cluster_id),
+                    Some((cluster, initial)),
+                    SpeakerObservationDecision::AnonymousCluster,
+                    None,
+                )
+            }
+            AnonymousSpeakerAssignment::Ambiguous => (
+                None,
+                None,
+                SpeakerObservationDecision::Ambiguous,
+                best_profile_similarity,
+            ),
+            AnonymousSpeakerAssignment::Ineligible(_)
+            | AnonymousSpeakerAssignment::IncompatibleModelSpace
+            | AnonymousSpeakerAssignment::CapacityReached => (
+                None,
+                None,
+                SpeakerObservationDecision::Ineligible,
+                best_profile_similarity,
+            ),
+        };
+        let observation = SpeakerObservation::new(
+            Uuid::new_v4(),
+            revision.session_id,
+            revision.id,
+            None,
+            cluster_id.clone(),
+            None,
+            decision,
+            similarity.or(best_profile_similarity),
+            None,
+            embedding,
+            quality,
+            revision.wall_clock_end,
+        )
+        .map_err(|error| format!("could not create anonymous speaker observation: {error}"))?;
+        Ok(NativeSpeakerPersistence {
+            transcript_cluster_id: cluster_id,
+            cluster_creation,
+            profile_label: None,
+            observation: Some(observation),
+            staged_clusterer: Some(clusterer),
+            profile_cluster_mapping: None,
+        })
     }
 
     fn upsert_timeline_projection(
@@ -2264,13 +3177,19 @@ impl AppState {
             monotonic_ns: session.started_monotonic_ns,
             wall_clock: session.started_at,
         };
-        self.append_local_asr_response_with_capture_anchor(&session, response, &capture_anchor)
+        self.append_local_asr_response_with_capture_anchor(
+            &session,
+            response,
+            &SpeakerAnalysis::Unavailable,
+            &capture_anchor,
+        )
     }
 
     fn append_local_asr_response_with_capture_anchor(
         &self,
         session: &CaptureSession,
         response: AsrResponse,
+        speaker: &SpeakerAnalysis,
         capture_anchor: &CapturePoint,
     ) -> Result<Vec<TranscriptSpan>, String> {
         if capture_anchor.monotonic_ns < session.started_monotonic_ns {
@@ -2301,6 +3220,7 @@ impl AppState {
                     revision,
                     &final_emission.idempotency_key(),
                     &final_emission.idempotency_payload_sha256(),
+                    speaker,
                 )
             })();
             match persisted {
@@ -2396,6 +3316,12 @@ impl AppState {
                 });
             }
         }
+        #[cfg(target_os = "macos")]
+        if let Ok(model) = bundled_speaker_model(resource_dir.as_ref()) {
+            if let Ok(mut active) = self.bundled_speaker_model.lock() {
+                *active = Some((model.artifact_path, model.manifest));
+            }
+        }
 
         status
     }
@@ -2487,7 +3413,23 @@ impl AppState {
         validate_active_local_asr_model(artifact.model())?;
         let asr = WhisperCppAsrEngine::from_registered_artifact(artifact)
             .map_err(|_| "已选择的本地转写模型无法加载，请重新选择或重新安装应用".to_owned())?;
-        Ok(NativeInferenceEngines::new(WebRtcVad::new(), asr))
+        let speaker = self
+            .bundled_speaker_model
+            .lock()
+            .map_err(|_| "bundled speaker model lock poisoned".to_owned())?
+            .as_ref()
+            .map(|(path, manifest)| crate::diarization::BundledSpeakerModel {
+                artifact_path: path.clone(),
+                manifest: manifest.clone(),
+            })
+            .ok_or_else(|| "内置离线声纹模型不可用，请重新安装应用".to_owned())?;
+        let speaker = OnnxSpeakerEmbeddingEngine::from_bundled(speaker)
+            .map_err(|_| "内置离线声纹模型无法加载，请重新安装应用".to_owned())?;
+        Ok(NativeInferenceEngines::with_speaker(
+            WebRtcVad::new(),
+            asr,
+            speaker,
+        ))
     }
 
     /// Imports a user-selected model into application-managed local storage.
@@ -2746,12 +3688,34 @@ impl AppState {
         wall_clock: DateTime<Utc>,
         payload: &T,
     ) -> Result<(), String> {
+        self.record_linked_audit_at(None, kind, monotonic_ns, wall_clock, payload)
+    }
+
+    fn record_session_audit_at<T: Serialize>(
+        &self,
+        session_id: Uuid,
+        kind: AuditKind,
+        monotonic_ns: u64,
+        wall_clock: DateTime<Utc>,
+        payload: &T,
+    ) -> Result<(), String> {
+        self.record_linked_audit_at(Some(session_id), kind, monotonic_ns, wall_clock, payload)
+    }
+
+    fn record_linked_audit_at<T: Serialize>(
+        &self,
+        run_id: Option<Uuid>,
+        kind: AuditKind,
+        monotonic_ns: u64,
+        wall_clock: DateTime<Utc>,
+        payload: &T,
+    ) -> Result<(), String> {
         let mut trail = self
             .audit_trail
             .lock()
             .map_err(|_| "audit state lock poisoned".to_owned())?;
         let event = trail
-            .next_event(None, None, kind, monotonic_ns, wall_clock, payload)
+            .next_event(run_id, None, kind, monotonic_ns, wall_clock, payload)
             .map_err(|error| format!("could not serialize audit payload: {error}"))?;
         self.audit_store
             .lock()
@@ -2849,6 +3813,146 @@ fn transcript_revision_projection(revision: &TranscriptRevision) -> TranscriptSp
         revision: revision.revision,
         source: revision.source.clone(),
     }
+}
+
+fn current_voice_profile(
+    store: &AuditStore,
+    profile_id: Uuid,
+    expected_revision: u32,
+) -> Result<VoiceProfile, String> {
+    let profile = store
+        .list_voice_profiles()
+        .map_err(|error| format!("could not load voice profiles: {error}"))?
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| "voice profile does not exist".to_owned())?;
+    if profile.revision != expected_revision {
+        return Err("voice profile has changed; refresh before updating".to_owned());
+    }
+    Ok(profile)
+}
+
+fn project_voice_profiles(store: &AuditStore) -> Result<Vec<VoiceProfileProjection>, String> {
+    let observations = store
+        .list_all_speaker_observations()
+        .map_err(|error| format!("could not load speaker observations: {error}"))?;
+    let mut profiles = store
+        .list_voice_profiles()
+        .map_err(|error| format!("could not load voice profiles: {error}"))?
+        .into_iter()
+        .map(|profile| {
+            let prototypes = store
+                .list_speaker_prototypes(profile.id)
+                .map_err(|error| format!("could not load voice prototypes: {error}"))?;
+            let used = prototypes
+                .iter()
+                .filter_map(|prototype| prototype.source_observation_id)
+                .collect::<BTreeSet<_>>();
+            let can_add_confirmed_sample = observations.iter().any(|observation| {
+                !used.contains(&observation.id)
+                    && observation.observed_at >= profile.learning_started_at
+                    && observation.embedding.model() == &profile.model
+                    && (observation.profile_id == Some(profile.id)
+                        || (Some(observation.session_id) == profile.origin_session_id
+                            && observation.anonymous_cluster_id.as_deref()
+                                == profile.origin_cluster_id.as_deref()))
+            });
+            Ok(VoiceProfileProjection {
+                id: profile.id,
+                revision: profile.revision,
+                display_name: profile.display_name,
+                state: profile.state,
+                confirmed_duration_ns: profile.confirmed_duration_ns,
+                ready_confirmed_duration_ns:
+                    crate::domain::voice_profile::READY_CONFIRMED_DURATION_NS,
+                model_id: profile.model.model_id().to_owned(),
+                model_version: profile.model.model_version().to_owned(),
+                last_confirmation_at: prototypes
+                    .iter()
+                    .map(|prototype| prototype.confirmed_at)
+                    .max(),
+                can_add_confirmed_sample,
+                updated_at: profile.updated_at,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    profiles.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+    Ok(profiles)
+}
+
+fn chained_audit_event<T: Serialize>(
+    previous: &crate::audit::AuditEvent,
+    run_id: Option<Uuid>,
+    causation_id: Option<Uuid>,
+    kind: AuditKind,
+    monotonic_ns: u64,
+    wall_clock: DateTime<Utc>,
+    payload: &T,
+) -> Result<crate::audit::AuditEvent, String> {
+    crate::audit::AuditEvent::new(
+        run_id,
+        causation_id,
+        kind,
+        monotonic_ns,
+        wall_clock,
+        payload,
+        Some(previous.hash.clone()),
+    )
+    .map_err(|error| format!("could not serialize audit event: {error}"))
+}
+
+fn append_chained_events(
+    trail: &mut AuditTrail,
+    events: impl IntoIterator<Item = crate::audit::AuditEvent>,
+) {
+    for event in events {
+        assert!(
+            trail.append_event(event),
+            "audit events persisted while holding the trail lock must append"
+        );
+    }
+}
+
+#[cfg(test)]
+fn test_speaker_match_policy() -> Result<SpeakerMatchPolicy, String> {
+    SpeakerMatchPolicy::new(0.75, 0.08, 1_000_000_000, 0.65, 0.55, 0.20)
+}
+
+fn native_unassigned_speaker_persistence(
+    revision: &TranscriptRevision,
+    embedding: crate::diarization::SpeakerEmbedding,
+    quality: crate::diarization::SpeakerSampleQuality,
+    decision: SpeakerObservationDecision,
+    similarity: Option<f32>,
+    runner_up_similarity: Option<f32>,
+) -> Result<NativeSpeakerPersistence, String> {
+    let observation = SpeakerObservation::new(
+        Uuid::new_v4(),
+        revision.session_id,
+        revision.id,
+        None,
+        None,
+        None,
+        decision,
+        similarity,
+        runner_up_similarity,
+        embedding,
+        quality,
+        revision.wall_clock_end,
+    )?;
+    Ok(NativeSpeakerPersistence {
+        transcript_cluster_id: None,
+        cluster_creation: None,
+        profile_label: None,
+        observation: Some(observation),
+        staged_clusterer: None,
+        profile_cluster_mapping: None,
+    })
 }
 
 fn transcript_revision_from_final_emission(
@@ -3062,6 +4166,42 @@ fn timeline_projections(revisions: Vec<TranscriptRevision>) -> BTreeMap<Uuid, Ve
     timelines
 }
 
+fn session_summary_projections(
+    events: &[crate::audit::AuditEvent],
+) -> BTreeMap<Uuid, SessionSummary> {
+    let mut summaries = BTreeMap::<Uuid, SessionSummary>::new();
+    for event in events {
+        let Some(session_id) = event.run_id else {
+            continue;
+        };
+        match event.kind {
+            AuditKind::SessionStarted => {
+                summaries.entry(session_id).or_insert(SessionSummary {
+                    id: session_id,
+                    started_at: event.wall_clock,
+                    started_monotonic_ns: event.monotonic_ns,
+                    stopped_at: None,
+                    // Audit-only sessions are archives. Only the live
+                    // in-memory overlay may report Starting or Recording.
+                    state: crate::domain::SessionState::Stopped,
+                    transcript_count: 0,
+                });
+            }
+            AuditKind::SessionStopped => {
+                if let Some(summary) = summaries.get_mut(&session_id) {
+                    summary.stopped_at = Some(event.wall_clock);
+                    summary.state = crate::domain::SessionState::Stopped;
+                }
+            }
+            AuditKind::SessionDeleted => {
+                summaries.remove(&session_id);
+            }
+            _ => {}
+        }
+    }
+    summaries
+}
+
 /// Returns the current durable final revision for exactly one logical span.
 /// Revisions are append-only and SQLite validates strict consecutive revision
 /// numbers, so the largest revision is the only current head.
@@ -3109,6 +4249,328 @@ mod tests {
         );
         assert!(state.stop_session().unwrap().is_some());
         assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn lists_stopped_sessions_newest_first_and_restores_empty_sessions() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-session-history-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let first_started_at = DateTime::<Utc>::UNIX_EPOCH + Duration::hours(1);
+        let second_started_at = DateTime::<Utc>::UNIX_EPOCH + Duration::hours(2);
+
+        let (first_session_id, second_session_id, expected) = {
+            let state = AppState::open(&database).unwrap();
+            let first = state
+                .start_session_at(
+                    CapturePoint {
+                        monotonic_ns: 1_000,
+                        wall_clock: first_started_at,
+                    },
+                    false,
+                )
+                .unwrap();
+            let revision = TranscriptRevision::original(
+                first.id,
+                TranscriptTiming::new(
+                    1_000,
+                    2_000,
+                    first_started_at,
+                    first_started_at + Duration::milliseconds(1),
+                )
+                .unwrap(),
+                None,
+                "第一段记录。",
+                true,
+                TranscriptSource::UserEdited,
+                None,
+                None,
+            )
+            .unwrap();
+            state.append_final_transcript_revision(revision).unwrap();
+            state
+                .finish_capture_session_at(CapturePoint {
+                    monotonic_ns: 3_000,
+                    wall_clock: first_started_at + Duration::seconds(10),
+                })
+                .unwrap();
+
+            let second = state
+                .start_session_at(
+                    CapturePoint {
+                        monotonic_ns: 4_000,
+                        wall_clock: second_started_at,
+                    },
+                    false,
+                )
+                .unwrap();
+            state
+                .finish_capture_session_at(CapturePoint {
+                    monotonic_ns: 5_000,
+                    wall_clock: second_started_at + Duration::seconds(5),
+                })
+                .unwrap();
+
+            let summaries = state.list_sessions().unwrap();
+            assert_eq!(summaries.len(), 2);
+            assert_eq!(summaries[0].id, second.id);
+            assert_eq!(summaries[0].transcript_count, 0);
+            assert_eq!(summaries[1].id, first.id);
+            assert_eq!(summaries[1].transcript_count, 1);
+            assert!(summaries
+                .iter()
+                .all(|summary| summary.state == crate::domain::SessionState::Stopped));
+            let session_events = state
+                .audit_trail
+                .lock()
+                .unwrap()
+                .events()
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        AuditKind::SessionStarted | AuditKind::SessionStopped
+                    )
+                })
+                .map(|event| (event.kind.clone(), event.run_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                session_events,
+                vec![
+                    (AuditKind::SessionStarted, Some(first.id)),
+                    (AuditKind::SessionStopped, Some(first.id)),
+                    (AuditKind::SessionStarted, Some(second.id)),
+                    (AuditKind::SessionStopped, Some(second.id)),
+                ]
+            );
+            (first.id, second.id, summaries)
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        let restored = reopened.list_sessions().unwrap();
+        assert_eq!(restored, expected);
+        assert_eq!(restored[0].id, second_session_id);
+        assert_eq!(restored[1].id, first_session_id);
+        assert!(reopened.audit_is_valid().unwrap());
+        drop(reopened);
+
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn permanently_deletes_a_stopped_session_and_keeps_other_archives() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-session-deletion-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let started_at = DateTime::<Utc>::UNIX_EPOCH + Duration::hours(8);
+        let (deleted_session_id, retained_session_id) = {
+            let state = AppState::open(&database).unwrap();
+            let deleted = state
+                .start_session_at(
+                    CapturePoint {
+                        monotonic_ns: 1_000,
+                        wall_clock: started_at,
+                    },
+                    false,
+                )
+                .unwrap();
+            let revision = TranscriptRevision::original(
+                deleted.id,
+                TranscriptTiming::new(
+                    1_000,
+                    2_000,
+                    started_at,
+                    started_at + Duration::milliseconds(1),
+                )
+                .unwrap(),
+                None,
+                "删除后不可检索的本地内容",
+                true,
+                TranscriptSource::UserEdited,
+                None,
+                None,
+            )
+            .unwrap();
+            state.append_final_transcript_revision(revision).unwrap();
+            state.create_speaker_cluster(deleted.id).unwrap();
+            state
+                .finish_capture_session_at(CapturePoint {
+                    monotonic_ns: 3_000,
+                    wall_clock: started_at + Duration::seconds(4),
+                })
+                .unwrap();
+
+            let retained = state
+                .start_session_at(
+                    CapturePoint {
+                        monotonic_ns: 4_000,
+                        wall_clock: started_at + Duration::minutes(1),
+                    },
+                    false,
+                )
+                .unwrap();
+            state
+                .finish_capture_session_at(CapturePoint {
+                    monotonic_ns: 5_000,
+                    wall_clock: started_at + Duration::minutes(1) + Duration::seconds(2),
+                })
+                .unwrap();
+
+            state.delete_session(deleted.id).unwrap();
+            assert_eq!(
+                state
+                    .list_sessions()
+                    .unwrap()
+                    .into_iter()
+                    .map(|session| session.id)
+                    .collect::<Vec<_>>(),
+                vec![retained.id]
+            );
+            assert!(state.list_timeline(Some(deleted.id)).unwrap().is_empty());
+            assert!(state
+                .list_speaker_clusters(Some(deleted.id))
+                .unwrap()
+                .is_empty());
+            let store = state.audit_store.lock().unwrap();
+            assert!(store
+                .list_transcript_revisions(deleted.id)
+                .unwrap()
+                .is_empty());
+            assert!(store
+                .search_transcript_revisions(Some(deleted.id), "删除后")
+                .unwrap()
+                .is_empty());
+            assert!(store.verify().unwrap());
+            drop(store);
+            (deleted.id, retained.id)
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        assert_eq!(
+            reopened
+                .list_sessions()
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![retained_session_id]
+        );
+        assert!(reopened
+            .list_timeline(Some(deleted_session_id))
+            .unwrap()
+            .is_empty());
+        assert!(reopened.audit_is_valid().unwrap());
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn rejects_deleting_an_active_or_unknown_session_without_audit_writes() {
+        let state = AppState::in_memory();
+        let active = state.start_session().unwrap();
+        let before = state.audit_trail.lock().unwrap().events().len();
+
+        assert_eq!(
+            state.delete_session(active.id).unwrap_err(),
+            "录音中的会话不能删除，请先停止录音"
+        );
+        assert_eq!(
+            state.delete_session(Uuid::new_v4()).unwrap_err(),
+            "会话不存在或已删除"
+        );
+        assert_eq!(state.audit_trail.lock().unwrap().events().len(), before);
+        assert_eq!(state.list_sessions().unwrap()[0].id, active.id);
+    }
+
+    #[test]
+    fn reopening_an_interrupted_session_does_not_report_live_recording() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-interrupted-session-history-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let session_id = {
+            let state = AppState::open(&database).unwrap();
+            state
+                .start_session_at(
+                    CapturePoint {
+                        monotonic_ns: 7_000,
+                        wall_clock: DateTime::<Utc>::UNIX_EPOCH + Duration::hours(4),
+                    },
+                    false,
+                )
+                .unwrap()
+                .id
+        };
+
+        let reopened = AppState::open(&database).unwrap();
+        let summaries = reopened.list_sessions().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, session_id);
+        assert_eq!(summaries[0].state, crate::domain::SessionState::Stopped);
+        assert_eq!(summaries[0].stopped_at, None);
+        assert_eq!(
+            reopened.privacy_status().unwrap().recording_session_id,
+            None
+        );
+        drop(reopened);
+
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn session_transcript_count_uses_the_latest_logical_span_projection() {
+        let state = AppState::in_memory();
+        let started_at = DateTime::<Utc>::UNIX_EPOCH + Duration::hours(3);
+        let session = state
+            .start_session_at(
+                CapturePoint {
+                    monotonic_ns: 10_000,
+                    wall_clock: started_at,
+                },
+                false,
+            )
+            .unwrap();
+        let timing = TranscriptTiming::new(
+            10_000,
+            20_000,
+            started_at,
+            started_at + Duration::milliseconds(10),
+        )
+        .unwrap();
+        let original = TranscriptRevision::original(
+            session.id,
+            timing.clone(),
+            None,
+            "初稿。",
+            true,
+            TranscriptSource::UserEdited,
+            None,
+            None,
+        )
+        .unwrap();
+        state
+            .append_final_transcript_revision(original.clone())
+            .unwrap();
+        let revised = TranscriptRevision::revision_of(
+            &original,
+            timing,
+            None,
+            "修订稿。",
+            true,
+            TranscriptSource::UserEdited,
+            None,
+            None,
+        )
+        .unwrap();
+        state.append_final_transcript_revision(revised).unwrap();
+
+        let summaries = state.list_sessions().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, session.id);
+        assert_eq!(summaries[0].state, crate::domain::SessionState::Recording);
+        assert_eq!(summaries[0].transcript_count, 1);
     }
 
     #[test]
@@ -3320,7 +4782,14 @@ mod tests {
         };
 
         let projections = state
-            .persist_native_outcome(&runtime, &AsrOutcome::Response { job, response })
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job,
+                    response,
+                    speaker: SpeakerAnalysis::Unavailable,
+                },
+            )
             .unwrap();
 
         assert_eq!(projections.len(), 1);
@@ -3541,6 +5010,18 @@ mod tests {
         }
     }
 
+    fn native_speaker(values: &[f32], duration_ns: u64) -> SpeakerAnalysis {
+        SpeakerAnalysis::Available {
+            embedding: crate::diarization::SpeakerEmbedding::new(
+                ModelProvenance::new("fixture", "speaker-embedding", "v1", "a".repeat(64)).unwrap(),
+                values.to_vec(),
+            )
+            .unwrap(),
+            quality: crate::diarization::SpeakerSampleQuality::new(duration_ns, 0.9, 0.8, 0.0)
+                .unwrap(),
+        }
+    }
+
     #[test]
     fn persists_a_fenced_native_final_using_its_capture_segment_anchor() {
         let state = AppState::in_memory();
@@ -3554,7 +5035,14 @@ mod tests {
             disposition: AsrResponseDisposition::Transcript,
         };
         let projections = state
-            .persist_native_outcome(&runtime, &AsrOutcome::Response { job, response })
+            .persist_native_outcome(
+                &runtime,
+                &AsrOutcome::Response {
+                    job,
+                    response,
+                    speaker: SpeakerAnalysis::Unavailable,
+                },
+            )
             .unwrap();
 
         assert_eq!(projections.len(), 1);
@@ -3593,6 +5081,7 @@ mod tests {
                 &AsrOutcome::Response {
                     job: native_job(&runtime, Uuid::new_v4()),
                     response: AsrResponse::no_speech(),
+                    speaker: SpeakerAnalysis::Unavailable,
                 },
             )
             .unwrap();
@@ -3627,6 +5116,7 @@ mod tests {
                         emissions: Vec::new(),
                         disposition: AsrResponseDisposition::Transcript,
                     },
+                    speaker: SpeakerAnalysis::Unavailable,
                 },
             )
             .unwrap();
@@ -3665,6 +5155,7 @@ mod tests {
                 &AsrOutcome::Response {
                     job: job.clone(),
                     response,
+                    speaker: SpeakerAnalysis::Unavailable,
                 },
             )
             .unwrap();
@@ -3693,6 +5184,7 @@ mod tests {
                         )],
                         disposition: AsrResponseDisposition::Transcript,
                     },
+                    speaker: SpeakerAnalysis::Unavailable,
                 },
             )
             .unwrap();
@@ -3720,6 +5212,7 @@ mod tests {
                 &AsrOutcome::Response {
                     job: job.clone(),
                     response,
+                    speaker: SpeakerAnalysis::Unavailable,
                 },
             )
             .unwrap();
@@ -3826,6 +5319,7 @@ mod tests {
                 emissions: vec![native_emission(&runtime, TranscriptEmissionKind::Final, 1)],
                 disposition: AsrResponseDisposition::Transcript,
             },
+            speaker: SpeakerAnalysis::Unavailable,
         };
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _store = state.audit_store.lock().expect("audit store is available");
@@ -4554,7 +6048,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_lists_and_renames_anonymous_speaker_clusters() {
+    fn creates_lists_and_rejects_enrollment_without_voice_evidence() {
         let state = AppState::in_memory();
         let session = state.start_session().unwrap();
 
@@ -4570,23 +6064,24 @@ mod tests {
         assert_eq!(cluster.label, "Speaker 1");
         assert!(!cluster.is_user_named);
         assert_eq!(cluster.label_revision, 1);
+        assert!(!cluster.can_enroll_voice_profile);
         assert_eq!(state.list_speaker_clusters(None).unwrap(), created.clusters);
 
-        let renamed = state
+        let event_count = state.audit_trail.lock().unwrap().events().len();
+        let error = state
             .rename_speaker_cluster(
                 session.id,
                 cluster.id.clone(),
                 cluster.label_revision,
                 "  会议主持人  ".to_owned(),
+                true,
             )
-            .unwrap();
-        assert!(renamed.updated_spans.is_empty());
-        assert_eq!(renamed.clusters.len(), 1);
-        assert_eq!(renamed.clusters[0].label, "会议主持人");
-        assert!(renamed.clusters[0].is_user_named);
-        assert_eq!(renamed.clusters[0].label_revision, 2);
-
-        let event_count = state.audit_trail.lock().unwrap().events().len();
+            .unwrap_err();
+        assert!(error.contains("no high-quality local sample"));
+        assert_eq!(
+            state.audit_trail.lock().unwrap().events().len(),
+            event_count
+        );
         let label_revisions = state
             .audit_store
             .lock()
@@ -4594,15 +6089,103 @@ mod tests {
             .get_latest_speaker_cluster_label_revision(&cluster.id)
             .unwrap()
             .unwrap();
-        assert_eq!(label_revisions.revision, 2);
-        assert!(state
-            .rename_speaker_cluster(session.id, cluster.id, 1, "过期名称".to_owned())
-            .unwrap_err()
-            .contains("changed"));
-        assert_eq!(
-            state.audit_trail.lock().unwrap().events().len(),
-            event_count
-        );
+        assert_eq!(label_revisions.revision, 1);
+        assert!(state.audit_is_valid().unwrap());
+    }
+
+    #[test]
+    fn confirmed_cluster_creates_a_ready_profile_and_future_sessions_reuse_its_name() {
+        let state = AppState::in_memory();
+        let first_session = state.start_session().unwrap();
+        let first_runtime = native_runtime_for(&first_session, Uuid::new_v4());
+        state
+            .activate_native_runtime(first_runtime.clone())
+            .unwrap();
+        let first = state
+            .persist_native_outcome(
+                &first_runtime,
+                &AsrOutcome::Response {
+                    job: native_job(&first_runtime, Uuid::new_v4()),
+                    response: AsrResponse {
+                        emissions: vec![native_emission(
+                            &first_runtime,
+                            TranscriptEmissionKind::Final,
+                            1,
+                        )],
+                        disposition: AsrResponseDisposition::Transcript,
+                    },
+                    speaker: native_speaker(&[1.0, 0.0, 0.0], 4_000_000_000),
+                },
+            )
+            .unwrap();
+        let first_cluster_id = first[0]
+            .speaker_cluster_id
+            .clone()
+            .expect("eligible speech creates an anonymous cluster");
+        let cluster = state
+            .list_speaker_clusters(Some(first_session.id))
+            .unwrap()
+            .into_iter()
+            .find(|cluster| cluster.id == first_cluster_id)
+            .unwrap();
+        assert!(cluster.can_enroll_voice_profile);
+
+        let renamed = state
+            .rename_speaker_cluster(
+                first_session.id,
+                cluster.id.clone(),
+                cluster.label_revision,
+                "会议主持人".to_owned(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(renamed.clusters[0].label, "会议主持人");
+        let profiles = state.list_voice_profiles().unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].display_name, "会议主持人");
+        assert_eq!(profiles[0].state, VoiceProfileState::Ready);
+
+        state.begin_native_runtime_shutdown(&first_runtime).unwrap();
+        state.begin_native_runtime_handoff(&first_runtime).unwrap();
+        state.mark_native_runtime_drained(&first_runtime).unwrap();
+        state
+            .clear_native_runtime_after_drain(&first_runtime)
+            .unwrap();
+        state.stop_session().unwrap();
+        let second_session = state.start_session().unwrap();
+        let second_runtime = native_runtime_for(&second_session, Uuid::new_v4());
+        state
+            .activate_native_runtime(second_runtime.clone())
+            .unwrap();
+        let second = state
+            .persist_native_outcome(
+                &second_runtime,
+                &AsrOutcome::Response {
+                    job: native_job(&second_runtime, Uuid::new_v4()),
+                    response: AsrResponse {
+                        emissions: vec![native_emission(
+                            &second_runtime,
+                            TranscriptEmissionKind::Final,
+                            1,
+                        )],
+                        disposition: AsrResponseDisposition::Transcript,
+                    },
+                    speaker: native_speaker(&[0.99, 0.01, 0.0], 2_000_000_000),
+                },
+            )
+            .unwrap();
+        let matched_cluster_id = second[0]
+            .speaker_cluster_id
+            .as_deref()
+            .expect("ready profile is assigned in the next session");
+        let matched = state
+            .list_speaker_clusters(Some(second_session.id))
+            .unwrap()
+            .into_iter()
+            .find(|cluster| cluster.id == matched_cluster_id)
+            .unwrap();
+        assert_eq!(matched.label, "会议主持人");
+        assert!(matched.is_user_named);
         assert!(state.audit_is_valid().unwrap());
     }
 

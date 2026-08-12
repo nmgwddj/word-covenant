@@ -7,6 +7,38 @@ describe('settings store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.restoreAllMocks()
+    vi.spyOn(wordCovenantApi, 'listVoiceProfiles').mockResolvedValue([])
+  })
+
+  test('loads and manages display-only voice profile projections', async () => {
+    const profile = {
+      id: 'profile-one',
+      revision: 2,
+      displayName: '主持人',
+      state: 'learning' as const,
+      confirmedDurationNs: 2_000_000_000,
+      readyConfirmedDurationNs: 4_000_000_000,
+      modelId: 'campplus',
+      modelVersion: '2024-10-14',
+      lastConfirmationAt: null,
+      canAddConfirmedSample: false,
+      updatedAt: '2026-08-12T08:00:00.000Z',
+    }
+    vi.mocked(wordCovenantApi.listVoiceProfiles).mockResolvedValue([profile])
+    const rename = vi.spyOn(wordCovenantApi, 'renameVoiceProfile').mockResolvedValue([
+      { ...profile, revision: 3, displayName: '会议主持人' },
+    ])
+    const store = useSettingsStore()
+
+    await store.loadVoiceProfiles()
+    expect(store.voiceProfiles).toEqual([profile])
+    await expect(store.renameVoiceProfile(profile, '会议主持人')).resolves.toBe(true)
+    expect(rename).toHaveBeenCalledWith({
+      profileId: 'profile-one',
+      expectedRevision: 2,
+      displayName: '会议主持人',
+    })
+    expect(store.voiceProfiles[0]?.displayName).toBe('会议主持人')
   })
 
   test('starts with the product default and loads the persisted local threshold', async () => {

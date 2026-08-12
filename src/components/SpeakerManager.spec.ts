@@ -14,6 +14,7 @@ const clusters = [
     mergedIntoClusterId: null,
     canonicalClusterId: 'speaker-1',
     spanCount: 2,
+    canEnrollVoiceProfile: true,
   },
   {
     id: 'speaker-2',
@@ -25,6 +26,7 @@ const clusters = [
     mergedIntoClusterId: null,
     canonicalClusterId: 'speaker-2',
     spanCount: 1,
+    canEnrollVoiceProfile: true,
   },
 ]
 
@@ -44,6 +46,7 @@ const spans: TranscriptSpan[] = [
 
 function mountManager({
   error = null,
+  managerClusters = clusters,
   managerSpans = spans,
   selectedSpanId = 'span-1',
   sessionStartNs = 0,
@@ -51,6 +54,7 @@ function mountManager({
   attachTo,
 }: {
   error?: string | null
+  managerClusters?: typeof clusters
   managerSpans?: typeof spans
   selectedSpanId?: string | null
   sessionStartNs?: number
@@ -60,7 +64,7 @@ function mountManager({
   return mount(SpeakerManager, {
     attachTo,
     props: {
-      clusters,
+      clusters: managerClusters,
       spans: managerSpans,
       selectedSpanId,
       sessionStartNs,
@@ -76,7 +80,8 @@ describe('SpeakerManager', () => {
 
     expect(wrapper.get('aside').attributes('aria-modal')).toBeUndefined()
     expect(wrapper.text()).toContain('请归类这条本地记录。')
-    await wrapper.get('[data-testid="speaker-target"]').setValue('speaker-2')
+    await wrapper.get('[data-testid="speaker-target"]').trigger('click')
+    await wrapper.get('[role="option"][data-value="speaker-2"]').trigger('click')
     await wrapper.get('.speaker-manager__assignment').trigger('submit')
 
     expect(wrapper.emitted('reassign')).toEqual([
@@ -97,6 +102,8 @@ describe('SpeakerManager', () => {
     await wrapper.get('[data-testid="create-speaker-cluster"]').trigger('click')
     await wrapper.get('[data-testid="speaker-label-speaker-2"]').setValue('主持人')
     await wrapper.findAll('.speaker-manager__row form')[1]!.trigger('submit')
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('在本机记住这个声音')
+    await wrapper.get('[data-testid="confirm-voice-enrollment"]').trigger('click')
 
     expect(wrapper.emitted('create')).toEqual([['session-one']])
     expect(wrapper.emitted('rename')).toEqual([
@@ -106,10 +113,23 @@ describe('SpeakerManager', () => {
           clusterId: 'speaker-2',
           expectedLabelRevision: 1,
           label: '主持人',
+          consent: true,
         },
       ],
     ])
     expect(wrapper.props('clusters')).toEqual(clusters)
+  })
+
+  test('does not offer voice enrollment for an empty manually created cluster', async () => {
+    const emptyCluster = { ...clusters[1]!, spanCount: 0, canEnrollVoiceProfile: false }
+    const wrapper = mountManager({ managerClusters: [clusters[0]!, emptyCluster] })
+
+    await wrapper.get('[data-testid="speaker-label-speaker-2"]').setValue('主持人')
+    await wrapper.findAll('.speaker-manager__row form')[1]!.trigger('submit')
+
+    expect(wrapper.find('[role="alertdialog"]').exists()).toBe(false)
+    expect(wrapper.get('[role="alert"]').text()).toContain('还没有可用于声纹学习的录音')
+    expect(wrapper.emitted('rename')).toBeUndefined()
   })
 
   test('exposes operation failures in an accessible alert', () => {

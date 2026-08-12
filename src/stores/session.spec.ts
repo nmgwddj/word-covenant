@@ -12,10 +12,295 @@ const recordingSession = {
   state: 'recording' as const,
 }
 
+const olderSummary = {
+  id: 'session-older',
+  startedAt: '2026-08-07T00:00:00.000Z',
+  startedMonotonicNs: 100,
+  stoppedAt: '2026-08-07T00:00:10.000Z',
+  state: 'stopped' as const,
+  transcriptCount: 1,
+}
+
+const newestSummary = {
+  id: 'session-newest',
+  startedAt: '2026-08-08T00:00:00.000Z',
+  startedMonotonicNs: 1_000,
+  stoppedAt: '2026-08-08T00:00:12.000Z',
+  state: 'stopped' as const,
+  transcriptCount: 2,
+}
+
+const newestTimeline = [
+  {
+    id: 'newest-span',
+    sessionId: newestSummary.id,
+    captureStartNs: 1_100,
+    captureEndNs: 1_900,
+    speakerClusterId: null,
+    text: '最新会话',
+    isFinal: true,
+    revision: 1,
+    source: 'local_inference' as const,
+  },
+]
+
+const newestClusters = [
+  {
+    id: 'speaker-1',
+    sessionId: newestSummary.id,
+    label: '说话人 1',
+    isUserNamed: false,
+    labelRevision: 1,
+    aliasRevision: 0,
+    mergedIntoClusterId: null,
+    canonicalClusterId: 'speaker-1',
+    spanCount: 1,
+    canEnrollVoiceProfile: true,
+  },
+]
+
 describe('session store', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     vi.restoreAllMocks()
+  })
+
+  test('initializes the newest session archive projection by explicit session id', async () => {
+    const listSessions = vi.spyOn(wordCovenantApi, 'listSessions').mockResolvedValue([newestSummary, olderSummary])
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue(newestTimeline)
+    const listSpeakerClusters = vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue(newestClusters)
+    vi.spyOn(wordCovenantApi, 'listActions').mockResolvedValue([])
+    vi.spyOn(wordCovenantApi, 'getCaptureProjection').mockResolvedValue({
+      revision: 0,
+      status: 'idle',
+      permission: 'granted',
+      selectedDevice: null,
+      devices: [],
+      meter: null,
+      lastIssue: null,
+    })
+    const store = useSessionStore()
+
+    await store.initialize()
+
+    expect(listSessions).toHaveBeenCalledOnce()
+    expect(listTimeline).toHaveBeenCalledWith(newestSummary.id)
+    expect(listSpeakerClusters).toHaveBeenCalledWith(newestSummary.id)
+    expect(store.sessions).toEqual([newestSummary, olderSummary])
+    expect(store.selectedSessionId).toBe(newestSummary.id)
+    expect(store.selectedSession).toEqual(newestSummary)
+    expect(store.timeline).toEqual(newestTimeline)
+    expect(store.speakerClusters).toEqual(newestClusters)
+    expect(store.isSessionHistoryLoading).toBe(false)
+    expect(store.sessionHistoryError).toBeNull()
+  })
+
+  test('selects a newly started recording and refreshes its archive summary', async () => {
+    const startedSummary = { ...recordingSession, transcriptCount: 0 }
+    const store = useSessionStore()
+    vi.spyOn(wordCovenantApi, 'startSession').mockResolvedValue(recordingSession)
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue([])
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue([])
+    vi.spyOn(wordCovenantApi, 'getCaptureProjection').mockResolvedValue({
+      revision: 1,
+      status: 'recording',
+      permission: 'granted',
+      selectedDevice: null,
+      devices: [],
+      meter: null,
+      lastIssue: null,
+    })
+    const listSessions = vi.spyOn(wordCovenantApi, 'listSessions').mockResolvedValue([startedSummary, newestSummary])
+
+    await store.toggleRecording()
+
+    expect(store.activeSession).toEqual(recordingSession)
+    expect(store.selectedSessionId).toBe(recordingSession.id)
+    expect(store.selectedSession).toEqual(startedSummary)
+    expect(store.timeline).toEqual([])
+    expect(listSessions).toHaveBeenCalledOnce()
+  })
+
+  test('stops into a final timeline and reports a failed archive refresh without discarding it', async () => {
+    const stoppedSession = {
+      ...recordingSession,
+      state: 'stopped' as const,
+      stoppedAt: '2026-08-08T00:00:12.000Z',
+    }
+    const finalTimeline = [{ ...newestTimeline[0], sessionId: stoppedSession.id }]
+    const store = useSessionStore()
+    store.activeSession = recordingSession
+    store.selectedSessionId = recordingSession.id
+    store.sessions = [{ ...recordingSession, transcriptCount: 0 }]
+    store.applyCaptureProjection({
+      revision: 1,
+      status: 'recording',
+      permission: 'granted',
+      selectedDevice: null,
+      devices: [],
+      meter: null,
+      lastIssue: null,
+    })
+    vi.spyOn(wordCovenantApi, 'stopSession').mockResolvedValue(stoppedSession)
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue(finalTimeline)
+    vi.spyOn(wordCovenantApi, 'listSessions').mockRejectedValue(new Error('会话索引暂不可用'))
+
+    await store.toggleRecording()
+
+    expect(store.activeSession).toEqual(stoppedSession)
+    expect(store.selectedSessionId).toBe(stoppedSession.id)
+    expect(store.timeline).toEqual(finalTimeline)
+    expect(store.sessions).toEqual([{ ...stoppedSession, transcriptCount: 1 }])
+    expect(store.sessionHistoryError).toBe('会话索引暂不可用')
+    expect(store.isSessionHistoryLoading).toBe(false)
+  })
+
+  test('retains session summaries when the newest timeline cannot be loaded during initialization', async () => {
+    const store = useSessionStore()
+    vi.spyOn(wordCovenantApi, 'listSessions').mockResolvedValue([newestSummary, olderSummary])
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockRejectedValue(new Error('时间线暂不可用'))
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue([])
+
+    await store.initializeSessionHistory()
+
+    expect(store.sessions).toEqual([newestSummary, olderSummary])
+    expect(store.selectedSessionId).toBeNull()
+    expect(store.timeline).toEqual([])
+    expect(store.sessionHistoryError).toBe('时间线暂不可用')
+  })
+
+  test('commits historical selection only after timeline and speakers both load', async () => {
+    let resolveTimeline: (value: typeof newestTimeline) => void = () => {}
+    let resolveClusters: (value: typeof newestClusters) => void = () => {}
+    const timelineRequest = new Promise<typeof newestTimeline>(resolve => {
+      resolveTimeline = resolve
+    })
+    const clustersRequest = new Promise<typeof newestClusters>(resolve => {
+      resolveClusters = resolve
+    })
+    const store = useSessionStore()
+    store.sessions = [newestSummary, olderSummary]
+    store.selectedSessionId = olderSummary.id
+    store.timeline = [{ ...newestTimeline[0], id: 'older-span', sessionId: olderSummary.id }]
+    const previousTimeline = [...store.timeline]
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockReturnValue(timelineRequest)
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockReturnValue(clustersRequest)
+
+    const selection = store.selectSession(newestSummary.id)
+    expect(store.selectedSessionId).toBe(olderSummary.id)
+    expect(store.timeline).toEqual(previousTimeline)
+    expect(store.isSessionHistoryLoading).toBe(true)
+
+    resolveTimeline(newestTimeline)
+    await Promise.resolve()
+    expect(store.selectedSessionId).toBe(olderSummary.id)
+
+    resolveClusters(newestClusters)
+    await expect(selection).resolves.toBe(true)
+    expect(store.selectedSessionId).toBe(newestSummary.id)
+    expect(store.timeline).toEqual(newestTimeline)
+    expect(store.speakerClusters).toEqual(newestClusters)
+    expect(store.isSessionHistoryLoading).toBe(false)
+  })
+
+  test('preserves the selected archive projection when another session fails to load', async () => {
+    const store = useSessionStore()
+    store.sessions = [newestSummary, olderSummary]
+    store.selectedSessionId = olderSummary.id
+    store.timeline = [{ ...newestTimeline[0], id: 'older-span', sessionId: olderSummary.id }]
+    const previousTimeline = [...store.timeline]
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockRejectedValue(new Error('记录读取失败'))
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue(newestClusters)
+
+    await expect(store.selectSession(newestSummary.id)).resolves.toBe(false)
+
+    expect(store.selectedSessionId).toBe(olderSummary.id)
+    expect(store.timeline).toEqual(previousTimeline)
+    expect(store.sessionHistoryError).toBe('记录读取失败')
+  })
+
+  test('rejects historical selection while recording without loading projections', async () => {
+    const store = useSessionStore()
+    store.sessions = [newestSummary, olderSummary]
+    store.selectedSessionId = newestSummary.id
+    store.activeSession = recordingSession
+    store.applyCaptureProjection({
+      revision: 1,
+      status: 'recording',
+      permission: 'granted',
+      selectedDevice: null,
+      devices: [],
+      meter: null,
+      lastIssue: null,
+    })
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline')
+    const listSpeakerClusters = vi.spyOn(wordCovenantApi, 'listSpeakerClusters')
+
+    await expect(store.selectSession(olderSummary.id)).resolves.toBe(false)
+
+    expect(store.selectedSessionId).toBe(newestSummary.id)
+    expect(listTimeline).not.toHaveBeenCalled()
+    expect(listSpeakerClusters).not.toHaveBeenCalled()
+  })
+
+  test('deletes the selected session and loads the adjacent archive projection', async () => {
+    const store = useSessionStore()
+    store.sessions = [newestSummary, olderSummary]
+    store.selectedSessionId = newestSummary.id
+    store.timeline = newestTimeline
+    store.speakerClusters = newestClusters
+    const deleteSession = vi.spyOn(wordCovenantApi, 'deleteSession').mockResolvedValue()
+    const olderTimeline = [{ ...newestTimeline[0], id: 'older-span', sessionId: olderSummary.id }]
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue(olderTimeline)
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue([])
+
+    await expect(store.deleteSession(newestSummary.id)).resolves.toBe(true)
+
+    expect(deleteSession).toHaveBeenCalledWith(newestSummary.id)
+    expect(store.sessions).toEqual([olderSummary])
+    expect(store.selectedSessionId).toBe(olderSummary.id)
+    expect(store.timeline).toEqual(olderTimeline)
+    expect(store.speakerClusters).toEqual([])
+    expect(store.deletingSessionId).toBeNull()
+  })
+
+  test('deletes an unselected session without reloading the current projection', async () => {
+    const store = useSessionStore()
+    store.sessions = [newestSummary, olderSummary]
+    store.selectedSessionId = newestSummary.id
+    store.timeline = newestTimeline
+    vi.spyOn(wordCovenantApi, 'deleteSession').mockResolvedValue()
+    const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline')
+
+    await expect(store.deleteSession(olderSummary.id)).resolves.toBe(true)
+
+    expect(store.sessions).toEqual([newestSummary])
+    expect(store.selectedSessionId).toBe(newestSummary.id)
+    expect(store.timeline).toEqual(newestTimeline)
+    expect(listTimeline).not.toHaveBeenCalled()
+  })
+
+  test('keeps a session when native deletion fails and rejects deletion while recording', async () => {
+    const store = useSessionStore()
+    store.sessions = [newestSummary]
+    store.selectedSessionId = newestSummary.id
+    const deleteSession = vi.spyOn(wordCovenantApi, 'deleteSession').mockRejectedValue(new Error('本地数据库忙碌'))
+
+    await expect(store.deleteSession(newestSummary.id)).resolves.toBe(false)
+    expect(store.sessions).toEqual([newestSummary])
+    expect(store.sessionHistoryError).toBe('本地数据库忙碌')
+
+    store.applyCaptureProjection({
+      revision: 1,
+      status: 'recording',
+      permission: 'granted',
+      selectedDevice: null,
+      devices: [],
+      meter: null,
+      lastIssue: null,
+    })
+    await expect(store.deleteSession(newestSummary.id)).resolves.toBe(false)
+    expect(deleteSession).toHaveBeenCalledOnce()
   })
 
   test('uses the development source and merges incremental synthetic spans by revision', async () => {
@@ -259,7 +544,7 @@ describe('session store', () => {
     })
   })
 
-  test('reloads the active timeline once for each newer native final transcript projection', async () => {
+  test('reloads the active timeline and speaker catalog for each newer native final transcript projection', async () => {
     const store = useSessionStore()
     const refreshedTimeline = [
       {
@@ -275,7 +560,17 @@ describe('session store', () => {
       },
     ]
     store.activeSession = recordingSession
+    store.selectedSessionId = recordingSession.id
     const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue(refreshedTimeline)
+    const refreshedClusters = [
+      {
+        ...newestClusters[0]!,
+        sessionId: recordingSession.id,
+        label: '已登记说话人',
+        isUserNamed: true,
+      },
+    ]
+    const listSpeakerClusters = vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue(refreshedClusters)
 
     await store.applyFinalTranscriptProjection({ sessionId: recordingSession.id, revision: 2 })
     await store.applyFinalTranscriptProjection({ sessionId: recordingSession.id, revision: 2 })
@@ -284,7 +579,10 @@ describe('session store', () => {
 
     expect(listTimeline).toHaveBeenCalledTimes(1)
     expect(listTimeline).toHaveBeenCalledWith(recordingSession.id)
+    expect(listSpeakerClusters).toHaveBeenCalledTimes(1)
+    expect(listSpeakerClusters).toHaveBeenCalledWith(recordingSession.id)
     expect(store.timeline).toEqual(refreshedTimeline)
+    expect(store.speakerClusters).toEqual(refreshedClusters)
     expect(store.finalTranscriptProjectionRevisions).toEqual({
       [recordingSession.id]: 2,
       'other-session': 3,
@@ -307,14 +605,20 @@ describe('session store', () => {
       },
     ]
     const newerTimeline = [{ ...olderTimeline[0], text: '较新快照', revision: 2 }]
+    const olderClusters = [{ ...newestClusters[0]!, sessionId: recordingSession.id, label: '旧名称' }]
+    const newerClusters = [{ ...newestClusters[0]!, sessionId: recordingSession.id, label: '自动归类名称' }]
     let resolveOlderTimeline: (timeline: typeof olderTimeline) => void = () => {}
     const olderTimelineRequest = new Promise<typeof olderTimeline>(resolve => {
       resolveOlderTimeline = resolve
     })
     store.activeSession = recordingSession
+    store.selectedSessionId = recordingSession.id
     vi.spyOn(wordCovenantApi, 'listTimeline')
       .mockReturnValueOnce(olderTimelineRequest)
       .mockResolvedValueOnce(newerTimeline)
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters')
+      .mockResolvedValueOnce(olderClusters)
+      .mockResolvedValueOnce(newerClusters)
 
     const olderRefresh = store.applyFinalTranscriptProjection({
       sessionId: recordingSession.id,
@@ -329,6 +633,7 @@ describe('session store', () => {
     await olderRefresh
 
     expect(store.timeline).toEqual(newerTimeline)
+    expect(store.speakerClusters).toEqual(newerClusters)
   })
 
   test('forces a final timeline refresh after stopping real microphone capture', async () => {
@@ -352,6 +657,7 @@ describe('session store', () => {
       },
     ]
     store.activeSession = recordingSession
+    store.selectedSessionId = recordingSession.id
     store.applyCaptureProjection({
       revision: 1,
       status: 'recording',
@@ -396,6 +702,7 @@ describe('session store', () => {
         mergedIntoClusterId: null,
         canonicalClusterId: 'speaker-2',
         spanCount: 1,
+        canEnrollVoiceProfile: true,
       },
     ]
     let completeOperation:
@@ -413,6 +720,7 @@ describe('session store', () => {
       revision: 2,
     }
     store.timeline = [original]
+    store.selectedSessionId = 'session-one'
     store.speakerClusters = [
       {
         ...clusters[0],
@@ -476,6 +784,7 @@ describe('session store', () => {
         mergedIntoClusterId: null,
         canonicalClusterId: 'speaker-1',
         spanCount: 1,
+        canEnrollVoiceProfile: true,
       },
     ]
     const refreshedClusters = [
@@ -489,6 +798,7 @@ describe('session store', () => {
         mergedIntoClusterId: null,
         canonicalClusterId: 'speaker-2',
         spanCount: 1,
+        canEnrollVoiceProfile: true,
       },
     ]
     let resolveTimeline: (timeline: typeof refreshedTimeline) => void = () => {}
@@ -501,6 +811,7 @@ describe('session store', () => {
     })
 
     store.timeline = [staleSpan]
+    store.selectedSessionId = 'session-one'
     store.speakerClusters = staleClusters
     vi.spyOn(wordCovenantApi, 'reassignTranscriptSpeaker').mockRejectedValue(new Error('记录版本已过期'))
     const listTimeline = vi.spyOn(wordCovenantApi, 'listTimeline').mockReturnValue(timelineRefresh)
@@ -554,6 +865,7 @@ describe('session store', () => {
         mergedIntoClusterId: null,
         canonicalClusterId: 'speaker-1',
         spanCount: 1,
+        canEnrollVoiceProfile: true,
       },
     ]
 
@@ -580,5 +892,37 @@ describe('session store', () => {
     expect(store.speakerClusters).toEqual(staleClusters)
     expect(store.speakerError).toBe('记录版本已过期')
     expect(store.isSpeakerOperationPending).toBe(false)
+  })
+
+  test('surfaces plain Tauri speaker errors and translates missing enrollment evidence', async () => {
+    const store = useSessionStore()
+    store.selectedSessionId = 'session-one'
+    vi.spyOn(wordCovenantApi, 'renameSpeakerCluster').mockRejectedValue(
+      'this speaker has no high-quality local sample available for enrollment'
+    )
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue([])
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue([])
+
+    await store.renameSpeakerCluster({
+      sessionId: 'session-one',
+      clusterId: 'speaker-1',
+      expectedLabelRevision: 1,
+      label: '主持人',
+      consent: true,
+    })
+
+    expect(store.speakerError).toBe('该归类还没有可用于声纹学习的录音，请重新录制一段清晰人声后再命名')
+  })
+
+  test('keeps an unrecognized plain Tauri speaker error instead of hiding it', async () => {
+    const store = useSessionStore()
+    store.selectedSessionId = 'session-one'
+    vi.spyOn(wordCovenantApi, 'createSpeakerCluster').mockRejectedValue('本地说话人数据库暂时不可用')
+    vi.spyOn(wordCovenantApi, 'listTimeline').mockResolvedValue([])
+    vi.spyOn(wordCovenantApi, 'listSpeakerClusters').mockResolvedValue([])
+
+    await store.createSpeakerCluster('session-one')
+
+    expect(store.speakerError).toBe('本地说话人数据库暂时不可用')
   })
 })

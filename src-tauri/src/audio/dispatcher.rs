@@ -7,6 +7,7 @@
 //! projection and speech segmentation observe the same PCM sequence.
 
 use super::{CaptureClock, CaptureIngress, CapturePoint, MAX_CAPTURE_SAMPLES_PER_PACKET};
+use crate::diarization::{SpeakerEmbedding, SpeakerSampleQuality};
 use crate::inference::pipeline::{
     NativePcmPacket, SpeechActivityDetector, SpeechSegmenter, SpeechSegmenterError,
     SpeechWindowEvent, PIPELINE_FRAME_SAMPLES,
@@ -252,7 +253,20 @@ pub enum AsrJobExecution {
     EngineResult {
         model_provenance: ModelProvenance,
         result: Result<AsrResponse, InferenceError>,
+        speaker: Box<SpeakerAnalysis>,
     },
+}
+
+/// Native-only speaker analysis from the same owned VAD window as ASR.
+/// It deliberately has no serialization implementation and contains no PCM.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SpeakerAnalysis {
+    Available {
+        embedding: SpeakerEmbedding,
+        quality: SpeakerSampleQuality,
+    },
+    Unavailable,
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -286,6 +300,7 @@ pub enum AsrOutcome {
     Response {
         job: AsrJobMetadata,
         response: AsrResponse,
+        speaker: SpeakerAnalysis,
     },
     Gap(InferenceGap),
 }
@@ -728,12 +743,14 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
             AsrJobExecution::EngineResult {
                 model_provenance,
                 result,
+                speaker,
             } => match result {
                 Ok(response) => {
                     match response.validate_against(lease.job.request(), &model_provenance) {
                         Ok(()) => AsrOutcome::Response {
                             job: lease.job.metadata().clone(),
                             response,
+                            speaker: *speaker,
                         },
                         Err(_) => {
                             self.metrics.engine_failure_outcomes =
@@ -799,6 +816,7 @@ impl<S: SpeechWindowSource> CaptureDispatcher<S> {
             Some(engine) => AsrJobExecution::EngineResult {
                 model_provenance: engine.model_provenance().clone(),
                 result: engine.transcribe(lease.request()),
+                speaker: Box::new(SpeakerAnalysis::Unavailable),
             },
         };
         self.complete_asr_job(lease, execution)
@@ -1770,6 +1788,7 @@ mod tests {
         let execution = AsrJobExecution::EngineResult {
             model_provenance: engine.model_provenance().clone(),
             result: engine.transcribe(lease.request()),
+            speaker: Box::new(SpeakerAnalysis::Unavailable),
         };
         assert_eq!(
             dispatcher.complete_asr_job(lease, execution).unwrap(),

@@ -32,7 +32,7 @@ pub use dispatcher::{
     AsrJobMetadata, AsrOutcome, AsrQueueMetrics, CaptureDispatcher, DispatcherError,
     DispatcherMeter, DispatcherRuntime, DispatcherRuntimeId, DispatcherStatus, IngressPumpResult,
     OwnedOutcomeLease, OwnedOutcomeLeaseError, ShutdownDrainResult, ShutdownPreparationResult,
-    WorkerPumpResult,
+    SpeakerAnalysis, WorkerPumpResult,
 };
 pub use lifecycle::{
     CaptureFailureCode, CaptureLifecycle, CaptureLifecycleAction, CaptureLifecycleError,

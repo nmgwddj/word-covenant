@@ -357,6 +357,7 @@ pub struct SpeakerCluster {
     pub merged_into_cluster_id: Option<String>,
     pub canonical_cluster_id: String,
     pub span_count: u32,
+    pub can_enroll_voice_profile: bool,
 }
 
 impl SpeakerCluster {
@@ -366,6 +367,7 @@ impl SpeakerCluster {
         alias: Option<&SpeakerClusterAliasRevision>,
         canonical_cluster_id: impl Into<String>,
         span_count: u32,
+        can_enroll_voice_profile: bool,
     ) -> Result<Self, String> {
         record.validate()?;
         label.validate_for_cluster(record)?;
@@ -401,6 +403,7 @@ impl SpeakerCluster {
             merged_into_cluster_id,
             canonical_cluster_id,
             span_count,
+            can_enroll_voice_profile,
         })
     }
 }
@@ -588,7 +591,8 @@ mod tests {
         let label = SpeakerClusterLabelRevision::initial_generated(&source).unwrap();
 
         let active =
-            SpeakerCluster::from_revisions(&source, &label, None, source.id.clone(), 3).unwrap();
+            SpeakerCluster::from_revisions(&source, &label, None, source.id.clone(), 3, true)
+                .unwrap();
         assert_eq!(active.canonical_cluster_id, source.id);
         assert_eq!(active.merged_into_cluster_id, None);
         assert_eq!(active.alias_revision, 0);
@@ -596,7 +600,8 @@ mod tests {
         let alias =
             SpeakerClusterAliasRevision::aliased_to(source.id.clone(), target.id.clone()).unwrap();
         let merged =
-            SpeakerCluster::from_revisions(&source, &label, Some(&alias), target.id, 3).unwrap();
+            SpeakerCluster::from_revisions(&source, &label, Some(&alias), target.id, 3, true)
+                .unwrap();
         assert_eq!(
             merged.merged_into_cluster_id,
             merged.canonical_cluster_id.into()

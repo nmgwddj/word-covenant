@@ -20,6 +20,43 @@ pub struct CaptureSession {
     pub state: SessionState,
 }
 
+/// Path-free archive metadata for one local recording session.
+///
+/// Transcript content remains in the session-scoped timeline projection; this
+/// summary only exposes the current number of logical transcript spans.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub started_monotonic_ns: u64,
+    pub stopped_at: Option<DateTime<Utc>>,
+    pub state: SessionState,
+    pub transcript_count: usize,
+}
+
+/// Minimal retained proof that local content for a session was erased.
+/// Transcript text, speaker labels, and content counts are deliberately not
+/// part of this payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDeletedAuditPayload {
+    pub session_id: Uuid,
+}
+
+impl From<&CaptureSession> for SessionSummary {
+    fn from(session: &CaptureSession) -> Self {
+        Self {
+            id: session.id,
+            started_at: session.started_at,
+            started_monotonic_ns: session.started_monotonic_ns,
+            stopped_at: session.stopped_at,
+            state: session.state.clone(),
+            transcript_count: 0,
+        }
+    }
+}
+
 impl CaptureSession {
     pub fn begin(started_monotonic_ns: u64, started_at: DateTime<Utc>) -> Self {
         Self::begin_with_id(Uuid::new_v4(), started_monotonic_ns, started_at)
@@ -221,6 +258,25 @@ mod tests {
         session.publish_recording().unwrap();
         assert_eq!(session.state, SessionState::Recording);
         assert!(session.publish_recording().is_err());
+    }
+
+    #[test]
+    fn serializes_session_summary_with_camel_case_fields() {
+        let summary = SessionSummary {
+            id: Uuid::new_v4(),
+            started_at: DateTime::<Utc>::UNIX_EPOCH,
+            started_monotonic_ns: 123,
+            stopped_at: Some(DateTime::<Utc>::UNIX_EPOCH),
+            state: SessionState::Stopped,
+            transcript_count: 4,
+        };
+
+        let value = serde_json::to_value(summary).unwrap();
+        assert!(value.get("startedAt").is_some());
+        assert!(value.get("startedMonotonicNs").is_some());
+        assert!(value.get("stoppedAt").is_some());
+        assert!(value.get("transcriptCount").is_some());
+        assert!(value.get("started_at").is_none());
     }
 
     #[test]

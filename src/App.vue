@@ -6,6 +6,7 @@ import DevelopmentCaptureControl from '@/components/DevelopmentCaptureControl.vu
 import LiveAudioMeter from '@/components/LiveAudioMeter.vue'
 import PrivacyStatus from '@/components/PrivacyStatus.vue'
 import RecordingControl from '@/components/RecordingControl.vue'
+import SessionRail from '@/components/SessionRail.vue'
 import SettingsPage from '@/components/SettingsPage.vue'
 import SpeakerManager from '@/components/SpeakerManager.vue'
 import TimelinePanel from '@/components/TimelinePanel.vue'
@@ -14,7 +15,7 @@ import { useModelStore } from '@/stores/models'
 import { useSettingsStore } from '@/stores/settings'
 import { useSessionStore } from '@/stores/session'
 import { wordCovenantApi } from '@/lib/wordCovenantApi'
-import type { LocalModelImportInput, SpeechDetectionSettings } from '@/types'
+import type { LocalModelImportInput, SpeechDetectionSettings, VoiceProfile } from '@/types'
 
 const privacyStore = usePrivacyStore()
 const modelStore = useModelStore()
@@ -66,6 +67,10 @@ const applicationSettingsButton = ref<HTMLButtonElement | null>(null)
 const isSpeakerManagerOpen = computed(() =>
   sessionStore.timeline.some(span => span.id === selectedSpeakerSpanId.value && span.isFinal)
 )
+const selectedSessionStartNs = computed(
+  () => sessionStore.selectedSession?.startedMonotonicNs ?? sessionStore.activeSession?.startedMonotonicNs ?? 0
+)
+const selectedSessionUsesWallClock = computed(() => sessionStore.selectedSession?.state === 'stopped')
 
 onMounted(async () => {
   unlistenCaptureProjection = await wordCovenantApi.onCaptureProjection(projection => {
@@ -86,6 +91,23 @@ async function toggleRecording() {
   await sessionStore.toggleRecording()
   await privacyStore.refresh()
   synchronizeDevelopmentMockTimer()
+}
+
+async function selectSession(sessionId: string) {
+  selectedSpeakerSpanId.value = null
+  speakerManagerTrigger.value = null
+  sessionStore.clearSpeakerError()
+  await sessionStore.selectSession(sessionId)
+}
+
+async function deleteSession(sessionId: string) {
+  const deletesSelectedSession = sessionStore.selectedSessionId === sessionId
+  const deleted = await sessionStore.deleteSession(sessionId)
+  if (deleted && deletesSelectedSession) {
+    selectedSpeakerSpanId.value = null
+    speakerManagerTrigger.value = null
+    sessionStore.clearSpeakerError()
+  }
 }
 
 async function setEgressEnabled(enabled: boolean) {
@@ -131,6 +153,10 @@ function closeApplicationSettings() {
 
 async function saveSpeechDetection(settings: SpeechDetectionSettings) {
   await settingsStore.setSpeechDetection(settings)
+}
+
+async function renameVoiceProfile(profile: VoiceProfile, displayName: string) {
+  await settingsStore.renameVoiceProfile(profile, displayName)
 }
 
 async function importLocalModel(input: LocalModelImportInput) {
@@ -180,6 +206,7 @@ async function renameSpeakerCluster(input: {
   clusterId: string
   expectedLabelRevision: number
   label: string
+  consent: boolean
 }) {
   await sessionStore.renameSpeakerCluster(input)
 }
@@ -298,6 +325,10 @@ onBeforeUnmount(() => {
       :error="modelStore.importError"
       :active-asr-error="modelStore.activeAsrError"
       :select-source-path="selectLocalModelFile"
+      :voice-profiles="settingsStore.voiceProfiles"
+      :loading-voice-profiles="settingsStore.isLoadingVoiceProfiles"
+      :pending-voice-profile-id="settingsStore.pendingVoiceProfileId"
+      :voice-profile-error="settingsStore.voiceProfileError"
       @close="closeApplicationSettings"
       @clear-error="clearLocalModelImportError"
       @clear-active-asr-error="modelStore.clearActiveAsrError"
@@ -307,26 +338,30 @@ onBeforeUnmount(() => {
       @save-speech-detection="saveSpeechDetection"
       @import="importLocalModel"
       @select-active-asr-model="selectActiveLocalAsrModel"
+      @clear-voice-profile-error="settingsStore.clearVoiceProfileError"
+      @rename-voice-profile="renameVoiceProfile"
+      @relearn-voice-profile="settingsStore.relearnVoiceProfile"
+      @add-voice-profile-sample="settingsStore.addVoiceProfileConfirmedSample"
+      @delete-voice-profile="settingsStore.deleteVoiceProfile"
     />
 
     <section v-else class="workspace-grid">
-      <aside class="session-rail" aria-label="本地会话">
-        <p class="session-rail__label">LOCAL ARCHIVE</p>
-        <button class="session-item session-item--active" type="button">
-          <span class="session-item__dot" aria-hidden="true" />
-          <span>当前会话</span>
-          <time>今天</time>
-        </button>
-        <button class="icon-button session-rail__new" type="button" title="新建本地会话">
-          <span class="i-mdi-plus" aria-hidden="true" />
-        </button>
-      </aside>
+      <SessionRail
+        :sessions="sessionStore.sessions"
+        :selected-session-id="sessionStore.selectedSessionId"
+        :recording="sessionStore.isRecording"
+        :loading="sessionStore.isSessionHistoryLoading"
+        :deleting-session-id="sessionStore.deletingSessionId"
+        :error="sessionStore.sessionHistoryError"
+        @select="selectSession"
+        @delete="deleteSession"
+      />
 
       <TimelinePanel
         :spans="sessionStore.timeline"
         :speaker-clusters="sessionStore.speakerClusters"
-        :session-start-ns="sessionStore.activeSession?.startedMonotonicNs ?? 0"
-        :use-wall-clock="!sessionStore.activeSession"
+        :session-start-ns="selectedSessionStartNs"
+        :use-wall-clock="selectedSessionUsesWallClock"
         @open-speaker-manager="openSpeakerManager"
       />
       <AgentActionPanel
@@ -356,8 +391,8 @@ onBeforeUnmount(() => {
       :clusters="sessionStore.speakerClusters"
       :spans="sessionStore.timeline"
       :selected-span-id="selectedSpeakerSpanId"
-      :session-start-ns="sessionStore.activeSession?.startedMonotonicNs ?? 0"
-      :use-wall-clock="!sessionStore.activeSession"
+      :session-start-ns="selectedSessionStartNs"
+      :use-wall-clock="selectedSessionUsesWallClock"
       :pending="sessionStore.isSpeakerOperationPending"
       :error="sessionStore.speakerError"
       @close="closeSpeakerManager"

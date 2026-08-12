@@ -30,6 +30,10 @@ export interface CaptureSession {
   state: SessionState
 }
 
+export interface SessionSummary extends CaptureSession {
+  transcriptCount: number
+}
+
 export interface CaptureInputDevice {
   uid: string
   name: string
@@ -193,6 +197,7 @@ export interface SpeakerCluster {
   mergedIntoClusterId: string | null
   canonicalClusterId: string
   spanCount: number
+  canEnrollVoiceProfile: boolean
 }
 
 export interface SpeakerSpanRef {
@@ -203,6 +208,23 @@ export interface SpeakerSpanRef {
 export interface SpeakerOperationResult {
   clusters: SpeakerCluster[]
   updatedSpans: SpeakerSpanRef[]
+}
+
+export type VoiceProfileState = 'learning' | 'ready' | 'relearn_required'
+
+/** Display-only voice profile metadata. Speaker vectors never cross IPC. */
+export interface VoiceProfile {
+  id: string
+  revision: number
+  displayName: string
+  state: VoiceProfileState
+  confirmedDurationNs: number
+  readyConfirmedDurationNs: number
+  modelId: string
+  modelVersion: string
+  lastConfirmationAt: string | null
+  canAddConfirmedSample: boolean
+  updatedAt: string
 }
 
 export interface AgentAction {

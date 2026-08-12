@@ -23,8 +23,10 @@ declare module 'vue' {
     OutboundAccessControl: typeof import('./src/components/OutboundAccessControl.vue')['default']
     PrivacyStatus: typeof import('./src/components/PrivacyStatus.vue')['default']
     RecordingControl: typeof import('./src/components/RecordingControl.vue')['default']
+    SessionRail: typeof import('./src/components/SessionRail.vue')['default']
     SettingsPage: typeof import('./src/components/SettingsPage.vue')['default']
     SpeakerManager: typeof import('./src/components/SpeakerManager.vue')['default']
     TimelinePanel: typeof import('./src/components/TimelinePanel.vue')['default']
+    VoiceProfileSettings: typeof import('./src/components/VoiceProfileSettings.vue')['default']
   }
 }

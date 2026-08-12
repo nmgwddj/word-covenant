@@ -97,6 +97,73 @@ describe('wordCovenantApi browser development mock', () => {
     expect(listen).toHaveBeenCalledWith('final-transcript-projection', expect.any(Function))
   })
 
+  test('uses the typed native command for newest-first session summaries', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {})
+    const summaries = [
+      {
+        id: 'session-newest',
+        startedAt: '2026-08-11T10:00:00.000Z',
+        startedMonotonicNs: 2_000,
+        stoppedAt: null,
+        state: 'recording' as const,
+        transcriptCount: 2,
+      },
+    ]
+    vi.mocked(invoke).mockResolvedValue(summaries)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await expect(wordCovenantApi.listSessions()).resolves.toEqual(summaries)
+
+    expect(invoke).toHaveBeenCalledWith('list_sessions')
+  })
+
+  test('uses the typed native command to delete a local session', async () => {
+    vi.stubGlobal('__TAURI_INTERNALS__', {})
+    vi.mocked(invoke).mockResolvedValue(undefined)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await expect(wordCovenantApi.deleteSession('session-stopped')).resolves.toBeUndefined()
+
+    expect(invoke).toHaveBeenCalledWith('delete_session', {
+      input: { sessionId: 'session-stopped' },
+    })
+  })
+
+  test('exposes local session summaries in browser preview without network access', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    const initial = await wordCovenantApi.listSessions()
+    expect(initial[0]).toMatchObject({
+      id: 'local-demo-session',
+      state: 'stopped',
+      transcriptCount: 3,
+    })
+
+    const session = await wordCovenantApi.startDevelopmentMockSession()
+    const recording = await wordCovenantApi.listSessions()
+    expect(recording[0]).toMatchObject({
+      id: session.id,
+      state: 'recording',
+      transcriptCount: 0,
+    })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  test('deletes browser preview session content without network access', async () => {
+    const fetchSpy = vi.fn()
+    vi.stubGlobal('fetch', fetchSpy)
+    const { wordCovenantApi } = await loadBrowserApi()
+
+    await wordCovenantApi.deleteSession('local-demo-session')
+
+    expect(await wordCovenantApi.listSessions()).toEqual([])
+    expect(await wordCovenantApi.listTimeline('local-demo-session')).toEqual([])
+    expect(await wordCovenantApi.listSpeakerClusters('local-demo-session')).toEqual([])
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   test('uses the typed native command for local model selection and preserves cancellation', async () => {
     vi.stubGlobal('__TAURI_INTERNALS__', {})
     const invokeMock = vi.mocked(invoke)
@@ -130,12 +197,20 @@ describe('wordCovenantApi browser development mock', () => {
     vi.stubGlobal('fetch', fetchSpy)
     const { wordCovenantApi } = await loadBrowserApi()
 
-    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ mode: 'adaptive', rmsThresholdDbfs: -10 })
-    await expect(wordCovenantApi.setSpeechDetectionSettings({ mode: 'manual', rmsThresholdDbfs: -26 })).resolves.toEqual({
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({
+      mode: 'adaptive',
+      rmsThresholdDbfs: -10,
+    })
+    await expect(
+      wordCovenantApi.setSpeechDetectionSettings({ mode: 'manual', rmsThresholdDbfs: -26 })
+    ).resolves.toEqual({
       mode: 'manual',
       rmsThresholdDbfs: -26,
     })
-    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ mode: 'manual', rmsThresholdDbfs: -26 })
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({
+      mode: 'manual',
+      rmsThresholdDbfs: -26,
+    })
 
     expect(fetchSpy).not.toHaveBeenCalled()
   })
@@ -148,8 +223,13 @@ describe('wordCovenantApi browser development mock', () => {
       .mockResolvedValueOnce({ mode: 'manual', rmsThresholdDbfs: -18 })
     const { wordCovenantApi } = await loadBrowserApi()
 
-    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({ mode: 'adaptive', rmsThresholdDbfs: -10 })
-    await expect(wordCovenantApi.setSpeechDetectionSettings({ mode: 'manual', rmsThresholdDbfs: -18 })).resolves.toEqual({
+    await expect(wordCovenantApi.getSpeechDetectionSettings()).resolves.toEqual({
+      mode: 'adaptive',
+      rmsThresholdDbfs: -10,
+    })
+    await expect(
+      wordCovenantApi.setSpeechDetectionSettings({ mode: 'manual', rmsThresholdDbfs: -18 })
+    ).resolves.toEqual({
       mode: 'manual',
       rmsThresholdDbfs: -18,
     })
@@ -174,6 +254,7 @@ describe('wordCovenantApi browser development mock', () => {
       clusterId: 'speaker-2',
       expectedLabelRevision: speakerTwo!.labelRevision,
       label: '主持人',
+      consent: true,
     })
     expect(renamed.clusters.find(cluster => cluster.id === 'speaker-2')).toMatchObject({
       label: '主持人',
@@ -213,6 +294,7 @@ describe('wordCovenantApi browser development mock', () => {
         mergedIntoClusterId: null,
         canonicalClusterId: 'speaker-1',
         spanCount: 1,
+        canEnrollVoiceProfile: true,
       },
     ]
     invokeMock
@@ -229,6 +311,7 @@ describe('wordCovenantApi browser development mock', () => {
       clusterId: 'speaker-1',
       expectedLabelRevision: 1,
       label: '主持人',
+      consent: true,
     })
     await wordCovenantApi.reassignTranscriptSpeaker({
       sessionId: 'session-one',
@@ -247,6 +330,7 @@ describe('wordCovenantApi browser development mock', () => {
         clusterId: 'speaker-1',
         expectedLabelRevision: 1,
         label: '主持人',
+        consent: true,
       },
     })
     expect(invokeMock).toHaveBeenNthCalledWith(4, 'reassign_transcript_speaker', {

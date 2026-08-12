@@ -1,9 +1,15 @@
 use super::{AuditEvent, AuditKind, AuditTrail};
 use crate::audio::{CaptureGap, CapturePoint, SpeechDetectionSettings};
+use crate::diarization::{SpeakerEmbedding, SpeakerSampleQuality};
+use crate::domain::session::SessionDeletedAuditPayload;
 use crate::domain::{
     CaptureSegment, CaptureSession, SpeakerCluster, SpeakerClusterAliasRevision,
     SpeakerClusterCreatedAuditPayload, SpeakerClusterLabelRevision, SpeakerClusterRecord,
-    TranscriptModelProvenance, TranscriptRevision, TranscriptSource,
+    SpeakerObservation, SpeakerObservationAuditPayload, SpeakerObservationDecision,
+    SpeakerPrototype, SpeakerPrototypeAuditBinding, TranscriptModelProvenance, TranscriptRevision,
+    TranscriptSource, VoiceProfile, VoiceProfileAuditBinding, VoiceProfileCreatedAuditPayload,
+    VoiceProfileDeletedAuditPayload, VoiceProfileEnrollmentAuditPayload,
+    VoiceProfileRevisionAuditPayload, VoiceProfileState,
 };
 use crate::inference::asr::logical_span_id_for_asr_utterance_digest;
 use crate::inference::model_registry::{LocalModelKind, RegisteredModel};
@@ -51,6 +57,14 @@ pub enum AuditStoreError {
         value: String,
     },
     InvalidSpeakerMetadata {
+        field: &'static str,
+        value: String,
+    },
+    InvalidVoiceProfileMetadata {
+        field: &'static str,
+        value: String,
+    },
+    InvalidSessionDeletionMetadata {
         field: &'static str,
         value: String,
     },
@@ -131,6 +145,18 @@ impl std::fmt::Display for AuditStoreError {
                     "invalid speaker catalog metadata for {field}: {value}"
                 )
             }
+            Self::InvalidVoiceProfileMetadata { field, value } => {
+                write!(
+                    formatter,
+                    "invalid voice profile metadata for {field}: {value}"
+                )
+            }
+            Self::InvalidSessionDeletionMetadata { field, value } => {
+                write!(
+                    formatter,
+                    "invalid session deletion metadata for {field}: {value}"
+                )
+            }
             Self::Integrity => write!(formatter, "audit chain integrity check failed"),
         }
     }
@@ -147,6 +173,72 @@ impl From<rusqlite::Error> for AuditStoreError {
 pub struct AuditStore {
     connection: Connection,
 }
+
+const IMMUTABLE_DELETE_TRIGGERS_DROP_SQL: &str = "
+    DROP TRIGGER inference_gaps_are_immutable_delete;
+    DROP TRIGGER transcript_revisions_are_immutable_delete;
+    DROP TRIGGER speaker_clusters_are_immutable_delete;
+    DROP TRIGGER speaker_cluster_label_revisions_are_immutable_delete;
+    DROP TRIGGER speaker_cluster_alias_revisions_are_immutable_delete;
+    DROP TRIGGER asr_final_idempotency_is_immutable_delete;
+    DROP TRIGGER speaker_observations_are_immutable_delete;
+";
+
+const IMMUTABLE_DELETE_TRIGGERS_CREATE_SQL: &str = "
+    CREATE TRIGGER inference_gaps_are_immutable_delete
+    BEFORE DELETE ON inference_gaps
+    BEGIN
+        SELECT RAISE(ABORT, 'inference gaps are immutable');
+    END;
+    CREATE TRIGGER transcript_revisions_are_immutable_delete
+    BEFORE DELETE ON transcript_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'transcript revisions are immutable');
+    END;
+    CREATE TRIGGER speaker_clusters_are_immutable_delete
+    BEFORE DELETE ON speaker_clusters
+    BEGIN
+        SELECT RAISE(ABORT, 'speaker clusters are immutable');
+    END;
+    CREATE TRIGGER speaker_cluster_label_revisions_are_immutable_delete
+    BEFORE DELETE ON speaker_cluster_label_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'speaker label revisions are immutable');
+    END;
+    CREATE TRIGGER speaker_cluster_alias_revisions_are_immutable_delete
+    BEFORE DELETE ON speaker_cluster_alias_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'speaker alias revisions are immutable');
+    END;
+    CREATE TRIGGER asr_final_idempotency_is_immutable_delete
+    BEFORE DELETE ON asr_final_idempotency
+    BEGIN
+        SELECT RAISE(ABORT, 'ASR final idempotency records are immutable');
+    END;
+    CREATE TRIGGER speaker_observations_are_immutable_delete
+    BEFORE DELETE ON speaker_observations
+    BEGIN
+        SELECT RAISE(ABORT, 'speaker observations are immutable');
+    END;
+";
+
+const VOICE_PROFILE_DELETE_TRIGGERS_DROP_SQL: &str = "
+    DROP TRIGGER speaker_profiles_are_immutable_delete;
+    DROP TRIGGER speaker_profile_prototypes_are_immutable_delete;
+";
+
+const VOICE_PROFILE_DELETE_TRIGGERS_CREATE_SQL: &str = "
+    CREATE TRIGGER speaker_profiles_are_immutable_delete
+    BEFORE DELETE ON speaker_profiles
+    BEGIN
+        SELECT RAISE(ABORT, 'speaker profiles are immutable');
+    END;
+    CREATE TRIGGER speaker_profile_prototypes_are_immutable_delete
+    BEFORE DELETE ON speaker_profile_prototypes
+    BEGIN
+        SELECT RAISE(ABORT, 'speaker profile prototypes are immutable');
+    END;
+";
 
 /// Durable result of one native ASR final emission. This is deliberately
 /// separate from `transcript_revisions`: final-ASR revisions may have an
@@ -430,6 +522,127 @@ impl AuditStore {
                 SELECT RAISE(ABORT, 'speaker alias revisions are immutable');
             END;
 
+            CREATE TABLE IF NOT EXISTS speaker_profiles (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL UNIQUE,
+                parent_revision_id TEXT,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                display_name TEXT NOT NULL,
+                state TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_sha256 TEXT NOT NULL,
+                confirmed_duration_ns TEXT NOT NULL,
+                learning_started_at TEXT NOT NULL,
+                origin_session_id TEXT,
+                origin_cluster_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                audit_event_id TEXT NOT NULL UNIQUE,
+                UNIQUE(profile_id, revision)
+            );
+            CREATE INDEX IF NOT EXISTS speaker_profiles_profile_sequence
+                ON speaker_profiles(profile_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS speaker_profiles_are_immutable_update
+            BEFORE UPDATE ON speaker_profiles
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker profiles are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_profiles_are_immutable_delete
+            BEFORE DELETE ON speaker_profiles
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker profiles are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS speaker_profile_prototypes (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                profile_id TEXT NOT NULL,
+                profile_revision_id TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_sha256 TEXT NOT NULL,
+                dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+                embedding BLOB NOT NULL,
+                confirmed_duration_ns TEXT NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                source_observation_id TEXT UNIQUE,
+                audit_event_id TEXT NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS speaker_profile_prototypes_profile_sequence
+                ON speaker_profile_prototypes(profile_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS speaker_profile_prototypes_are_immutable_update
+            BEFORE UPDATE ON speaker_profile_prototypes
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker profile prototypes are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_profile_prototypes_are_immutable_delete
+            BEFORE DELETE ON speaker_profile_prototypes
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker profile prototypes are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS speaker_observations (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                transcript_revision_id TEXT NOT NULL UNIQUE,
+                profile_id TEXT,
+                anonymous_cluster_id TEXT,
+                label_snapshot TEXT,
+                decision TEXT NOT NULL,
+                similarity REAL,
+                runner_up_similarity REAL,
+                model_provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                model_version TEXT NOT NULL,
+                model_sha256 TEXT NOT NULL,
+                dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+                embedding BLOB NOT NULL,
+                voiced_duration_ns TEXT NOT NULL,
+                voiced_ratio REAL NOT NULL,
+                signal_quality REAL NOT NULL,
+                overlap_probability REAL NOT NULL,
+                observed_at TEXT NOT NULL,
+                audit_event_id TEXT NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS speaker_observations_session_sequence
+                ON speaker_observations(session_id, sequence);
+            CREATE INDEX IF NOT EXISTS speaker_observations_profile_sequence
+                ON speaker_observations(profile_id, sequence);
+            CREATE TRIGGER IF NOT EXISTS speaker_observations_are_immutable_update
+            BEFORE UPDATE ON speaker_observations
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker observations are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_observations_are_immutable_delete
+            BEFORE DELETE ON speaker_observations
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker observations are immutable');
+            END;
+
+            CREATE TABLE IF NOT EXISTS speaker_profile_deletions (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id TEXT NOT NULL UNIQUE,
+                purged_audit_event_ids TEXT NOT NULL,
+                purged_audit_event_ids_sha256 TEXT NOT NULL,
+                purged_audit_event_count INTEGER NOT NULL CHECK (purged_audit_event_count > 0),
+                audit_event_id TEXT NOT NULL UNIQUE
+            );
+            CREATE TRIGGER IF NOT EXISTS speaker_profile_deletions_are_immutable_update
+            BEFORE UPDATE ON speaker_profile_deletions
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker profile deletions are immutable');
+            END;
+            CREATE TRIGGER IF NOT EXISTS speaker_profile_deletions_are_immutable_delete
+            BEFORE DELETE ON speaker_profile_deletions
+            BEGIN
+                SELECT RAISE(ABORT, 'speaker profile deletions are immutable');
+            END;
+
             CREATE TABLE IF NOT EXISTS asr_final_idempotency (
                 session_id TEXT NOT NULL,
                 utterance_key_sha256 TEXT NOT NULL,
@@ -485,6 +698,34 @@ impl AuditStore {
             );
             ",
         )?;
+        ensure_column(
+            &connection,
+            "speaker_profiles",
+            "learning_started_at",
+            "TEXT",
+        )?;
+        connection.execute(
+            "UPDATE speaker_profiles SET learning_started_at = created_at WHERE learning_started_at IS NULL",
+            [],
+        )?;
+        ensure_column(&connection, "speaker_profiles", "origin_session_id", "TEXT")?;
+        ensure_column(&connection, "speaker_profiles", "origin_cluster_id", "TEXT")?;
+        ensure_column(
+            &connection,
+            "speaker_profile_prototypes",
+            "source_observation_id",
+            "TEXT",
+        )?;
+        connection.execute_batch(
+            "
+            CREATE UNIQUE INDEX IF NOT EXISTS speaker_profiles_origin_cluster
+                ON speaker_profiles(origin_session_id, origin_cluster_id)
+                WHERE revision = 1 AND origin_session_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS speaker_profile_prototypes_source_observation
+                ON speaker_profile_prototypes(source_observation_id)
+                WHERE source_observation_id IS NOT NULL;
+            ",
+        )?;
         Ok(Self { connection })
     }
 
@@ -533,6 +774,77 @@ impl AuditStore {
 
     pub fn append(&self, event: &AuditEvent) -> Result<(), AuditStoreError> {
         insert_audit_event(&self.connection, event)
+    }
+
+    /// Appends a minimal deletion tombstone and removes all content-bearing
+    /// records owned by the session in the same SQLite transaction.
+    pub fn delete_session_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        payload: &SessionDeletedAuditPayload,
+    ) -> Result<(), AuditStoreError> {
+        validate_session_deleted_audit_event(&self.connection, event, payload)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+
+        // SQLite DDL is transactional. Dropping these guards only within this
+        // connection lets the product's explicit erase operation remove
+        // immutable content while rollback restores every guard on failure.
+        transaction.execute_batch(IMMUTABLE_DELETE_TRIGGERS_DROP_SQL)?;
+        let session_id = payload.session_id.to_string();
+        transaction.execute(
+            "DELETE FROM speaker_observations WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM transcript_revision_fts WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM asr_final_idempotency WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "
+            DELETE FROM speaker_cluster_label_revisions
+            WHERE speaker_cluster_id IN (
+                SELECT id FROM speaker_clusters WHERE session_id = ?1
+            )
+            ",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "
+            DELETE FROM speaker_cluster_alias_revisions
+            WHERE speaker_cluster_id IN (
+                SELECT id FROM speaker_clusters WHERE session_id = ?1
+            )
+            ",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM speaker_clusters WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM transcript_revisions WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM inference_gaps WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM capture_gaps WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM capture_segments WHERE session_id = ?1",
+            params![&session_id],
+        )?;
+        transaction.execute_batch(IMMUTABLE_DELETE_TRIGGERS_CREATE_SQL)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically creates an anonymous speaker cluster and its generated
@@ -595,6 +907,8 @@ impl AuditStore {
     ) -> Result<Vec<SpeakerCluster>, AuditStoreError> {
         let catalog = load_speaker_catalog(&self.connection)?;
         let aliases = catalog.active_aliases();
+        let enrollment_clusters =
+            speaker_clusters_with_enrollment_samples(&self.connection, session_id)?;
         let mut records = catalog
             .clusters
             .values()
@@ -627,6 +941,7 @@ impl AuditStore {
                     alias.map(|stored| &stored.revision),
                     canonical_cluster_id,
                     span_count,
+                    enrollment_clusters.contains(&stored.record.id),
                 )
                 .map_err(|value| speaker_error("speaker projection", value))
             })
@@ -656,6 +971,343 @@ impl AuditStore {
         Ok(catalog
             .latest_label(cluster_id)
             .map(|stored| stored.revision.clone()))
+    }
+
+    pub fn append_voice_profile_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        profile: &VoiceProfile,
+    ) -> Result<(), AuditStoreError> {
+        let was_deleted = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM speaker_profile_deletions WHERE profile_id = ?1)",
+            params![profile.id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if was_deleted {
+            return Err(voice_profile_error(
+                "profile creation",
+                "a deleted voice profile ID cannot be reused",
+            ));
+        }
+        validate_voice_profile_created_audit_event(event, profile)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_voice_profile(&transaction, profile, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append_voice_profile_revision_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        profile: &VoiceProfile,
+    ) -> Result<(), AuditStoreError> {
+        let previous = latest_voice_profile(&self.connection, profile.id)?
+            .ok_or_else(|| voice_profile_error("profile revision", "profile does not exist"))?;
+        profile
+            .validate_successor_of(&previous)
+            .map_err(|value| voice_profile_error("profile revision", value))?;
+        validate_voice_profile_revision_audit_event(event, profile)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_voice_profile(&transaction, profile, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append_speaker_label_and_voice_profile_revision_with_audit(
+        &mut self,
+        label_event: &AuditEvent,
+        label: &SpeakerClusterLabelRevision,
+        profile_event: &AuditEvent,
+        profile: &VoiceProfile,
+    ) -> Result<(), AuditStoreError> {
+        let cluster = validate_speaker_cluster_label_revision_for_write(&self.connection, label)?;
+        validate_speaker_cluster_label_revision_audit_event(label_event, &cluster, label)?;
+        let previous = latest_voice_profile(&self.connection, profile.id)?
+            .ok_or_else(|| voice_profile_error("profile revision", "profile does not exist"))?;
+        profile
+            .validate_successor_of(&previous)
+            .map_err(|value| voice_profile_error("profile revision", value))?;
+        if profile.origin_session_id != Some(cluster.session_id)
+            || profile.origin_cluster_id.as_deref() != Some(cluster.id.as_str())
+            || profile.display_name != label.label
+        {
+            return Err(voice_profile_error(
+                "profile label revision",
+                "speaker cluster and voice profile names must stay aligned",
+            ));
+        }
+        validate_voice_profile_revision_audit_event(profile_event, profile)?;
+
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, label_event)?;
+        insert_speaker_cluster_label_revision(&transaction, label, label_event.id)?;
+        insert_audit_event(&transaction, profile_event)?;
+        insert_voice_profile(&transaction, profile, profile_event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically appends one user-confirmed prototype and the resulting
+    /// profile learning-state revision. Automatic matches must not call this.
+    pub fn append_voice_profile_enrollment_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        profile: &VoiceProfile,
+        prototype: &SpeakerPrototype,
+    ) -> Result<(), AuditStoreError> {
+        let previous = latest_voice_profile(&self.connection, profile.id)?
+            .ok_or_else(|| voice_profile_error("profile enrollment", "profile does not exist"))?;
+        profile
+            .validate_successor_of(&previous)
+            .map_err(|value| voice_profile_error("profile enrollment", value))?;
+        prototype
+            .validate_for_profile(profile)
+            .map_err(|value| voice_profile_error("prototype", value))?;
+        if prototype.source_observation_id.is_some() {
+            validate_prototype_source_observation(&self.connection, profile, prototype)?;
+        }
+        let expected_duration = previous
+            .confirmed_duration_ns
+            .saturating_add(prototype.confirmed_duration_ns)
+            .min(crate::domain::voice_profile::MAX_CONFIRMED_DURATION_NS);
+        if profile.confirmed_duration_ns != expected_duration {
+            return Err(voice_profile_error(
+                "profile enrollment duration",
+                format!(
+                    "expected {expected_duration}, got {}",
+                    profile.confirmed_duration_ns
+                ),
+            ));
+        }
+        let prototype_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM speaker_profile_prototypes WHERE profile_id = ?1",
+            params![profile.id.to_string()],
+            |row| row.get(0),
+        )?;
+        if prototype_count >= crate::domain::voice_profile::MAX_PROTOTYPES_PER_PROFILE as i64 {
+            return Err(voice_profile_error(
+                "prototype count",
+                prototype_count.to_string(),
+            ));
+        }
+        validate_voice_profile_enrollment_audit_event(event, profile, prototype)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_voice_profile(&transaction, profile, event.id)?;
+        insert_speaker_prototype(&transaction, prototype, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically confirms an anonymous cluster as one persistent local voice
+    /// profile. Every prototype in this bundle comes from an explicitly
+    /// confirmed observation in that exact session cluster.
+    pub fn append_voice_profile_cluster_enrollment_with_audit(
+        &mut self,
+        label_event: &AuditEvent,
+        label: &SpeakerClusterLabelRevision,
+        profile_events: &[AuditEvent],
+        profiles: &[VoiceProfile],
+        prototypes: &[SpeakerPrototype],
+    ) -> Result<(), AuditStoreError> {
+        if profiles.is_empty()
+            || profiles.len() != profile_events.len()
+            || profiles.len() != prototypes.len() + 1
+        {
+            return Err(voice_profile_error(
+                "cluster enrollment bundle",
+                "profile event and prototype counts do not form a revision chain",
+            ));
+        }
+        let cluster = validate_speaker_cluster_label_revision_for_write(&self.connection, label)?;
+        validate_speaker_cluster_label_revision_audit_event(label_event, &cluster, label)?;
+        let initial = &profiles[0];
+        if initial.origin_session_id != Some(cluster.session_id)
+            || initial.origin_cluster_id.as_deref() != Some(cluster.id.as_str())
+            || initial.display_name != label.label
+        {
+            return Err(voice_profile_error(
+                "cluster enrollment origin",
+                "voice profile does not bind the confirmed speaker cluster",
+            ));
+        }
+        validate_voice_profile_created_audit_event(&profile_events[0], initial)?;
+        for ((previous, current), (event, prototype)) in profiles
+            .windows(2)
+            .map(|pair| (&pair[0], &pair[1]))
+            .zip(profile_events[1..].iter().zip(prototypes))
+        {
+            current
+                .validate_successor_of(previous)
+                .map_err(|value| voice_profile_error("cluster enrollment profile chain", value))?;
+            prototype
+                .validate_for_profile(current)
+                .map_err(|value| voice_profile_error("cluster enrollment prototype", value))?;
+            let source =
+                validate_prototype_source_observation(&self.connection, current, prototype)?;
+            if source.session_id != cluster.session_id
+                || source.anonymous_cluster_id.as_deref() != Some(cluster.id.as_str())
+                || source.decision != SpeakerObservationDecision::AnonymousCluster
+            {
+                return Err(voice_profile_error(
+                    "cluster enrollment observation",
+                    "confirmed observation does not belong to the anonymous cluster",
+                ));
+            }
+            validate_voice_profile_enrollment_audit_event(event, current, prototype)?;
+        }
+
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, label_event)?;
+        insert_speaker_cluster_label_revision(&transaction, label, label_event.id)?;
+        insert_audit_event(&transaction, &profile_events[0])?;
+        insert_voice_profile(&transaction, initial, profile_events[0].id)?;
+        for ((profile, prototype), event) in profiles[1..]
+            .iter()
+            .zip(prototypes)
+            .zip(&profile_events[1..])
+        {
+            insert_audit_event(&transaction, event)?;
+            insert_voice_profile(&transaction, profile, event.id)?;
+            insert_speaker_prototype(&transaction, prototype, event.id)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn append_speaker_observation_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        observation: &SpeakerObservation,
+    ) -> Result<(), AuditStoreError> {
+        validate_speaker_observation_audit_event(event, observation)?;
+        validate_speaker_observation_for_write(&self.connection, observation)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        insert_speaker_observation(&transaction, observation, event.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_voice_profiles(&self) -> Result<Vec<VoiceProfile>, AuditStoreError> {
+        list_current_voice_profiles(&self.connection)
+    }
+
+    pub fn list_speaker_prototypes(
+        &self,
+        profile_id: Uuid,
+    ) -> Result<Vec<SpeakerPrototype>, AuditStoreError> {
+        let Some(profile) = latest_voice_profile(&self.connection, profile_id)? else {
+            return Ok(Vec::new());
+        };
+        list_speaker_prototypes(&self.connection, Some(profile_id)).map(|records| {
+            records
+                .into_iter()
+                .map(|record| record.value)
+                .filter(|prototype| {
+                    prototype.embedding.model() == &profile.model
+                        && prototype.confirmed_at >= profile.learning_started_at
+                })
+                .collect()
+        })
+    }
+
+    pub fn list_speaker_observations(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<SpeakerObservation>, AuditStoreError> {
+        list_speaker_observations(&self.connection, Some(session_id))
+            .map(|records| records.into_iter().map(|record| record.value).collect())
+    }
+
+    pub fn list_all_speaker_observations(
+        &self,
+    ) -> Result<Vec<SpeakerObservation>, AuditStoreError> {
+        list_speaker_observations(&self.connection, None)
+            .map(|records| records.into_iter().map(|record| record.value).collect())
+    }
+
+    pub fn voice_profile_deletion_payload(
+        &self,
+        profile_id: Uuid,
+    ) -> Result<VoiceProfileDeletedAuditPayload, AuditStoreError> {
+        if latest_voice_profile(&self.connection, profile_id)?.is_none() {
+            return Err(voice_profile_error(
+                "profile deletion",
+                "profile does not exist",
+            ));
+        }
+        let audit_event_ids = voice_profile_purged_audit_event_ids(&self.connection, profile_id)?;
+        VoiceProfileDeletedAuditPayload::new(profile_id, &audit_event_ids)
+            .map_err(|value| voice_profile_error("profile deletion payload", value))
+    }
+
+    /// Physically erases biometric profile records and vectors. Historical
+    /// observation label snapshots remain immutable, while this minimal
+    /// tombstone prevents future recognition under the deleted profile ID.
+    pub fn delete_voice_profile_with_audit(
+        &mut self,
+        event: &AuditEvent,
+        payload: &VoiceProfileDeletedAuditPayload,
+    ) -> Result<(), AuditStoreError> {
+        if latest_voice_profile(&self.connection, payload.profile_id)?.is_none() {
+            return Err(voice_profile_error(
+                "profile deletion",
+                "profile does not exist",
+            ));
+        }
+        let purged_audit_event_ids =
+            voice_profile_purged_audit_event_ids(&self.connection, payload.profile_id)?;
+        let expected_payload =
+            VoiceProfileDeletedAuditPayload::new(payload.profile_id, &purged_audit_event_ids)
+                .map_err(|value| voice_profile_error("profile deletion payload", value))?;
+        if payload != &expected_payload {
+            return Err(voice_profile_error(
+                "profile deletion payload",
+                "purged audit event digest does not match current profile records",
+            ));
+        }
+        validate_voice_profile_deleted_audit_event(event, payload)?;
+        let transaction = self.connection.transaction()?;
+        insert_audit_event(&transaction, event)?;
+        transaction.execute_batch(VOICE_PROFILE_DELETE_TRIGGERS_DROP_SQL)?;
+        transaction.execute(
+            "DELETE FROM speaker_profile_prototypes WHERE profile_id = ?1",
+            params![payload.profile_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM speaker_profiles WHERE profile_id = ?1",
+            params![payload.profile_id.to_string()],
+        )?;
+        transaction.execute_batch(VOICE_PROFILE_DELETE_TRIGGERS_CREATE_SQL)?;
+        transaction.execute(
+            "
+            INSERT INTO speaker_profile_deletions (
+                profile_id, purged_audit_event_ids, purged_audit_event_ids_sha256,
+                purged_audit_event_count, audit_event_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ",
+            params![
+                payload.profile_id.to_string(),
+                purged_audit_event_ids
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                &payload.purged_audit_event_ids_sha256,
+                i64::try_from(payload.purged_audit_event_count).map_err(|_| {
+                    voice_profile_error(
+                        "profile deletion event count",
+                        payload.purged_audit_event_count.to_string(),
+                    )
+                })?,
+                event.id.to_string()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Atomically persist the three audit records that publish a new native
@@ -748,10 +1400,23 @@ impl AuditStore {
             return Ok(false);
         }
 
+        let Some(deleted_session_ids) = verified_deleted_session_ids(&events)? else {
+            return Ok(false);
+        };
+        let retained_events = events
+            .iter()
+            .filter(|event| {
+                event
+                    .run_id
+                    .is_none_or(|session_id| !deleted_session_ids.contains(&session_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
         // The hash chain proves event ordering; these checks additionally
         // prove that every durable M2 record still matches exactly one event
         // after reopening the SQLite database.
-        let transcript_events = events
+        let transcript_events = retained_events
             .iter()
             .filter(|event| {
                 matches!(
@@ -800,7 +1465,7 @@ impl AuditStore {
             return Ok(false);
         }
 
-        let model_events = events
+        let model_events = retained_events
             .iter()
             .filter(|event| event.kind == AuditKind::LocalModelImported)
             .collect::<Vec<_>>();
@@ -815,7 +1480,7 @@ impl AuditStore {
             return Ok(false);
         }
 
-        let inference_events = events
+        let inference_events = retained_events
             .iter()
             .filter(|event| event.kind == AuditKind::InferenceGapRecorded)
             .map(|event| (event.id, event))
@@ -840,7 +1505,11 @@ impl AuditStore {
             Ok(catalog) => catalog,
             Err(_) => return Ok(false),
         };
-        if !verify_speaker_catalog(&events, &catalog) {
+        if !verify_speaker_catalog(&retained_events, &catalog) {
+            return Ok(false);
+        }
+
+        if !verify_voice_profile_storage(&self.connection, &retained_events)? {
             return Ok(false);
         }
 
@@ -1140,6 +1809,76 @@ impl AuditStore {
         insert_audit_event(&transaction, event)?;
         insert_transcript_revision(&transaction, revision)?;
         insert_asr_final_idempotency(&transaction, idempotency, revision.id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Commits one native final transcript and its speaker decision as a
+    /// single unit. A newly inferred session speaker is created before the
+    /// transcript references it; the observation is appended last because it
+    /// is causally bound to the immutable transcript revision.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_asr_final_with_speaker_audit(
+        &mut self,
+        transcript_event: &AuditEvent,
+        revision: &TranscriptRevision,
+        idempotency: &AsrFinalIdempotencyBinding,
+        cluster_creation: Option<(
+            &AuditEvent,
+            &SpeakerClusterRecord,
+            &SpeakerClusterLabelRevision,
+        )>,
+        profile_label: Option<(&AuditEvent, &SpeakerClusterLabelRevision)>,
+        observation: Option<(&AuditEvent, &SpeakerObservation)>,
+    ) -> Result<(), AuditStoreError> {
+        validate_asr_final_audit_event(transcript_event, revision, idempotency)?;
+        if observation.is_none() && (cluster_creation.is_some() || profile_label.is_some()) {
+            return Err(voice_profile_error(
+                "native speaker transaction",
+                "a speaker cluster cannot be created without an observation",
+            ));
+        }
+
+        if let Some((event, cluster, initial_label)) = cluster_creation {
+            validate_speaker_cluster_created_audit_event(event, cluster, initial_label)?;
+            if revision.speaker_cluster_id.as_deref() != Some(cluster.id.as_str()) {
+                return Err(voice_profile_error(
+                    "native speaker cluster",
+                    "transcript does not reference its newly created speaker cluster",
+                ));
+            }
+            if let Some((label_event, label)) = profile_label {
+                label
+                    .validate_successor_of(initial_label)
+                    .map_err(|value| speaker_error("speaker label parent", value))?;
+                validate_speaker_cluster_label_revision_audit_event(label_event, cluster, label)?;
+            }
+        } else if profile_label.is_some() {
+            return Err(voice_profile_error(
+                "native speaker label",
+                "a profile label requires a newly created session cluster",
+            ));
+        }
+
+        let transaction = self.connection.transaction()?;
+        if let Some((event, cluster, initial_label)) = cluster_creation {
+            insert_audit_event(&transaction, event)?;
+            insert_speaker_cluster(&transaction, cluster, event.id)?;
+            insert_speaker_cluster_label_revision(&transaction, initial_label, event.id)?;
+        }
+        if let Some((event, label)) = profile_label {
+            insert_audit_event(&transaction, event)?;
+            insert_speaker_cluster_label_revision(&transaction, label, event.id)?;
+        }
+        insert_audit_event(&transaction, transcript_event)?;
+        insert_transcript_revision(&transaction, revision)?;
+        insert_asr_final_idempotency(&transaction, idempotency, revision.id)?;
+        if let Some((event, observation)) = observation {
+            validate_speaker_observation_for_write(&transaction, observation)?;
+            validate_speaker_observation_audit_event(event, observation)?;
+            insert_audit_event(&transaction, event)?;
+            insert_speaker_observation(&transaction, observation, event.id)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1446,6 +2185,72 @@ struct SpeakerClusterAliasRevisionRow {
     audit_event_id: String,
 }
 
+struct VoiceProfileRow {
+    profile_id: String,
+    revision_id: String,
+    parent_revision_id: Option<String>,
+    revision: i64,
+    display_name: String,
+    state: String,
+    model_provider: String,
+    model_id: String,
+    model_version: String,
+    model_sha256: String,
+    confirmed_duration_ns: String,
+    learning_started_at: String,
+    origin_session_id: Option<String>,
+    origin_cluster_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    audit_event_id: String,
+}
+
+struct SpeakerPrototypeRow {
+    id: String,
+    profile_id: String,
+    profile_revision_id: String,
+    model_provider: String,
+    model_id: String,
+    model_version: String,
+    model_sha256: String,
+    dimensions: i64,
+    embedding: Vec<u8>,
+    confirmed_duration_ns: String,
+    confirmed_at: String,
+    source_observation_id: Option<String>,
+    audit_event_id: String,
+}
+
+struct SpeakerObservationRow {
+    id: String,
+    session_id: String,
+    transcript_revision_id: String,
+    profile_id: Option<String>,
+    anonymous_cluster_id: Option<String>,
+    label_snapshot: Option<String>,
+    decision: String,
+    similarity: Option<f64>,
+    runner_up_similarity: Option<f64>,
+    model_provider: String,
+    model_id: String,
+    model_version: String,
+    model_sha256: String,
+    dimensions: i64,
+    embedding: Vec<u8>,
+    voiced_duration_ns: String,
+    voiced_ratio: f64,
+    signal_quality: f64,
+    overlap_probability: f64,
+    observed_at: String,
+    audit_event_id: String,
+}
+
+#[derive(Clone)]
+struct AuditedRecord<T> {
+    value: T,
+    audit_event_id: Uuid,
+}
+
 struct SpeakerCatalog {
     clusters: BTreeMap<String, StoredSpeakerCluster>,
     labels: BTreeMap<String, Vec<StoredSpeakerClusterLabelRevision>>,
@@ -1546,6 +2351,72 @@ fn speaker_cluster_alias_revision_row(
         revision: row.get(3)?,
         merged_into_cluster_id: row.get(4)?,
         audit_event_id: row.get(5)?,
+    })
+}
+
+fn voice_profile_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VoiceProfileRow> {
+    Ok(VoiceProfileRow {
+        profile_id: row.get(0)?,
+        revision_id: row.get(1)?,
+        parent_revision_id: row.get(2)?,
+        revision: row.get(3)?,
+        display_name: row.get(4)?,
+        state: row.get(5)?,
+        model_provider: row.get(6)?,
+        model_id: row.get(7)?,
+        model_version: row.get(8)?,
+        model_sha256: row.get(9)?,
+        confirmed_duration_ns: row.get(10)?,
+        learning_started_at: row.get(11)?,
+        origin_session_id: row.get(12)?,
+        origin_cluster_id: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        audit_event_id: row.get(16)?,
+    })
+}
+
+fn speaker_prototype_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpeakerPrototypeRow> {
+    Ok(SpeakerPrototypeRow {
+        id: row.get(0)?,
+        profile_id: row.get(1)?,
+        profile_revision_id: row.get(2)?,
+        model_provider: row.get(3)?,
+        model_id: row.get(4)?,
+        model_version: row.get(5)?,
+        model_sha256: row.get(6)?,
+        dimensions: row.get(7)?,
+        embedding: row.get(8)?,
+        confirmed_duration_ns: row.get(9)?,
+        confirmed_at: row.get(10)?,
+        source_observation_id: row.get(11)?,
+        audit_event_id: row.get(12)?,
+    })
+}
+
+fn speaker_observation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SpeakerObservationRow> {
+    Ok(SpeakerObservationRow {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        transcript_revision_id: row.get(2)?,
+        profile_id: row.get(3)?,
+        anonymous_cluster_id: row.get(4)?,
+        label_snapshot: row.get(5)?,
+        decision: row.get(6)?,
+        similarity: row.get(7)?,
+        runner_up_similarity: row.get(8)?,
+        model_provider: row.get(9)?,
+        model_id: row.get(10)?,
+        model_version: row.get(11)?,
+        model_sha256: row.get(12)?,
+        dimensions: row.get(13)?,
+        embedding: row.get(14)?,
+        voiced_duration_ns: row.get(15)?,
+        voiced_ratio: row.get(16)?,
+        signal_quality: row.get(17)?,
+        overlap_probability: row.get(18)?,
+        observed_at: row.get(19)?,
+        audit_event_id: row.get(20)?,
     })
 }
 
@@ -1953,6 +2824,241 @@ fn parse_transcript_model_provenance(
             ),
         }),
     }
+}
+
+fn parse_speaker_model_provenance(
+    provider: String,
+    model_id: String,
+    version: String,
+    sha256: String,
+) -> Result<crate::inference::ModelProvenance, AuditStoreError> {
+    crate::inference::ModelProvenance::new(provider, model_id, version, sha256)
+        .map_err(|value| voice_profile_error("model provenance", value))
+}
+
+fn parse_voice_profile(
+    row: VoiceProfileRow,
+) -> Result<AuditedRecord<VoiceProfile>, AuditStoreError> {
+    let profile = VoiceProfile {
+        id: parse_uuid(&row.profile_id)?,
+        revision_id: parse_uuid(&row.revision_id)?,
+        parent_revision_id: parse_optional_uuid(row.parent_revision_id)?,
+        revision: row
+            .revision
+            .try_into()
+            .map_err(|_| voice_profile_error("profile revision", row.revision.to_string()))?,
+        display_name: row.display_name,
+        state: serde_json::from_str(&row.state)
+            .map_err(|_| voice_profile_error("profile state", row.state))?,
+        model: parse_speaker_model_provenance(
+            row.model_provider,
+            row.model_id,
+            row.model_version,
+            row.model_sha256,
+        )?,
+        confirmed_duration_ns: row.confirmed_duration_ns.parse().map_err(|_| {
+            voice_profile_error("profile confirmed duration", row.confirmed_duration_ns)
+        })?,
+        learning_started_at: parse_timestamp(&row.learning_started_at)?,
+        origin_session_id: parse_optional_uuid(row.origin_session_id)?,
+        origin_cluster_id: row.origin_cluster_id,
+        created_at: parse_timestamp(&row.created_at)?,
+        updated_at: parse_timestamp(&row.updated_at)?,
+    };
+    profile
+        .validate()
+        .map_err(|value| voice_profile_error("profile", value))?;
+    Ok(AuditedRecord {
+        value: profile,
+        audit_event_id: parse_uuid(&row.audit_event_id)?,
+    })
+}
+
+fn parse_speaker_embedding(
+    model: crate::inference::ModelProvenance,
+    dimensions: i64,
+    bytes: Vec<u8>,
+) -> Result<SpeakerEmbedding, AuditStoreError> {
+    let dimensions: usize = dimensions
+        .try_into()
+        .map_err(|_| voice_profile_error("embedding dimensions", dimensions.to_string()))?;
+    if bytes.len() != dimensions.saturating_mul(std::mem::size_of::<f32>()) {
+        return Err(voice_profile_error(
+            "embedding bytes",
+            format!("dimensions={dimensions}, bytes={}", bytes.len()),
+        ));
+    }
+    let values = bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    SpeakerEmbedding::from_normalized(model, values)
+        .map_err(|value| voice_profile_error("embedding", value))
+}
+
+fn parse_speaker_prototype(
+    row: SpeakerPrototypeRow,
+) -> Result<AuditedRecord<SpeakerPrototype>, AuditStoreError> {
+    let model = parse_speaker_model_provenance(
+        row.model_provider,
+        row.model_id,
+        row.model_version,
+        row.model_sha256,
+    )?;
+    let prototype = SpeakerPrototype {
+        id: parse_uuid(&row.id)?,
+        profile_id: parse_uuid(&row.profile_id)?,
+        profile_revision_id: parse_uuid(&row.profile_revision_id)?,
+        embedding: parse_speaker_embedding(model, row.dimensions, row.embedding)?,
+        confirmed_duration_ns: row.confirmed_duration_ns.parse().map_err(|_| {
+            voice_profile_error("prototype confirmed duration", row.confirmed_duration_ns)
+        })?,
+        confirmed_at: parse_timestamp(&row.confirmed_at)?,
+        source_observation_id: parse_optional_uuid(row.source_observation_id)?,
+    };
+    Ok(AuditedRecord {
+        value: prototype,
+        audit_event_id: parse_uuid(&row.audit_event_id)?,
+    })
+}
+
+fn parse_speaker_observation(
+    row: SpeakerObservationRow,
+) -> Result<AuditedRecord<SpeakerObservation>, AuditStoreError> {
+    let model = parse_speaker_model_provenance(
+        row.model_provider,
+        row.model_id,
+        row.model_version,
+        row.model_sha256,
+    )?;
+    let quality = SpeakerSampleQuality::new(
+        row.voiced_duration_ns.parse().map_err(|_| {
+            voice_profile_error("observation voiced duration", row.voiced_duration_ns)
+        })?,
+        finite_f32("observation voiced ratio", row.voiced_ratio)?,
+        finite_f32("observation signal quality", row.signal_quality)?,
+        finite_f32("observation overlap probability", row.overlap_probability)?,
+    )
+    .map_err(|value| voice_profile_error("observation quality", value))?;
+    let observation = SpeakerObservation::new(
+        parse_uuid(&row.id)?,
+        parse_uuid(&row.session_id)?,
+        parse_uuid(&row.transcript_revision_id)?,
+        row.profile_id.as_deref().map(parse_uuid).transpose()?,
+        row.anonymous_cluster_id,
+        row.label_snapshot,
+        serde_json::from_str::<SpeakerObservationDecision>(&row.decision)
+            .map_err(|_| voice_profile_error("observation decision", row.decision))?,
+        row.similarity
+            .map(|value| finite_f32("observation similarity", value))
+            .transpose()?,
+        row.runner_up_similarity
+            .map(|value| finite_f32("observation runner-up similarity", value))
+            .transpose()?,
+        parse_speaker_embedding(model, row.dimensions, row.embedding)?,
+        quality,
+        parse_timestamp(&row.observed_at)?,
+    )
+    .map_err(|value| voice_profile_error("observation", value))?;
+    Ok(AuditedRecord {
+        value: observation,
+        audit_event_id: parse_uuid(&row.audit_event_id)?,
+    })
+}
+
+fn finite_f32(field: &'static str, value: f64) -> Result<f32, AuditStoreError> {
+    if !value.is_finite() || value < f64::from(f32::MIN) || value > f64::from(f32::MAX) {
+        return Err(voice_profile_error(field, value.to_string()));
+    }
+    Ok(value as f32)
+}
+
+fn list_voice_profile_revisions(
+    connection: &Connection,
+) -> Result<Vec<AuditedRecord<VoiceProfile>>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT profile_id, revision_id, parent_revision_id, revision, display_name, state,
+               model_provider, model_id, model_version, model_sha256,
+               confirmed_duration_ns, learning_started_at, origin_session_id, origin_cluster_id,
+               created_at, updated_at, audit_event_id
+        FROM speaker_profiles
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let rows = statement.query_map([], voice_profile_row)?;
+    rows.map(|row| parse_voice_profile(row?)).collect()
+}
+
+fn list_current_voice_profiles(
+    connection: &Connection,
+) -> Result<Vec<VoiceProfile>, AuditStoreError> {
+    let revisions = list_voice_profile_revisions(connection)?;
+    let mut current = BTreeMap::<Uuid, VoiceProfile>::new();
+    for revision in revisions {
+        if let Some(previous) = current.get(&revision.value.id) {
+            revision
+                .value
+                .validate_successor_of(previous)
+                .map_err(|value| voice_profile_error("profile revision chain", value))?;
+        } else if revision.value.revision != 1 {
+            return Err(voice_profile_error(
+                "profile revision chain",
+                "profile does not start at revision one",
+            ));
+        }
+        current.insert(revision.value.id, revision.value);
+    }
+    Ok(current.into_values().collect())
+}
+
+fn latest_voice_profile(
+    connection: &Connection,
+    profile_id: Uuid,
+) -> Result<Option<VoiceProfile>, AuditStoreError> {
+    Ok(list_current_voice_profiles(connection)?
+        .into_iter()
+        .find(|profile| profile.id == profile_id))
+}
+
+fn list_speaker_prototypes(
+    connection: &Connection,
+    profile_id: Option<Uuid>,
+) -> Result<Vec<AuditedRecord<SpeakerPrototype>>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, profile_id, profile_revision_id, model_provider, model_id,
+               model_version, model_sha256, dimensions, embedding,
+               confirmed_duration_ns, confirmed_at, source_observation_id, audit_event_id
+        FROM speaker_profile_prototypes
+        WHERE (?1 IS NULL OR profile_id = ?1)
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let stored_profile_id = profile_id.map(|value| value.to_string());
+    let rows = statement.query_map(params![stored_profile_id], speaker_prototype_row)?;
+    rows.map(|row| parse_speaker_prototype(row?)).collect()
+}
+
+fn list_speaker_observations(
+    connection: &Connection,
+    session_id: Option<Uuid>,
+) -> Result<Vec<AuditedRecord<SpeakerObservation>>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT id, session_id, transcript_revision_id, profile_id, anonymous_cluster_id,
+               label_snapshot, decision, similarity, runner_up_similarity,
+               model_provider, model_id, model_version, model_sha256, dimensions, embedding,
+               voiced_duration_ns, voiced_ratio, signal_quality, overlap_probability,
+               observed_at, audit_event_id
+        FROM speaker_observations
+        WHERE (?1 IS NULL OR session_id = ?1)
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let stored_session_id = session_id.map(|value| value.to_string());
+    let rows = statement.query_map(params![stored_session_id], speaker_observation_row)?;
+    rows.map(|row| parse_speaker_observation(row?)).collect()
 }
 
 fn validate_transcript_revision_metadata(
@@ -2713,6 +3819,351 @@ fn current_speaker_cluster_span_count(
         .map_err(AuditStoreError::from)
 }
 
+fn speaker_clusters_with_enrollment_samples(
+    connection: &Connection,
+    session_id: Uuid,
+) -> Result<BTreeSet<String>, AuditStoreError> {
+    let decision = serde_json::to_string(&SpeakerObservationDecision::AnonymousCluster)
+        .expect("speaker observation decision serializes");
+    let mut statement = connection.prepare(
+        "
+        SELECT DISTINCT anonymous_cluster_id
+        FROM speaker_observations
+        WHERE session_id = ?1
+          AND anonymous_cluster_id IS NOT NULL
+          AND decision = ?2
+        ",
+    )?;
+    let rows = statement.query_map(params![session_id.to_string(), decision], |row| row.get(0))?;
+    rows.collect::<Result<BTreeSet<String>, _>>()
+        .map_err(AuditStoreError::from)
+}
+
+fn validate_session_deleted_audit_event(
+    connection: &Connection,
+    event: &AuditEvent,
+    payload: &SessionDeletedAuditPayload,
+) -> Result<(), AuditStoreError> {
+    if event.kind != AuditKind::SessionDeleted {
+        return Err(AuditStoreError::InvalidSessionDeletionMetadata {
+            field: "audit event kind",
+            value: format!("{:?}", event.kind),
+        });
+    }
+    if event.run_id != Some(payload.session_id) || event.causation_id.is_some() {
+        return Err(AuditStoreError::InvalidSessionDeletionMetadata {
+            field: "audit event linkage",
+            value: format!("run={:?}, causation={:?}", event.run_id, event.causation_id),
+        });
+    }
+    if !event.matches_payload(payload).map_err(|error| {
+        AuditStoreError::InvalidSessionDeletionMetadata {
+            field: "audit event payload",
+            value: error.to_string(),
+        }
+    })? {
+        return Err(AuditStoreError::InvalidSessionDeletionMetadata {
+            field: "audit event payload",
+            value: "digest does not match".to_owned(),
+        });
+    }
+
+    let session_id = payload.session_id.to_string();
+    let session_started_kind =
+        serde_json::to_string(&AuditKind::SessionStarted).expect("audit kind is serializable");
+    let session_deleted_kind =
+        serde_json::to_string(&AuditKind::SessionDeleted).expect("audit kind is serializable");
+    let (started_count, deleted_count) = connection.query_row(
+        "
+        SELECT
+            SUM(CASE WHEN kind = ?2 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN kind = ?3 THEN 1 ELSE 0 END)
+        FROM audit_events
+        WHERE run_id = ?1
+        ",
+        params![session_id, session_started_kind, session_deleted_kind],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    if started_count != 1 || deleted_count != 0 {
+        return Err(AuditStoreError::InvalidSessionDeletionMetadata {
+            field: "session lifecycle",
+            value: format!("started={started_count}, deleted={deleted_count}"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_voice_profile_created_audit_event(
+    event: &AuditEvent,
+    profile: &VoiceProfile,
+) -> Result<(), AuditStoreError> {
+    if profile.revision != 1 || profile.parent_revision_id.is_some() {
+        return Err(voice_profile_error(
+            "profile creation",
+            "initial profile must be revision one",
+        ));
+    }
+    let payload = VoiceProfileCreatedAuditPayload {
+        profile: VoiceProfileAuditBinding::from_profile(profile)
+            .map_err(|value| voice_profile_error("profile creation", value))?,
+    };
+    validate_voice_profile_event(
+        event,
+        AuditKind::VoiceProfileCreated,
+        None,
+        None,
+        profile.updated_at,
+        &payload,
+    )
+}
+
+fn validate_voice_profile_revision_audit_event(
+    event: &AuditEvent,
+    profile: &VoiceProfile,
+) -> Result<(), AuditStoreError> {
+    let payload = VoiceProfileRevisionAuditPayload {
+        profile: VoiceProfileAuditBinding::from_profile(profile)
+            .map_err(|value| voice_profile_error("profile revision", value))?,
+    };
+    validate_voice_profile_event(
+        event,
+        AuditKind::VoiceProfileRevisionRecorded,
+        None,
+        profile.parent_revision_id,
+        profile.updated_at,
+        &payload,
+    )
+}
+
+fn validate_voice_profile_enrollment_audit_event(
+    event: &AuditEvent,
+    profile: &VoiceProfile,
+    prototype: &SpeakerPrototype,
+) -> Result<(), AuditStoreError> {
+    let payload = VoiceProfileEnrollmentAuditPayload {
+        profile: VoiceProfileAuditBinding::from_profile(profile)
+            .map_err(|value| voice_profile_error("profile enrollment", value))?,
+        prototype: SpeakerPrototypeAuditBinding::from_prototype(prototype),
+    };
+    validate_voice_profile_event(
+        event,
+        AuditKind::VoiceProfileEnrollmentRecorded,
+        None,
+        profile.parent_revision_id,
+        profile.updated_at,
+        &payload,
+    )
+}
+
+fn validate_speaker_observation_audit_event(
+    event: &AuditEvent,
+    observation: &SpeakerObservation,
+) -> Result<(), AuditStoreError> {
+    let payload = SpeakerObservationAuditPayload {
+        observation: crate::domain::SpeakerObservationAuditBinding::from_observation(observation)
+            .map_err(|value| voice_profile_error("speaker observation", value))?,
+    };
+    validate_voice_profile_event(
+        event,
+        AuditKind::SpeakerObservationRecorded,
+        Some(observation.session_id),
+        Some(observation.transcript_revision_id),
+        observation.observed_at,
+        &payload,
+    )
+}
+
+fn validate_speaker_observation_for_write(
+    connection: &Connection,
+    observation: &SpeakerObservation,
+) -> Result<(), AuditStoreError> {
+    let transcript_session = connection
+        .query_row(
+            "SELECT session_id FROM transcript_revisions WHERE id = ?1",
+            params![observation.transcript_revision_id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if transcript_session.as_deref() != Some(observation.session_id.to_string().as_str()) {
+        return Err(voice_profile_error(
+            "observation transcript",
+            "final transcript revision does not belong to the observation session",
+        ));
+    }
+    if let Some(cluster_id) = observation.anonymous_cluster_id.as_deref() {
+        let cluster_session = connection
+            .query_row(
+                "SELECT session_id FROM speaker_clusters WHERE id = ?1",
+                params![cluster_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if cluster_session.as_deref() != Some(observation.session_id.to_string().as_str()) {
+            return Err(voice_profile_error(
+                "observation anonymous cluster",
+                "speaker cluster does not belong to the observation session",
+            ));
+        }
+    }
+    if observation.decision == SpeakerObservationDecision::MatchedProfile {
+        let profile_id = observation.profile_id.ok_or_else(|| {
+            voice_profile_error("observation profile", "matched observation has no profile")
+        })?;
+        let profile = latest_voice_profile(connection, profile_id)?.ok_or_else(|| {
+            voice_profile_error("observation profile", "matched profile does not exist")
+        })?;
+        if profile.state != VoiceProfileState::Ready {
+            return Err(voice_profile_error(
+                "observation profile",
+                "only ready profiles may be matched automatically",
+            ));
+        }
+        if observation.embedding.model() != &profile.model {
+            return Err(voice_profile_error(
+                "observation profile",
+                "matched observation uses an incompatible model space",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_prototype_source_observation(
+    connection: &Connection,
+    profile: &VoiceProfile,
+    prototype: &SpeakerPrototype,
+) -> Result<SpeakerObservation, AuditStoreError> {
+    let source_observation_id = prototype.source_observation_id.ok_or_else(|| {
+        voice_profile_error(
+            "prototype source observation",
+            "user-confirmed prototypes must identify their source observation",
+        )
+    })?;
+    let observation = list_speaker_observations(connection, None)?
+        .into_iter()
+        .find(|record| record.value.id == source_observation_id)
+        .map(|record| record.value)
+        .ok_or_else(|| {
+            voice_profile_error(
+                "prototype source observation",
+                "source observation does not exist",
+            )
+        })?;
+    if observation.embedding != prototype.embedding
+        || observation.quality.voiced_duration_ns() != prototype.confirmed_duration_ns
+        || observation.embedding.model() != &profile.model
+        || observation.observed_at > prototype.confirmed_at
+    {
+        return Err(voice_profile_error(
+            "prototype source observation",
+            "source observation does not match the confirmed prototype",
+        ));
+    }
+    Ok(observation)
+}
+
+fn validate_voice_profile_deleted_audit_event(
+    event: &AuditEvent,
+    payload: &VoiceProfileDeletedAuditPayload,
+) -> Result<(), AuditStoreError> {
+    validate_voice_profile_event(
+        event,
+        AuditKind::VoiceProfileDeleted,
+        None,
+        None,
+        event.wall_clock,
+        payload,
+    )
+}
+
+fn validate_voice_profile_event<T: Serialize>(
+    event: &AuditEvent,
+    kind: AuditKind,
+    run_id: Option<Uuid>,
+    causation_id: Option<Uuid>,
+    wall_clock: DateTime<Utc>,
+    payload: &T,
+) -> Result<(), AuditStoreError> {
+    if event.kind != kind
+        || event.run_id != run_id
+        || event.causation_id != causation_id
+        || event.wall_clock != wall_clock
+    {
+        return Err(voice_profile_error(
+            "audit linkage",
+            format!(
+                "kind={:?}, run={:?}, causation={:?}, wall_clock={}",
+                event.kind, event.run_id, event.causation_id, event.wall_clock
+            ),
+        ));
+    }
+    if !event
+        .matches_payload(payload)
+        .map_err(|value| voice_profile_error("audit payload", value.to_string()))?
+    {
+        return Err(voice_profile_error(
+            "audit payload",
+            "digest does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn voice_profile_purged_audit_event_ids(
+    connection: &Connection,
+    profile_id: Uuid,
+) -> Result<Vec<Uuid>, AuditStoreError> {
+    let profile_id = profile_id.to_string();
+    let mut statement = connection.prepare(
+        "
+        SELECT audit_event_id FROM speaker_profiles WHERE profile_id = ?1
+        UNION
+        SELECT audit_event_id FROM speaker_profile_prototypes WHERE profile_id = ?1
+        ORDER BY audit_event_id ASC
+        ",
+    )?;
+    let rows = statement.query_map(params![profile_id], |row| row.get::<_, String>(0))?;
+    rows.map(|row| parse_uuid(&row?)).collect()
+}
+
+fn verified_deleted_session_ids(
+    events: &[AuditEvent],
+) -> Result<Option<BTreeSet<Uuid>>, AuditStoreError> {
+    let mut started = BTreeSet::new();
+    let mut deleted = BTreeSet::new();
+    for event in events {
+        match event.kind {
+            AuditKind::SessionStarted => {
+                let Some(session_id) = event.run_id else {
+                    continue;
+                };
+                started.insert(session_id);
+            }
+            AuditKind::SessionDeleted => {
+                let Some(session_id) = event.run_id else {
+                    return Ok(None);
+                };
+                let payload = SessionDeletedAuditPayload { session_id };
+                let payload_matches = event.matches_payload(&payload).map_err(|error| {
+                    AuditStoreError::InvalidSessionDeletionMetadata {
+                        field: "retained audit payload",
+                        value: error.to_string(),
+                    }
+                })?;
+                if event.causation_id.is_some()
+                    || !payload_matches
+                    || !started.contains(&session_id)
+                    || !deleted.insert(session_id)
+                {
+                    return Ok(None);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Some(deleted))
+}
+
 fn verify_speaker_catalog(events: &[AuditEvent], catalog: &SpeakerCatalog) -> bool {
     let events_by_id = events
         .iter()
@@ -2810,6 +4261,185 @@ fn verify_speaker_catalog(events: &[AuditEvent], catalog: &SpeakerCatalog) -> bo
     true
 }
 
+fn verify_voice_profile_storage(
+    connection: &Connection,
+    events: &[AuditEvent],
+) -> Result<bool, AuditStoreError> {
+    let events_by_id = events
+        .iter()
+        .map(|event| (event.id, event))
+        .collect::<BTreeMap<_, _>>();
+    let revisions = match list_voice_profile_revisions(connection) {
+        Ok(revisions) => revisions,
+        Err(_) => return Ok(false),
+    };
+    let profiles_by_revision = revisions
+        .iter()
+        .map(|profile| (profile.value.revision_id, &profile.value))
+        .collect::<BTreeMap<_, _>>();
+    let prototypes = match list_speaker_prototypes(connection, None) {
+        Ok(prototypes) => prototypes,
+        Err(_) => return Ok(false),
+    };
+    let observations = match list_speaker_observations(connection, None) {
+        Ok(observations) => observations,
+        Err(_) => return Ok(false),
+    };
+    let deleted = load_voice_profile_deletions(connection)?;
+    let purged_event_ids = deleted
+        .iter()
+        .flat_map(|deletion| deletion.purged_audit_event_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut bound_event_ids = BTreeSet::new();
+
+    for revision in &revisions {
+        let Some(event) = events_by_id.get(&revision.audit_event_id) else {
+            return Ok(false);
+        };
+        let valid = if revision.value.revision == 1 {
+            validate_voice_profile_created_audit_event(event, &revision.value).is_ok()
+        } else if event.kind == AuditKind::VoiceProfileEnrollmentRecorded {
+            let Some(prototype) = prototypes.iter().find(|prototype| {
+                prototype.value.profile_revision_id == revision.value.revision_id
+            }) else {
+                return Ok(false);
+            };
+            validate_voice_profile_enrollment_audit_event(event, &revision.value, &prototype.value)
+                .is_ok()
+        } else {
+            validate_voice_profile_revision_audit_event(event, &revision.value).is_ok()
+        };
+        if !valid || !bound_event_ids.insert(revision.audit_event_id) {
+            return Ok(false);
+        }
+    }
+    for prototype in &prototypes {
+        let Some(profile) = profiles_by_revision.get(&prototype.value.profile_revision_id) else {
+            return Ok(false);
+        };
+        let Some(event) = events_by_id.get(&prototype.audit_event_id) else {
+            return Ok(false);
+        };
+        let source_is_valid = prototype.value.source_observation_id.is_none()
+            || validate_prototype_source_observation(connection, profile, &prototype.value).is_ok();
+        if prototype.value.validate_for_profile(profile).is_err()
+            || !source_is_valid
+            || event.kind != AuditKind::VoiceProfileEnrollmentRecorded
+            || validate_voice_profile_enrollment_audit_event(event, profile, &prototype.value)
+                .is_err()
+        {
+            return Ok(false);
+        }
+    }
+    for observation in &observations {
+        let Some(event) = events_by_id.get(&observation.audit_event_id) else {
+            return Ok(false);
+        };
+        if !bound_event_ids.insert(observation.audit_event_id)
+            || validate_speaker_observation_audit_event(event, &observation.value).is_err()
+        {
+            return Ok(false);
+        }
+        let transcript_exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM transcript_revisions WHERE id = ?1 AND session_id = ?2)",
+            params![
+                observation.value.transcript_revision_id.to_string(),
+                observation.value.session_id.to_string()
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !transcript_exists {
+            return Ok(false);
+        }
+    }
+    for deletion in &deleted {
+        let Some(event) = events_by_id.get(&deletion.audit_event_id) else {
+            return Ok(false);
+        };
+        if !bound_event_ids.insert(deletion.audit_event_id)
+            || validate_voice_profile_deleted_audit_event(event, &deletion.payload).is_err()
+            || deletion
+                .purged_audit_event_ids
+                .iter()
+                .any(|id| !events_by_id.contains_key(id))
+        {
+            return Ok(false);
+        }
+    }
+
+    let speaker_event_ids = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                AuditKind::VoiceProfileCreated
+                    | AuditKind::VoiceProfileRevisionRecorded
+                    | AuditKind::VoiceProfileEnrollmentRecorded
+                    | AuditKind::VoiceProfileDeleted
+                    | AuditKind::SpeakerObservationRecorded
+            )
+        })
+        .map(|event| event.id)
+        .collect::<BTreeSet<_>>();
+    bound_event_ids.extend(purged_event_ids);
+    Ok(bound_event_ids == speaker_event_ids)
+}
+
+struct VoiceProfileDeletionRecord {
+    payload: VoiceProfileDeletedAuditPayload,
+    purged_audit_event_ids: Vec<Uuid>,
+    audit_event_id: Uuid,
+}
+
+fn load_voice_profile_deletions(
+    connection: &Connection,
+) -> Result<Vec<VoiceProfileDeletionRecord>, AuditStoreError> {
+    let mut statement = connection.prepare(
+        "
+        SELECT profile_id, purged_audit_event_ids, purged_audit_event_ids_sha256,
+               purged_audit_event_count, audit_event_id
+        FROM speaker_profile_deletions
+        ORDER BY sequence ASC
+        ",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, String>(4)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (profile_id, event_ids, sha256, count, audit_event_id) = row?;
+        let purged_audit_event_ids = event_ids
+            .split('\n')
+            .map(parse_uuid)
+            .collect::<Result<Vec<_>, _>>()?;
+        let count: usize = count
+            .try_into()
+            .map_err(|_| voice_profile_error("profile deletion event count", count.to_string()))?;
+        let payload =
+            VoiceProfileDeletedAuditPayload::new(parse_uuid(&profile_id)?, &purged_audit_event_ids)
+                .map_err(|value| voice_profile_error("profile deletion payload", value))?;
+        if payload.purged_audit_event_ids_sha256 != sha256
+            || payload.purged_audit_event_count != count
+        {
+            return Err(voice_profile_error(
+                "profile deletion binding",
+                "persisted digest or count does not match event IDs",
+            ));
+        }
+        Ok(VoiceProfileDeletionRecord {
+            payload,
+            purged_audit_event_ids,
+            audit_event_id: parse_uuid(&audit_event_id)?,
+        })
+    })
+    .collect()
+}
+
 fn insert_audit_event(connection: &Connection, event: &AuditEvent) -> Result<(), AuditStoreError> {
     if !event.verifies() {
         return Err(AuditStoreError::Integrity);
@@ -2840,6 +4470,159 @@ fn insert_audit_event(connection: &Connection, event: &AuditEvent) -> Result<(),
             event.payload_hash,
             event.previous_hash,
             event.hash,
+        ],
+    )?;
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<(), AuditStoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|value| value == column) {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+        ))?;
+    }
+    Ok(())
+}
+
+fn insert_voice_profile(
+    connection: &Connection,
+    profile: &VoiceProfile,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    profile
+        .validate()
+        .map_err(|value| voice_profile_error("profile", value))?;
+    connection.execute(
+        "
+        INSERT INTO speaker_profiles (
+            profile_id, revision_id, parent_revision_id, revision, display_name, state,
+            model_provider, model_id, model_version, model_sha256,
+            confirmed_duration_ns, learning_started_at, origin_session_id, origin_cluster_id,
+            created_at, updated_at, audit_event_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+        )
+        ",
+        params![
+            profile.id.to_string(),
+            profile.revision_id.to_string(),
+            profile.parent_revision_id.map(|value| value.to_string()),
+            i64::from(profile.revision),
+            &profile.display_name,
+            serde_json::to_string(&profile.state).expect("voice profile state serializes"),
+            profile.model.provider(),
+            profile.model.model_id(),
+            profile.model.model_version(),
+            profile.model.artifact_sha256(),
+            profile.confirmed_duration_ns.to_string(),
+            profile.learning_started_at.to_rfc3339(),
+            profile.origin_session_id.map(|value| value.to_string()),
+            profile.origin_cluster_id.as_deref(),
+            profile.created_at.to_rfc3339(),
+            profile.updated_at.to_rfc3339(),
+            audit_event_id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_speaker_prototype(
+    connection: &Connection,
+    prototype: &SpeakerPrototype,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    connection.execute(
+        "
+        INSERT INTO speaker_profile_prototypes (
+            id, profile_id, profile_revision_id, model_provider, model_id,
+            model_version, model_sha256, dimensions, embedding,
+            confirmed_duration_ns, confirmed_at, source_observation_id, audit_event_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        ",
+        params![
+            prototype.id.to_string(),
+            prototype.profile_id.to_string(),
+            prototype.profile_revision_id.to_string(),
+            prototype.embedding.model().provider(),
+            prototype.embedding.model().model_id(),
+            prototype.embedding.model().model_version(),
+            prototype.embedding.model().artifact_sha256(),
+            i64::try_from(prototype.embedding.dimensions()).map_err(|_| {
+                voice_profile_error(
+                    "prototype dimensions",
+                    prototype.embedding.dimensions().to_string(),
+                )
+            })?,
+            crate::domain::voice_profile::embedding_bytes(&prototype.embedding),
+            prototype.confirmed_duration_ns.to_string(),
+            prototype.confirmed_at.to_rfc3339(),
+            prototype
+                .source_observation_id
+                .map(|value| value.to_string()),
+            audit_event_id.to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_speaker_observation(
+    connection: &Connection,
+    observation: &SpeakerObservation,
+    audit_event_id: Uuid,
+) -> Result<(), AuditStoreError> {
+    observation
+        .validate()
+        .map_err(|value| voice_profile_error("observation", value))?;
+    connection.execute(
+        "
+        INSERT INTO speaker_observations (
+            id, session_id, transcript_revision_id, profile_id, anonymous_cluster_id,
+            label_snapshot, decision, similarity, runner_up_similarity,
+            model_provider, model_id, model_version, model_sha256, dimensions, embedding,
+            voiced_duration_ns, voiced_ratio, signal_quality, overlap_probability,
+            observed_at, audit_event_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21
+        )
+        ",
+        params![
+            observation.id.to_string(),
+            observation.session_id.to_string(),
+            observation.transcript_revision_id.to_string(),
+            observation.profile_id.map(|value| value.to_string()),
+            &observation.anonymous_cluster_id,
+            &observation.label_snapshot,
+            serde_json::to_string(&observation.decision)
+                .expect("speaker observation decision serializes"),
+            observation.similarity.map(f64::from),
+            observation.runner_up_similarity.map(f64::from),
+            observation.embedding.model().provider(),
+            observation.embedding.model().model_id(),
+            observation.embedding.model().model_version(),
+            observation.embedding.model().artifact_sha256(),
+            i64::try_from(observation.embedding.dimensions()).map_err(|_| {
+                voice_profile_error(
+                    "observation dimensions",
+                    observation.embedding.dimensions().to_string(),
+                )
+            })?,
+            crate::domain::voice_profile::embedding_bytes(&observation.embedding),
+            observation.quality.voiced_duration_ns().to_string(),
+            f64::from(observation.quality.voiced_ratio()),
+            f64::from(observation.quality.signal_quality()),
+            f64::from(observation.quality.overlap_probability()),
+            observation.observed_at.to_rfc3339(),
+            audit_event_id.to_string(),
         ],
     )?;
     Ok(())
@@ -3396,6 +5179,13 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, AuditStoreError> {
 
 fn speaker_error(field: &'static str, value: impl Into<String>) -> AuditStoreError {
     AuditStoreError::InvalidSpeakerMetadata {
+        field,
+        value: value.into(),
+    }
+}
+
+fn voice_profile_error(field: &'static str, value: impl Into<String>) -> AuditStoreError {
+    AuditStoreError::InvalidVoiceProfileMetadata {
         field,
         value: value.into(),
     }
@@ -4073,6 +5863,79 @@ mod tests {
             revision.capture_end_ns,
             revision.wall_clock_end,
             revision,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn speaker_model(version: &str) -> crate::inference::ModelProvenance {
+        crate::inference::ModelProvenance::new(
+            "fixture",
+            "speaker-embedding",
+            version,
+            "d".repeat(64),
+        )
+        .unwrap()
+    }
+
+    fn speaker_embedding() -> SpeakerEmbedding {
+        SpeakerEmbedding::new(speaker_model("v1"), vec![0.9, 0.1, 0.0]).unwrap()
+    }
+
+    fn profile_created_event(profile: &VoiceProfile, previous_hash: Option<String>) -> AuditEvent {
+        let payload = VoiceProfileCreatedAuditPayload {
+            profile: VoiceProfileAuditBinding::from_profile(profile).unwrap(),
+        };
+        AuditEvent::new(
+            None,
+            None,
+            AuditKind::VoiceProfileCreated,
+            1,
+            profile.updated_at,
+            &payload,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn profile_enrollment_event(
+        profile: &VoiceProfile,
+        prototype: &SpeakerPrototype,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        let payload = VoiceProfileEnrollmentAuditPayload {
+            profile: VoiceProfileAuditBinding::from_profile(profile).unwrap(),
+            prototype: SpeakerPrototypeAuditBinding::from_prototype(prototype),
+        };
+        AuditEvent::new(
+            None,
+            profile.parent_revision_id,
+            AuditKind::VoiceProfileEnrollmentRecorded,
+            2,
+            profile.updated_at,
+            &payload,
+            previous_hash,
+        )
+        .unwrap()
+    }
+
+    fn observation_event(
+        observation: &SpeakerObservation,
+        previous_hash: Option<String>,
+    ) -> AuditEvent {
+        let payload = SpeakerObservationAuditPayload {
+            observation: crate::domain::SpeakerObservationAuditBinding::from_observation(
+                observation,
+            )
+            .unwrap(),
+        };
+        AuditEvent::new(
+            Some(observation.session_id),
+            Some(observation.transcript_revision_id),
+            AuditKind::SpeakerObservationRecorded,
+            3,
+            observation.observed_at,
+            &payload,
             previous_hash,
         )
         .unwrap()
@@ -4865,6 +6728,7 @@ mod tests {
             assert_eq!(projected.merged_into_cluster_id, Some(second.id.clone()));
             assert_eq!(projected.canonical_cluster_id, second.id);
             assert_eq!(projected.span_count, 1);
+            assert!(!projected.can_enroll_voice_profile);
             assert_eq!(
                 store
                     .get_latest_speaker_cluster_label_revision(&first.id)
@@ -5296,5 +7160,273 @@ mod tests {
         assert!(!reopened.verify().unwrap());
         drop(reopened);
         std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn persists_audited_voice_profiles_prototypes_and_observations_after_reopen() {
+        let database = std::env::temp_dir().join(format!(
+            "word-covenant-voice-profiles-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        let now = DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(40);
+        let profile = VoiceProfile::new_with_id(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "Alice",
+            speaker_model("v1"),
+            now,
+        )
+        .unwrap();
+        let created = profile_created_event(&profile, None);
+        let learned = VoiceProfile::confirm_with_id(
+            &profile,
+            Uuid::new_v4(),
+            4_000_000_000,
+            now + Duration::seconds(1),
+        )
+        .unwrap();
+        let prototype = SpeakerPrototype::new_with_id(
+            Uuid::new_v4(),
+            &learned,
+            speaker_embedding(),
+            4_000_000_000,
+            learned.updated_at,
+        )
+        .unwrap();
+        let enrolled = profile_enrollment_event(&learned, &prototype, Some(created.hash.clone()));
+        let transcript = transcript_fixture(Uuid::new_v4());
+        let transcript_event = transcript_event(&transcript, Some(enrolled.hash.clone()));
+        let observation = SpeakerObservation::new(
+            Uuid::new_v4(),
+            transcript.session_id,
+            transcript.id,
+            Some(profile.id),
+            None,
+            Some("Alice".to_owned()),
+            SpeakerObservationDecision::MatchedProfile,
+            Some(0.93),
+            Some(0.61),
+            speaker_embedding(),
+            SpeakerSampleQuality::new(1_200_000_000, 0.9, 0.8, 0.0).unwrap(),
+            transcript.wall_clock_end,
+        )
+        .unwrap();
+        let observed = observation_event(&observation, Some(transcript_event.hash.clone()));
+
+        {
+            let mut store = AuditStore::open_path(&database).unwrap();
+            store
+                .append_voice_profile_with_audit(&created, &profile)
+                .unwrap();
+            store
+                .append_voice_profile_enrollment_with_audit(&enrolled, &learned, &prototype)
+                .unwrap();
+            store
+                .append_transcript_revision_with_audit(&transcript_event, &transcript)
+                .unwrap();
+            store
+                .append_speaker_observation_with_audit(&observed, &observation)
+                .unwrap();
+            assert_eq!(store.list_voice_profiles().unwrap(), vec![learned.clone()]);
+            assert_eq!(
+                store.list_speaker_prototypes(profile.id).unwrap(),
+                vec![prototype.clone()]
+            );
+            assert_eq!(
+                store
+                    .list_speaker_observations(transcript.session_id)
+                    .unwrap(),
+                vec![observation.clone()]
+            );
+            assert!(store.verify().unwrap());
+        }
+
+        let reopened = AuditStore::open_path(&database).unwrap();
+        assert_eq!(reopened.list_voice_profiles().unwrap(), vec![learned]);
+        assert_eq!(
+            reopened.list_speaker_prototypes(profile.id).unwrap(),
+            vec![prototype]
+        );
+        assert_eq!(
+            reopened
+                .list_speaker_observations(transcript.session_id)
+                .unwrap(),
+            vec![observation]
+        );
+        assert!(reopened.verify().unwrap());
+        drop(reopened);
+        std::fs::remove_file(database).unwrap();
+    }
+
+    #[test]
+    fn detects_tampered_voice_vectors_and_physically_deletes_profiles() {
+        let now = DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(50);
+        let profile = VoiceProfile::new_with_id(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "Alice",
+            speaker_model("v1"),
+            now,
+        )
+        .unwrap();
+        let created = profile_created_event(&profile, None);
+        let learned = VoiceProfile::confirm_with_id(
+            &profile,
+            Uuid::new_v4(),
+            4_000_000_000,
+            now + Duration::seconds(1),
+        )
+        .unwrap();
+        let prototype = SpeakerPrototype::new_with_id(
+            Uuid::new_v4(),
+            &learned,
+            speaker_embedding(),
+            4_000_000_000,
+            learned.updated_at,
+        )
+        .unwrap();
+        let enrolled = profile_enrollment_event(&learned, &prototype, Some(created.hash.clone()));
+        let mut store = AuditStore::open_in_memory().unwrap();
+        store
+            .append_voice_profile_with_audit(&created, &profile)
+            .unwrap();
+        store
+            .append_voice_profile_enrollment_with_audit(&enrolled, &learned, &prototype)
+            .unwrap();
+        assert!(store.verify().unwrap());
+
+        let original_embedding =
+            crate::domain::voice_profile::embedding_bytes(&speaker_embedding());
+        store
+            .connection
+            .execute(
+                "UPDATE speaker_profile_prototypes SET embedding = ?1 WHERE id = ?2",
+                params![
+                    vec![0_u8; original_embedding.len()],
+                    prototype.id.to_string()
+                ],
+            )
+            .unwrap_err();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER speaker_profile_prototypes_are_immutable_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE speaker_profile_prototypes SET embedding = ?1 WHERE id = ?2",
+                params![
+                    vec![0_u8; original_embedding.len()],
+                    prototype.id.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(!store.verify().unwrap());
+
+        store
+            .connection
+            .execute(
+                "UPDATE speaker_profile_prototypes SET embedding = ?1 WHERE id = ?2",
+                params![original_embedding, prototype.id.to_string()],
+            )
+            .unwrap();
+        assert!(store.verify().unwrap());
+        let payload = store.voice_profile_deletion_payload(profile.id).unwrap();
+        let deleted = AuditEvent::new(
+            None,
+            None,
+            AuditKind::VoiceProfileDeleted,
+            4,
+            now + Duration::seconds(2),
+            &payload,
+            Some(enrolled.hash.clone()),
+        )
+        .unwrap();
+        store
+            .delete_voice_profile_with_audit(&deleted, &payload)
+            .unwrap();
+        assert!(store.list_voice_profiles().unwrap().is_empty());
+        assert!(store
+            .list_speaker_prototypes(profile.id)
+            .unwrap()
+            .is_empty());
+        assert!(store.verify().unwrap());
+    }
+
+    #[test]
+    fn session_deletion_removes_observations_but_preserves_voice_profiles() {
+        let now = DateTime::<Utc>::UNIX_EPOCH + Duration::seconds(60);
+        let profile = VoiceProfile::new_with_id(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "Alice",
+            speaker_model("v1"),
+            now,
+        )
+        .unwrap();
+        let created = profile_created_event(&profile, None);
+        let transcript = transcript_fixture(Uuid::new_v4());
+        let session_started = AuditEvent::new(
+            Some(transcript.session_id),
+            None,
+            AuditKind::SessionStarted,
+            1,
+            transcript.wall_clock_start - Duration::seconds(1),
+            &serde_json::json!({ "sessionId": transcript.session_id }),
+            Some(created.hash.clone()),
+        )
+        .unwrap();
+        let transcript_event = transcript_event(&transcript, Some(session_started.hash.clone()));
+        let observation = SpeakerObservation::new(
+            Uuid::new_v4(),
+            transcript.session_id,
+            transcript.id,
+            None,
+            None,
+            None,
+            SpeakerObservationDecision::Unknown,
+            Some(0.93),
+            None,
+            speaker_embedding(),
+            SpeakerSampleQuality::new(1_200_000_000, 0.9, 0.8, 0.0).unwrap(),
+            transcript.wall_clock_end,
+        )
+        .unwrap();
+        let observed = observation_event(&observation, Some(transcript_event.hash.clone()));
+        let deletion_payload = SessionDeletedAuditPayload {
+            session_id: transcript.session_id,
+        };
+        let deleted = AuditEvent::new(
+            Some(transcript.session_id),
+            None,
+            AuditKind::SessionDeleted,
+            transcript.capture_end_ns + 1,
+            transcript.wall_clock_end + Duration::seconds(1),
+            &deletion_payload,
+            Some(observed.hash.clone()),
+        )
+        .unwrap();
+
+        let mut store = AuditStore::open_in_memory().unwrap();
+        store
+            .append_voice_profile_with_audit(&created, &profile)
+            .unwrap();
+        store.append(&session_started).unwrap();
+        store
+            .append_transcript_revision_with_audit(&transcript_event, &transcript)
+            .unwrap();
+        store
+            .append_speaker_observation_with_audit(&observed, &observation)
+            .unwrap();
+        store
+            .delete_session_with_audit(&deleted, &deletion_payload)
+            .unwrap();
+
+        assert!(store
+            .list_speaker_observations(transcript.session_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.list_voice_profiles().unwrap(), vec![profile]);
+        assert!(store.verify().unwrap());
     }
 }

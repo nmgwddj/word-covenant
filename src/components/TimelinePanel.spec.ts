@@ -77,6 +77,7 @@ describe('TimelinePanel', () => {
             mergedIntoClusterId: null,
             canonicalClusterId: 'speaker-2',
             spanCount: 1,
+            canEnrollVoiceProfile: true,
           },
         ],
         spans: [
@@ -137,6 +138,7 @@ describe('TimelinePanel', () => {
             mergedIntoClusterId: null,
             canonicalClusterId: 'speaker-2',
             spanCount: 1,
+            canEnrollVoiceProfile: true,
           },
         ],
         spans: [
@@ -174,6 +176,7 @@ describe('TimelinePanel', () => {
             mergedIntoClusterId: null,
             canonicalClusterId: 'speaker-2',
             spanCount: 1,
+            canEnrollVoiceProfile: true,
           },
         ],
         spans: [

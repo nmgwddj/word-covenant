@@ -4,6 +4,7 @@ use tauri::{Emitter, Manager};
 pub mod audio;
 pub mod audit;
 pub mod commands;
+pub mod diarization;
 pub mod domain;
 pub mod inference;
 pub mod policy;
@@ -115,11 +116,18 @@ pub fn run() {
         commands::start_development_mock_session,
         commands::advance_development_mock,
         commands::stop_session,
+        commands::list_sessions,
+        commands::delete_session,
         commands::list_timeline,
         commands::list_speaker_clusters,
         commands::create_speaker_cluster,
         commands::rename_speaker_cluster,
         commands::reassign_transcript_speaker,
+        commands::list_voice_profiles,
+        commands::rename_voice_profile,
+        commands::relearn_voice_profile,
+        commands::add_voice_profile_confirmed_sample,
+        commands::delete_voice_profile,
         commands::list_local_models,
         commands::get_bundled_asr_status,
         commands::get_active_local_asr_profile,
@@ -143,11 +151,18 @@ pub fn run() {
         commands::get_capture_projection,
         commands::select_input_device,
         commands::stop_session,
+        commands::list_sessions,
+        commands::delete_session,
         commands::list_timeline,
         commands::list_speaker_clusters,
         commands::create_speaker_cluster,
         commands::rename_speaker_cluster,
         commands::reassign_transcript_speaker,
+        commands::list_voice_profiles,
+        commands::rename_voice_profile,
+        commands::relearn_voice_profile,
+        commands::add_voice_profile_confirmed_sample,
+        commands::delete_voice_profile,
         commands::list_local_models,
         commands::get_bundled_asr_status,
         commands::get_active_local_asr_profile,

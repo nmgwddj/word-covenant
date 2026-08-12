@@ -7,6 +7,7 @@ use crate::inference::model_registry::{
 use crate::policy::{EgressApproval, PolicyDecision};
 use crate::state::{
     ActiveLocalAsrProfile, AgentAction, AppState, PrivacyStatus, SpeakerOperationResult,
+    VoiceProfileProjection,
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -71,6 +72,22 @@ pub struct RenameSpeakerClusterInput {
     pub cluster_id: String,
     pub expected_label_revision: u32,
     pub label: String,
+    pub consent: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameVoiceProfileInput {
+    pub profile_id: Uuid,
+    pub expected_revision: u32,
+    pub display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceProfileMutationInput {
+    pub profile_id: Uuid,
+    pub expected_revision: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +97,12 @@ pub struct ReassignTranscriptSpeakerInput {
     pub logical_span_id: Uuid,
     pub expected_revision: u32,
     pub target_cluster_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteSessionInput {
+    pub session_id: Uuid,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -162,6 +185,18 @@ pub fn stop_session(
 }
 
 #[tauri::command]
+pub fn list_sessions(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::domain::session::SessionSummary>, String> {
+    state.list_sessions()
+}
+
+#[tauri::command]
+pub fn delete_session(state: State<'_, AppState>, input: DeleteSessionInput) -> Result<(), String> {
+    state.delete_session(input.session_id)
+}
+
+#[tauri::command]
 pub fn list_timeline(
     state: State<'_, AppState>,
     session_id: Option<Uuid>,
@@ -195,7 +230,51 @@ pub fn rename_speaker_cluster(
         input.cluster_id,
         input.expected_label_revision,
         input.label,
+        input.consent,
     )
+}
+
+#[tauri::command]
+pub fn list_voice_profiles(
+    state: State<'_, AppState>,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.list_voice_profiles()
+}
+
+#[tauri::command]
+pub fn rename_voice_profile(
+    state: State<'_, AppState>,
+    input: RenameVoiceProfileInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.rename_voice_profile(
+        input.profile_id,
+        input.expected_revision,
+        input.display_name,
+    )
+}
+
+#[tauri::command]
+pub fn relearn_voice_profile(
+    state: State<'_, AppState>,
+    input: VoiceProfileMutationInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.relearn_voice_profile(input.profile_id, input.expected_revision)
+}
+
+#[tauri::command]
+pub fn add_voice_profile_confirmed_sample(
+    state: State<'_, AppState>,
+    input: VoiceProfileMutationInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.add_voice_profile_confirmed_sample(input.profile_id, input.expected_revision)
+}
+
+#[tauri::command]
+pub fn delete_voice_profile(
+    state: State<'_, AppState>,
+    input: VoiceProfileMutationInput,
+) -> Result<Vec<VoiceProfileProjection>, String> {
+    state.delete_voice_profile(input.profile_id, input.expected_revision)
 }
 
 #[tauri::command]
@@ -379,6 +458,7 @@ mod tests {
             "clusterId": "speaker-01234567-89ab-cdef-0123-456789abcdef",
             "expectedLabelRevision": 4,
             "label": "会议主持人",
+            "consent": true,
         }))
         .unwrap();
         assert_eq!(rename.session_id, session_id);
@@ -388,6 +468,7 @@ mod tests {
         );
         assert_eq!(rename.expected_label_revision, 4);
         assert_eq!(rename.label, "会议主持人");
+        assert!(rename.consent);
 
         let reassign: ReassignTranscriptSpeakerInput = serde_json::from_value(json!({
             "sessionId": session_id,
